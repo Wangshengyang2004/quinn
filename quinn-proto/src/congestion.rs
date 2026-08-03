@@ -65,6 +65,13 @@ pub trait Controller: Send + Sync {
     /// Number of ack-eliciting bytes that may be in flight
     fn window(&self) -> u64;
 
+    /// Explicit pacing rate in bytes per second.
+    ///
+    /// When absent, the connection derives its pacing rate from the congestion window and RTT.
+    fn pacing_rate(&self) -> Option<u64> {
+        None
+    }
+
     /// Duplicate the controller's state
     fn clone_box(&self) -> Box<dyn Controller>;
 

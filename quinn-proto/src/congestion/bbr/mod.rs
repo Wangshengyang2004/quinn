@@ -485,6 +485,10 @@ impl Controller for Bbr {
         self.cwnd
     }
 
+    fn pacing_rate(&self) -> Option<u64> {
+        (self.pacing_rate > 0).then_some(self.pacing_rate)
+    }
+
     fn clone_box(&self) -> Box<dyn Controller> {
         Box::new(self.clone())
     }

@@ -113,6 +113,30 @@ impl Pacer {
     }
 }
 
+/// Converts an explicit byte rate into the synthetic window expected by the generic pacer.
+pub(super) fn pacing_window(
+    pacing_rate: Option<u64>,
+    smoothed_rtt: Duration,
+    congestion_window: u64,
+    mtu: u16,
+) -> u64 {
+    let Some(pacing_rate) = pacing_rate.filter(|rate| *rate > 0) else {
+        return congestion_window;
+    };
+    if smoothed_rtt.is_zero() {
+        return congestion_window;
+    }
+
+    // Pacer::delay refills at 1.25 * window / RTT, so scale by 4/5 here.
+    let window = (pacing_rate as u128)
+        .saturating_mul(smoothed_rtt.as_nanos())
+        .saturating_mul(4)
+        / 5_000_000_000u128;
+    u64::try_from(window)
+        .unwrap_or(u64::MAX)
+        .max(u64::from(mtu))
+}
+
 /// Calculates a pacer capacity for a certain window and RTT
 ///
 /// The goal is to emit a burst (of size `capacity`) in timer intervals
@@ -153,6 +177,27 @@ const MAX_BURST_SIZE: u64 = 256;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_rate_uses_an_independent_pacing_window() {
+        assert_eq!(
+            pacing_window(
+                Some(10_000_000),
+                Duration::from_millis(100),
+                2_000_000,
+                1200,
+            ),
+            800_000
+        );
+    }
+
+    #[test]
+    fn absent_rate_uses_the_congestion_window() {
+        assert_eq!(
+            pacing_window(None, Duration::from_millis(100), 2_000_000, 1200),
+            2_000_000
+        );
+    }
 
     #[test]
     fn does_not_panic_on_bad_instant() {
