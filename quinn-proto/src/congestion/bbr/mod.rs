@@ -377,9 +377,7 @@ impl Bbr {
         }
 
         self.round_wo_bw_gain += 1;
-        if self.round_wo_bw_gain >= K_ROUND_TRIPS_WITHOUT_GROWTH_BEFORE_EXITING_STARTUP as u64
-            || (self.recovery_state.in_recovery())
-        {
+        if self.round_wo_bw_gain >= K_ROUND_TRIPS_WITHOUT_GROWTH_BEFORE_EXITING_STARTUP as u64 {
             self.is_at_full_bandwidth = true;
         }
     }
@@ -639,3 +637,21 @@ const K_MAX_INITIAL_CONGESTION_WINDOW: u64 = 200;
 
 const PROBE_RTT_BASED_ON_BDP: bool = true;
 const DRAIN_TO_TARGET: bool = true;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn startup_loss_does_not_end_bandwidth_growth_early() {
+        let mut bbr = Bbr::new(Arc::new(BbrConfig::default()), BASE_DATAGRAM_SIZE as u16);
+        bbr.bw_at_last_round = 1;
+        bbr.round_wo_bw_gain = 1;
+        bbr.recovery_state = RecoveryState::Conservation;
+
+        bbr.check_if_full_bw_reached(false);
+
+        assert_eq!(bbr.round_wo_bw_gain, 2);
+        assert!(!bbr.is_at_full_bandwidth);
+    }
+}
