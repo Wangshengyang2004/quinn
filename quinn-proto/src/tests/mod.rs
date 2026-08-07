@@ -37,6 +37,60 @@ use util::*;
 
 mod token;
 
+#[derive(Clone)]
+struct SentPacketRecorder {
+    sent: Arc<Mutex<Vec<(u64, u64)>>>,
+}
+
+impl congestion::Controller for SentPacketRecorder {
+    fn on_sent(&mut self, _now: Instant, bytes: u64, packet_number: u64) {
+        self.sent.lock().unwrap().push((bytes, packet_number));
+    }
+
+    fn on_congestion_event(
+        &mut self,
+        _now: Instant,
+        _sent: Instant,
+        _is_persistent_congestion: bool,
+        _lost_bytes: u64,
+    ) {
+    }
+
+    fn on_mtu_update(&mut self, _new_mtu: u16) {}
+
+    fn window(&self) -> u64 {
+        u64::MAX
+    }
+
+    fn clone_box(&self) -> Box<dyn congestion::Controller> {
+        Box::new(self.clone())
+    }
+
+    fn initial_window(&self) -> u64 {
+        u64::MAX
+    }
+
+    fn into_any(self: Box<Self>) -> Box<dyn std::any::Any> {
+        self
+    }
+}
+
+struct SentPacketRecorderFactory {
+    sent: Arc<Mutex<Vec<(u64, u64)>>>,
+}
+
+impl congestion::ControllerFactory for SentPacketRecorderFactory {
+    fn build(
+        self: Arc<Self>,
+        _now: Instant,
+        _current_mtu: u16,
+    ) -> Box<dyn congestion::Controller> {
+        Box::new(SentPacketRecorder {
+            sent: self.sent.clone(),
+        })
+    }
+}
+
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
 use wasm_bindgen_test::wasm_bindgen_test as test;
 
@@ -1827,6 +1881,39 @@ fn tail_loss_small_segment_size() {
     // Finally the server should have received some datagrams.
     let server_stats = pair.server_conn_mut(server_ch).stats();
     assert_eq!(server_stats.frame_rx.datagram, DGRAM_NUM);
+}
+
+#[test]
+fn congestion_controller_observes_each_packet_in_a_gso_batch() {
+    let _guard = subscribe();
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let mut transport = TransportConfig::default();
+    transport
+        .enable_segmentation_offload(true)
+        .congestion_controller_factory(Arc::new(SentPacketRecorderFactory {
+            sent: sent.clone(),
+        }));
+    let mut config = client_config();
+    config.transport_config(Arc::new(transport));
+
+    let mut pair = Pair::default();
+    let (client_ch, _) = pair.connect_with(config);
+    sent.lock().unwrap().clear();
+    let sent_packets_before = pair.client_conn_mut(client_ch).stats().path.sent_packets;
+
+    for _ in 0..5 {
+        pair.client_datagrams(client_ch)
+            .send(vec![0; 1_000].into(), false)
+            .unwrap();
+    }
+    pair.drive_client();
+
+    let records = sent.lock().unwrap();
+    let sent_packets = pair.client_conn_mut(client_ch).stats().path.sent_packets
+        - sent_packets_before;
+    assert!(sent_packets > 1, "test must produce a multi-packet GSO batch");
+    assert_eq!(records.len() as u64, sent_packets);
+    assert!(records.iter().all(|(bytes, _)| *bytes > 0));
 }
 
 // Respect max_datagrams when TLP happens

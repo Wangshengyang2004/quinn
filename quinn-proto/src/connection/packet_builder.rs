@@ -210,6 +210,11 @@ impl PacketBuilder {
             stream_frames: sent.stream_frames,
         };
 
+        if size != 0 {
+            conn.path
+                .congestion
+                .on_sent(now, u64::from(size), exact_number);
+        }
         conn.path
             .sent(exact_number, packet, &mut conn.spaces[space_id]);
         conn.stats.path.sent_packets += 1;
