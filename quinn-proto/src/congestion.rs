@@ -9,7 +9,7 @@ mod bbr;
 mod cubic;
 mod new_reno;
 
-pub use bbr::{Bbr, BbrConfig};
+pub use bbr::{Bbr, BbrConfig, BbrProfile};
 pub use cubic::{Cubic, CubicConfig};
 pub use new_reno::{NewReno, NewRenoConfig};
 

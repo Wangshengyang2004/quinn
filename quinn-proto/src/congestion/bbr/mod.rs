@@ -36,6 +36,19 @@ pub struct Bbr {
     drain_gain: f32,
     cwnd_gain: f32,
     high_cwnd_gain: f32,
+    cwnd_gain_constant: f32,
+    startup_rounds: u64,
+    exit_startup_on_loss: bool,
+    drain_to_target: bool,
+    enable_ack_aggregation_during_startup: bool,
+    expire_ack_aggregation_in_startup: bool,
+    detect_overshooting: bool,
+    bytes_lost_while_detecting_overshooting: u64,
+    bytes_lost_multiplier_while_detecting_overshooting: u64,
+    cwnd_to_calculate_min_pacing_rate: u64,
+    has_non_app_limited_sample: bool,
+    loss_events_in_round: u64,
+    bytes_lost_in_round: u64,
     last_cycle_start: Option<Instant>,
     current_cycle_offset: u8,
     init_cwnd: u64,
@@ -61,7 +74,8 @@ pub struct Bbr {
 impl Bbr {
     /// Construct a state using the given `config` and current time `now`
     pub fn new(config: Arc<BbrConfig>, current_mtu: u16) -> Self {
-        let initial_window = config.initial_window;
+        let initial_window = config.computed_initial_window(current_mtu);
+        let profile = config.profile.config();
         Self {
             config,
             current_mtu: current_mtu as u64,
@@ -72,11 +86,24 @@ impl Bbr {
             recovery_state: RecoveryState::NotInRecovery,
             recovery_window: 0,
             is_at_full_bandwidth: false,
-            pacing_gain: K_DEFAULT_HIGH_GAIN,
-            high_gain: K_DEFAULT_HIGH_GAIN,
-            drain_gain: 1.0 / K_DEFAULT_HIGH_GAIN,
-            cwnd_gain: K_DEFAULT_HIGH_GAIN,
-            high_cwnd_gain: K_DEFAULT_HIGH_GAIN,
+            pacing_gain: profile.high_gain,
+            high_gain: profile.high_gain,
+            drain_gain: 1.0 / profile.high_gain,
+            cwnd_gain: profile.high_cwnd_gain,
+            high_cwnd_gain: profile.high_cwnd_gain,
+            cwnd_gain_constant: profile.cwnd_gain_constant,
+            startup_rounds: profile.startup_rounds,
+            exit_startup_on_loss: profile.exit_startup_on_loss,
+            drain_to_target: profile.drain_to_target,
+            enable_ack_aggregation_during_startup: profile.enable_ack_aggregation_during_startup,
+            expire_ack_aggregation_in_startup: profile.expire_ack_aggregation_in_startup,
+            detect_overshooting: profile.detect_overshooting,
+            bytes_lost_while_detecting_overshooting: 0,
+            bytes_lost_multiplier_while_detecting_overshooting: profile.bytes_lost_multiplier,
+            cwnd_to_calculate_min_pacing_rate: initial_window,
+            has_non_app_limited_sample: false,
+            loss_events_in_round: 0,
+            bytes_lost_in_round: 0,
             last_cycle_start: None,
             current_cycle_offset: 0,
             init_cwnd: initial_window,
@@ -108,7 +135,7 @@ impl Bbr {
 
     fn enter_probe_bandwidth_mode(&mut self, now: Instant) {
         self.mode = Mode::ProbeBw;
-        self.cwnd_gain = K_DERIVED_HIGH_CWNDGAIN;
+        self.cwnd_gain = self.cwnd_gain_constant;
         self.last_cycle_start = Some(now);
         // Pick a random offset for the gain cycle out of {0, 2..7} range. 1 is
         // excluded because in that case increased gain and decreased gain would not
@@ -186,7 +213,7 @@ impl Bbr {
             self.last_cycle_start = Some(now);
             // Stay in low gain mode until the target BDP is hit.  Low gain mode
             // will be exited immediately when the target BDP is achieved.
-            if DRAIN_TO_TARGET
+            if self.drain_to_target
                 && self.pacing_gain < 1.0
                 && (K_PACING_GAIN[self.current_cycle_offset as usize] - 1.0).abs() < f32::EPSILON
                 && in_flight > self.get_target_cwnd(1.0)
@@ -275,7 +302,7 @@ impl Bbr {
         self.min_cwnd
     }
 
-    fn calculate_pacing_rate(&mut self) {
+    fn calculate_pacing_rate(&mut self, bytes_lost: u64) {
         let bw = self.max_bandwidth.get_estimate();
         if bw == 0 {
             return;
@@ -294,6 +321,29 @@ impl Bbr {
             return;
         }
 
+        if self.detect_overshooting {
+            self.bytes_lost_while_detecting_overshooting = self
+                .bytes_lost_while_detecting_overshooting
+                .saturating_add(bytes_lost);
+            if self.pacing_rate > target_rate
+                && self.bytes_lost_while_detecting_overshooting > 0
+                && (self.has_non_app_limited_sample
+                    || self
+                        .bytes_lost_while_detecting_overshooting
+                        .saturating_mul(self.bytes_lost_multiplier_while_detecting_overshooting)
+                        > self.init_cwnd)
+            {
+                let min_rate = BandwidthEstimation::bw_from_delta(
+                    self.cwnd_to_calculate_min_pacing_rate,
+                    self.min_rtt,
+                )
+                .unwrap_or(0);
+                self.pacing_rate = target_rate.max(min_rate);
+                self.bytes_lost_while_detecting_overshooting = 0;
+                self.detect_overshooting = false;
+            }
+        }
+
         // Do not decrease the pacing rate during startup.
         if self.pacing_rate < target_rate {
             self.pacing_rate = target_rate;
@@ -308,7 +358,7 @@ impl Bbr {
         if self.is_at_full_bandwidth {
             // Add the max recently measured ack aggregation to CWND.
             target_window += self.ack_aggregation.max_ack_height.get();
-        } else {
+        } else if self.enable_ack_aggregation_during_startup {
             // Add the most recent excess acked.  Because CWND never decreases in
             // STARTUP, this will automatically create a very localized max filter.
             target_window += excess_acked;
@@ -318,7 +368,7 @@ impl Bbr {
         // time.
         if self.is_at_full_bandwidth {
             self.cwnd = target_window.min(self.cwnd + bytes_acked);
-        } else if (self.cwnd_gain < target_window as f32) || (self.acked_bytes < self.init_cwnd) {
+        } else if self.cwnd < target_window || self.acked_bytes < self.init_cwnd {
             // If the connection is not yet out of startup phase, do not decrease
             // the window.
             self.cwnd += bytes_acked;
@@ -372,12 +422,19 @@ impl Bbr {
         if bw >= target {
             self.bw_at_last_round = bw;
             self.round_wo_bw_gain = 0;
-            self.ack_aggregation.max_ack_height.reset();
+            if self.expire_ack_aggregation_in_startup {
+                self.ack_aggregation.max_ack_height.reset();
+            }
             return;
         }
 
         self.round_wo_bw_gain += 1;
-        if self.round_wo_bw_gain >= K_ROUND_TRIPS_WITHOUT_GROWTH_BEFORE_EXITING_STARTUP as u64 {
+        let excessive_startup_loss = self.exit_startup_on_loss
+            && self.loss_events_in_round >= K_STARTUP_FULL_LOSS_COUNT
+            && self.prev_in_flight_count > 0
+            && self.bytes_lost_in_round
+                > (self.prev_in_flight_count as f64 * K_STARTUP_LOSS_THRESHOLD) as u64;
+        if self.round_wo_bw_gain >= self.startup_rounds || excessive_startup_loss {
             self.is_at_full_bandwidth = true;
         }
     }
@@ -399,6 +456,7 @@ impl Controller for Bbr {
     ) {
         self.max_bandwidth
             .on_ack(now, sent, bytes, self.round_count, app_limited);
+        self.has_non_app_limited_sample |= !app_limited;
         self.acked_bytes += bytes;
         if self.is_min_rtt_expired(now, app_limited) || self.min_rtt > rtt.min() {
             self.min_rtt = rtt.min();
@@ -449,11 +507,15 @@ impl Controller for Bbr {
         self.maybe_enter_or_exit_probe_rtt(now, is_round_start, in_flight, app_limited);
 
         // After the model is updated, recalculate the pacing rate and congestion window.
-        self.calculate_pacing_rate();
+        self.calculate_pacing_rate(self.loss_state.lost_bytes);
         self.calculate_cwnd(bytes_acked, excess_acked);
         self.calculate_recovery_window(bytes_acked, self.loss_state.lost_bytes, in_flight);
 
         self.prev_in_flight_count = in_flight;
+        if is_round_start {
+            self.loss_events_in_round = 0;
+            self.bytes_lost_in_round = 0;
+        }
         self.loss_state.reset();
     }
 
@@ -465,12 +527,19 @@ impl Controller for Bbr {
         lost_bytes: u64,
     ) {
         self.loss_state.lost_bytes += lost_bytes;
+        if lost_bytes > 0 {
+            self.loss_events_in_round = self.loss_events_in_round.saturating_add(1);
+            self.bytes_lost_in_round = self.bytes_lost_in_round.saturating_add(lost_bytes);
+        }
     }
 
     fn on_mtu_update(&mut self, new_mtu: u16) {
         self.current_mtu = new_mtu as u64;
         self.min_cwnd = calculate_min_window(self.current_mtu);
-        self.init_cwnd = self.config.initial_window.max(self.min_cwnd);
+        self.init_cwnd = self
+            .config
+            .computed_initial_window(new_mtu)
+            .max(self.min_cwnd);
         self.cwnd = self.cwnd.max(self.min_cwnd);
     }
 
@@ -492,7 +561,7 @@ impl Controller for Bbr {
     }
 
     fn initial_window(&self) -> u64 {
-        self.config.initial_window
+        self.config.computed_initial_window(self.current_mtu as u16)
     }
 
     fn into_any(self: Box<Self>) -> Box<dyn Any> {
@@ -504,6 +573,8 @@ impl Controller for Bbr {
 #[derive(Debug, Clone)]
 pub struct BbrConfig {
     initial_window: u64,
+    initial_window_packets: Option<u64>,
+    profile: BbrProfile,
 }
 
 impl BbrConfig {
@@ -512,7 +583,22 @@ impl BbrConfig {
     /// Recommended value: `min(10 * max_datagram_size, max(2 * max_datagram_size, 14720))`
     pub fn initial_window(&mut self, value: u64) -> &mut Self {
         self.initial_window = value;
+        self.initial_window_packets = None;
         self
+    }
+
+    /// Apply the congestion-control tuning used by Hysteria 2.10.
+    pub fn hysteria_profile(&mut self, profile: BbrProfile) -> &mut Self {
+        self.profile = profile;
+        self.initial_window_packets = Some(K_HYSTERIA_INITIAL_WINDOW_PACKETS);
+        self
+    }
+
+    fn computed_initial_window(&self, current_mtu: u16) -> u64 {
+        self.initial_window_packets
+            .map_or(self.initial_window, |packets| {
+                packets.saturating_mul(u64::from(current_mtu))
+            })
     }
 }
 
@@ -520,6 +606,91 @@ impl Default for BbrConfig {
     fn default() -> Self {
         Self {
             initial_window: K_MAX_INITIAL_CONGESTION_WINDOW * BASE_DATAGRAM_SIZE,
+            initial_window_packets: None,
+            profile: BbrProfile::Quinn,
+        }
+    }
+}
+
+/// BBR tuning profiles. Hysteria variants mirror Hysteria 2.10's public profiles.
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+pub enum BbrProfile {
+    /// Preserve Quinn's default BBR behavior.
+    #[default]
+    Quinn,
+    /// Hysteria's conservative profile for unstable or shallow-buffered paths.
+    HysteriaConservative,
+    /// Hysteria's standard profile.
+    HysteriaStandard,
+    /// Hysteria's aggressive profile for high-BDP paths.
+    HysteriaAggressive,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BbrProfileConfig {
+    high_gain: f32,
+    high_cwnd_gain: f32,
+    cwnd_gain_constant: f32,
+    startup_rounds: u64,
+    exit_startup_on_loss: bool,
+    drain_to_target: bool,
+    detect_overshooting: bool,
+    bytes_lost_multiplier: u64,
+    enable_ack_aggregation_during_startup: bool,
+    expire_ack_aggregation_in_startup: bool,
+}
+
+impl BbrProfile {
+    fn config(self) -> BbrProfileConfig {
+        match self {
+            Self::HysteriaConservative => BbrProfileConfig {
+                high_gain: 2.25,
+                high_cwnd_gain: 1.75,
+                cwnd_gain_constant: 1.75,
+                startup_rounds: 2,
+                exit_startup_on_loss: true,
+                drain_to_target: true,
+                detect_overshooting: true,
+                bytes_lost_multiplier: 1,
+                enable_ack_aggregation_during_startup: false,
+                expire_ack_aggregation_in_startup: false,
+            },
+            Self::HysteriaStandard => BbrProfileConfig {
+                high_gain: K_DEFAULT_HIGH_GAIN,
+                high_cwnd_gain: K_DERIVED_HIGH_CWNDGAIN,
+                cwnd_gain_constant: 2.0,
+                startup_rounds: 3,
+                exit_startup_on_loss: true,
+                drain_to_target: false,
+                detect_overshooting: false,
+                bytes_lost_multiplier: 2,
+                enable_ack_aggregation_during_startup: false,
+                expire_ack_aggregation_in_startup: false,
+            },
+            Self::HysteriaAggressive => BbrProfileConfig {
+                high_gain: 3.0,
+                high_cwnd_gain: 2.25,
+                cwnd_gain_constant: 2.5,
+                startup_rounds: 4,
+                exit_startup_on_loss: true,
+                drain_to_target: false,
+                detect_overshooting: false,
+                bytes_lost_multiplier: 2,
+                enable_ack_aggregation_during_startup: true,
+                expire_ack_aggregation_in_startup: true,
+            },
+            Self::Quinn => BbrProfileConfig {
+                high_gain: K_DEFAULT_HIGH_GAIN,
+                high_cwnd_gain: K_DEFAULT_HIGH_GAIN,
+                cwnd_gain_constant: K_DERIVED_HIGH_CWNDGAIN,
+                startup_rounds: K_ROUND_TRIPS_WITHOUT_GROWTH_BEFORE_EXITING_STARTUP as u64,
+                exit_startup_on_loss: false,
+                drain_to_target: DRAIN_TO_TARGET,
+                detect_overshooting: false,
+                bytes_lost_multiplier: 2,
+                enable_ack_aggregation_during_startup: true,
+                expire_ack_aggregation_in_startup: true,
+            },
         }
     }
 }
@@ -631,6 +802,9 @@ const K_PACING_GAIN: [f32; 8] = [1.25, 0.75, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0];
 
 const K_STARTUP_GROWTH_TARGET: f32 = 1.25;
 const K_ROUND_TRIPS_WITHOUT_GROWTH_BEFORE_EXITING_STARTUP: u8 = 3;
+const K_STARTUP_FULL_LOSS_COUNT: u64 = 8;
+const K_STARTUP_LOSS_THRESHOLD: f64 = 0.02;
+const K_HYSTERIA_INITIAL_WINDOW_PACKETS: u64 = 32;
 
 // Do not allow initial congestion window to be greater than 200 packets.
 const K_MAX_INITIAL_CONGESTION_WINDOW: u64 = 200;
@@ -653,5 +827,64 @@ mod tests {
 
         assert_eq!(bbr.round_wo_bw_gain, 2);
         assert!(!bbr.is_at_full_bandwidth);
+    }
+
+    #[test]
+    fn hysteria_profiles_match_reference_tuning() {
+        let cases = [
+            (
+                BbrProfile::HysteriaConservative,
+                2.25,
+                1.75,
+                1.75,
+                2,
+                true,
+                false,
+            ),
+            (
+                BbrProfile::HysteriaStandard,
+                K_DEFAULT_HIGH_GAIN,
+                2.0,
+                2.0,
+                3,
+                false,
+                false,
+            ),
+            (
+                BbrProfile::HysteriaAggressive,
+                3.0,
+                2.25,
+                2.5,
+                4,
+                false,
+                true,
+            ),
+        ];
+
+        for (profile, high_gain, high_cwnd, probe_cwnd, rounds, drain, aggregate) in cases {
+            let mut config = BbrConfig::default();
+            config.hysteria_profile(profile);
+            let bbr = Bbr::new(Arc::new(config), BASE_DATAGRAM_SIZE as u16);
+            assert_eq!(bbr.init_cwnd, 32 * BASE_DATAGRAM_SIZE);
+            assert_eq!(bbr.high_gain, high_gain);
+            assert_eq!(bbr.high_cwnd_gain, high_cwnd);
+            assert_eq!(bbr.cwnd_gain_constant, probe_cwnd);
+            assert_eq!(bbr.startup_rounds, rounds);
+            assert_eq!(bbr.drain_to_target, drain);
+            assert_eq!(bbr.enable_ack_aggregation_during_startup, aggregate);
+            assert!(bbr.exit_startup_on_loss);
+        }
+    }
+
+    #[test]
+    fn hysteria_initial_window_scales_with_mtu() {
+        let mut config = BbrConfig::default();
+        config.hysteria_profile(BbrProfile::HysteriaStandard);
+        let mut bbr = Bbr::new(Arc::new(config), 1200);
+
+        bbr.on_mtu_update(1400);
+
+        assert_eq!(bbr.init_cwnd, 32 * 1400);
+        assert_eq!(bbr.initial_window(), 32 * 1400);
     }
 }
