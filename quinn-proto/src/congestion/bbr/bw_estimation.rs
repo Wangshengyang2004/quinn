@@ -62,7 +62,7 @@ impl BandwidthEstimation {
         };
 
         let bandwidth = send_rate.min(ack_rate);
-        if !app_limited && self.max_filter.get() < bandwidth {
+        if !app_limited {
             self.max_filter.update_max(round, bandwidth);
         }
     }
@@ -97,5 +97,43 @@ impl Display for BandwidthEstimation {
             "{:.3} MB/s",
             self.get_estimate() as f32 / (1024 * 1024) as f32
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lower_samples_expire_a_stale_peak_after_the_filter_window() {
+        let start = Instant::now();
+        let mut estimation = BandwidthEstimation::default();
+
+        estimation.on_sent(start, 1_000);
+        estimation.on_sent(start + Duration::from_millis(1), 1_000_000);
+        estimation.on_ack(start + Duration::from_millis(1), start, 1_000, 0, false);
+        estimation.on_ack(
+            start + Duration::from_millis(2),
+            start + Duration::from_millis(1),
+            1_000_000,
+            0,
+            false,
+        );
+        let peak = estimation.get_estimate();
+        assert!(peak >= 1_000_000_000);
+
+        for round in 1..=12 {
+            let sent_at = start + Duration::from_millis(2 + round * 10);
+            estimation.on_sent(sent_at, 1_000);
+            estimation.on_ack(
+                sent_at + Duration::from_millis(10),
+                sent_at,
+                1_000,
+                round,
+                false,
+            );
+        }
+
+        assert!(estimation.get_estimate() < peak / 100);
     }
 }

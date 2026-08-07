@@ -291,7 +291,17 @@ impl Bbr {
         if cwnd == 0 {
             return self.init_cwnd;
         }
-        cwnd.max(self.min_cwnd)
+        self.clamp_cwnd(cwnd.max(self.min_cwnd))
+    }
+
+    fn max_cwnd(&self) -> u64 {
+        self.config
+            .max_window_packets
+            .map_or(u64::MAX, |packets| packets.saturating_mul(self.current_mtu))
+    }
+
+    fn clamp_cwnd(&self, cwnd: u64) -> u64 {
+        cwnd.clamp(self.min_cwnd, self.max_cwnd())
     }
 
     fn get_probe_rtt_cwnd(&self) -> u64 {
@@ -378,6 +388,7 @@ impl Bbr {
         if self.cwnd < self.min_cwnd {
             self.cwnd = self.min_cwnd;
         }
+        self.cwnd = self.clamp_cwnd(self.cwnd);
     }
 
     fn calculate_recovery_window(&mut self, bytes_acked: u64, bytes_lost: u64, in_flight: u64) {
@@ -386,7 +397,10 @@ impl Bbr {
         }
         // Set up the initial recovery window.
         if self.recovery_window == 0 {
-            self.recovery_window = self.min_cwnd.max(in_flight + bytes_acked);
+            self.recovery_window = self
+                .min_cwnd
+                .max(in_flight + bytes_acked)
+                .min(self.max_cwnd());
             return;
         }
 
@@ -409,7 +423,8 @@ impl Bbr {
         self.recovery_window = self
             .recovery_window
             .max(in_flight + bytes_acked)
-            .max(self.min_cwnd);
+            .max(self.min_cwnd)
+            .min(self.max_cwnd());
     }
 
     /// <https://datatracker.ietf.org/doc/html/draft-cardwell-iccrg-bbr-congestion-control#section-4.3.2.2>
@@ -540,7 +555,8 @@ impl Controller for Bbr {
             .config
             .computed_initial_window(new_mtu)
             .max(self.min_cwnd);
-        self.cwnd = self.cwnd.max(self.min_cwnd);
+        self.cwnd = self.clamp_cwnd(self.cwnd);
+        self.recovery_window = self.recovery_window.min(self.max_cwnd());
     }
 
     fn window(&self) -> u64 {
@@ -574,6 +590,7 @@ impl Controller for Bbr {
 pub struct BbrConfig {
     initial_window: u64,
     initial_window_packets: Option<u64>,
+    max_window_packets: Option<u64>,
     profile: BbrProfile,
 }
 
@@ -591,6 +608,7 @@ impl BbrConfig {
     pub fn hysteria_profile(&mut self, profile: BbrProfile) -> &mut Self {
         self.profile = profile;
         self.initial_window_packets = Some(K_HYSTERIA_INITIAL_WINDOW_PACKETS);
+        self.max_window_packets = Some(K_HYSTERIA_MAX_CONGESTION_WINDOW_PACKETS);
         self
     }
 
@@ -607,6 +625,7 @@ impl Default for BbrConfig {
         Self {
             initial_window: K_MAX_INITIAL_CONGESTION_WINDOW * BASE_DATAGRAM_SIZE,
             initial_window_packets: None,
+            max_window_packets: None,
             profile: BbrProfile::Quinn,
         }
     }
@@ -805,6 +824,7 @@ const K_ROUND_TRIPS_WITHOUT_GROWTH_BEFORE_EXITING_STARTUP: u8 = 3;
 const K_STARTUP_FULL_LOSS_COUNT: u64 = 8;
 const K_STARTUP_LOSS_THRESHOLD: f64 = 0.02;
 const K_HYSTERIA_INITIAL_WINDOW_PACKETS: u64 = 32;
+const K_HYSTERIA_MAX_CONGESTION_WINDOW_PACKETS: u64 = 20_000;
 
 // Do not allow initial congestion window to be greater than 200 packets.
 const K_MAX_INITIAL_CONGESTION_WINDOW: u64 = 200;
@@ -886,5 +906,20 @@ mod tests {
 
         assert_eq!(bbr.init_cwnd, 32 * 1400);
         assert_eq!(bbr.initial_window(), 32 * 1400);
+    }
+
+    #[test]
+    fn hysteria_cwnd_is_capped_at_reference_packet_limit() {
+        let mut config = BbrConfig::default();
+        config.hysteria_profile(BbrProfile::HysteriaStandard);
+        let mut bbr = Bbr::new(Arc::new(config), 1200);
+        bbr.cwnd = u64::MAX;
+
+        bbr.calculate_cwnd(0, 0);
+        assert_eq!(bbr.cwnd, K_HYSTERIA_MAX_CONGESTION_WINDOW_PACKETS * 1200);
+
+        bbr.cwnd = u64::MAX;
+        bbr.on_mtu_update(1400);
+        assert_eq!(bbr.cwnd, K_HYSTERIA_MAX_CONGESTION_WINDOW_PACKETS * 1400);
     }
 }
