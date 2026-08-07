@@ -5,6 +5,7 @@ use tracing::{trace, trace_span};
 use super::{Connection, SentFrames, spaces::SentPacket};
 use crate::{
     ConnectionId, Instant, TransportError, TransportErrorCode,
+    congestion::SentPacketInfo,
     connection::ConnectionSide,
     frame::{self, Close},
     packet::{FIXED_BIT, Header, InitialHeader, LongType, PacketNumber, PartialEncode, SpaceId},
@@ -201,7 +202,11 @@ impl PacketBuilder {
             false => 0,
         };
 
+        let congestion_packet_number = conn.next_congestion_packet_number;
+        conn.next_congestion_packet_number = conn.next_congestion_packet_number.saturating_add(1);
+
         let packet = SentPacket {
+            congestion_packet_number,
             largest_acked: sent.largest_acked,
             time_sent: now,
             size,
@@ -210,10 +215,14 @@ impl PacketBuilder {
             stream_frames: sent.stream_frames,
         };
 
-        if size != 0 {
-            conn.path
-                .congestion
-                .on_sent(now, u64::from(size), exact_number);
+        if size != 0 && ack_eliciting {
+            conn.path.congestion.on_packet_sent(SentPacketInfo {
+                now,
+                packet_number: congestion_packet_number,
+                bytes: u64::from(size),
+                bytes_in_flight: conn.path.in_flight.bytes,
+                app_limited: conn.app_limited,
+            });
         }
         conn.path
             .sent(exact_number, packet, &mut conn.spaces[space_id]);

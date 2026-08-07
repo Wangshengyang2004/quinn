@@ -39,12 +39,17 @@ mod token;
 
 #[derive(Clone)]
 struct SentPacketRecorder {
-    sent: Arc<Mutex<Vec<(u64, u64)>>>,
+    sent: Arc<Mutex<Vec<(u64, u64, u64, bool)>>>,
 }
 
 impl congestion::Controller for SentPacketRecorder {
-    fn on_sent(&mut self, _now: Instant, bytes: u64, packet_number: u64) {
-        self.sent.lock().unwrap().push((bytes, packet_number));
+    fn on_packet_sent(&mut self, packet: congestion::SentPacketInfo) {
+        self.sent.lock().unwrap().push((
+            packet.bytes,
+            packet.packet_number,
+            packet.bytes_in_flight,
+            packet.app_limited,
+        ));
     }
 
     fn on_congestion_event(
@@ -76,15 +81,72 @@ impl congestion::Controller for SentPacketRecorder {
 }
 
 struct SentPacketRecorderFactory {
-    sent: Arc<Mutex<Vec<(u64, u64)>>>,
+    sent: Arc<Mutex<Vec<(u64, u64, u64, bool)>>>,
+}
+
+#[derive(Clone)]
+struct CongestionEventRecorder {
+    events: Arc<Mutex<Vec<(Vec<u64>, Vec<u64>)>>>,
+}
+
+impl congestion::Controller for CongestionEventRecorder {
+    fn on_ack_and_loss(&mut self, event: congestion::CongestionEvent<'_>) {
+        self.events.lock().unwrap().push((
+            event
+                .acked_packets
+                .iter()
+                .map(|packet| packet.packet_number)
+                .collect(),
+            event
+                .lost_packets
+                .iter()
+                .map(|packet| packet.packet_number)
+                .collect(),
+        ));
+    }
+
+    fn on_congestion_event(
+        &mut self,
+        _now: Instant,
+        _sent: Instant,
+        _is_persistent_congestion: bool,
+        _lost_bytes: u64,
+    ) {
+    }
+
+    fn on_mtu_update(&mut self, _new_mtu: u16) {}
+
+    fn window(&self) -> u64 {
+        u64::MAX
+    }
+
+    fn clone_box(&self) -> Box<dyn congestion::Controller> {
+        Box::new(self.clone())
+    }
+
+    fn initial_window(&self) -> u64 {
+        u64::MAX
+    }
+
+    fn into_any(self: Box<Self>) -> Box<dyn std::any::Any> {
+        self
+    }
+}
+
+struct CongestionEventRecorderFactory {
+    events: Arc<Mutex<Vec<(Vec<u64>, Vec<u64>)>>>,
+}
+
+impl congestion::ControllerFactory for CongestionEventRecorderFactory {
+    fn build(self: Arc<Self>, _now: Instant, _current_mtu: u16) -> Box<dyn congestion::Controller> {
+        Box::new(CongestionEventRecorder {
+            events: self.events.clone(),
+        })
+    }
 }
 
 impl congestion::ControllerFactory for SentPacketRecorderFactory {
-    fn build(
-        self: Arc<Self>,
-        _now: Instant,
-        _current_mtu: u16,
-    ) -> Box<dyn congestion::Controller> {
+    fn build(self: Arc<Self>, _now: Instant, _current_mtu: u16) -> Box<dyn congestion::Controller> {
         Box::new(SentPacketRecorder {
             sent: self.sent.clone(),
         })
@@ -1890,9 +1952,7 @@ fn congestion_controller_observes_each_packet_in_a_gso_batch() {
     let mut transport = TransportConfig::default();
     transport
         .enable_segmentation_offload(true)
-        .congestion_controller_factory(Arc::new(SentPacketRecorderFactory {
-            sent: sent.clone(),
-        }));
+        .congestion_controller_factory(Arc::new(SentPacketRecorderFactory { sent: sent.clone() }));
     let mut config = client_config();
     config.transport_config(Arc::new(transport));
 
@@ -1909,11 +1969,68 @@ fn congestion_controller_observes_each_packet_in_a_gso_batch() {
     pair.drive_client();
 
     let records = sent.lock().unwrap();
-    let sent_packets = pair.client_conn_mut(client_ch).stats().path.sent_packets
-        - sent_packets_before;
-    assert!(sent_packets > 1, "test must produce a multi-packet GSO batch");
+    let sent_packets =
+        pair.client_conn_mut(client_ch).stats().path.sent_packets - sent_packets_before;
+    assert!(
+        sent_packets > 1,
+        "test must produce a multi-packet GSO batch"
+    );
     assert_eq!(records.len() as u64, sent_packets);
-    assert!(records.iter().all(|(bytes, _)| *bytes > 0));
+    assert!(records.iter().all(|(bytes, _, _, _)| *bytes > 0));
+    assert!(
+        records.windows(2).all(|pair| pair[0].1 < pair[1].1),
+        "congestion packet identifiers must be globally monotonic",
+    );
+    assert!(
+        records.windows(2).all(|pair| pair[0].2 < pair[1].2),
+        "each packet in a GSO batch must observe the preceding packet in flight",
+    );
+}
+
+#[test]
+fn congestion_controller_receives_ack_and_induced_loss_in_one_event() {
+    let _guard = subscribe();
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let mut transport = TransportConfig::default();
+    transport
+        .enable_segmentation_offload(false)
+        .deterministic_packet_numbers(true)
+        .congestion_controller_factory(Arc::new(CongestionEventRecorderFactory {
+            events: events.clone(),
+        }));
+    let mut config = client_config();
+    config.transport_config(Arc::new(transport));
+
+    let mut pair = Pair::default();
+    let (client_ch, _) = pair.connect_with(config);
+    events.lock().unwrap().clear();
+
+    for _ in 0..5 {
+        pair.client_datagrams(client_ch)
+            .send(vec![0; 1_000].into(), false)
+            .unwrap();
+    }
+    pair.client.drive_outgoing(pair.time);
+    assert!(pair.client.outbound.len() >= 5);
+
+    let _ = pair.client.outbound.pop_front().unwrap();
+    let delivered: Vec<_> = pair.client.outbound.drain(..).collect();
+    for (transmit, buffer) in delivered {
+        assert_eq!(transmit.destination, pair.server.addr);
+        pair.server
+            .inbound
+            .push_back((pair.time, transmit.ecn, buffer.as_ref().into()));
+    }
+    pair.drive_server();
+    pair.drive_client();
+
+    let events = events.lock().unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|(acked, lost)| !acked.is_empty() && !lost.is_empty()),
+        "packet-threshold loss caused by an ACK must share that ACK's congestion event",
+    );
 }
 
 // Respect max_datagrams when TLP happens
@@ -3240,6 +3357,78 @@ fn stream_gso() {
     pair.drive();
     let final_ios = pair.client_conn_mut(client_ch).stats().udp_tx.ios;
     assert_eq!(final_ios - initial_ios, 2);
+}
+
+#[test]
+fn bbr_gso_recovers_stream_after_loss_on_high_latency_path() {
+    let _guard = subscribe();
+
+    let mut server_transport = TransportConfig::default();
+    let mut server_bbr = congestion::BbrConfig::default();
+    server_bbr.hysteria_profile(congestion::BbrProfile::HysteriaStandard);
+    server_transport
+        .enable_segmentation_offload(true)
+        .congestion_controller_factory(Arc::new(server_bbr));
+    let mut server = server_config();
+    server.transport = Arc::new(server_transport);
+
+    let mut client_transport = TransportConfig::default();
+    let mut client_bbr = congestion::BbrConfig::default();
+    client_bbr.hysteria_profile(congestion::BbrProfile::HysteriaStandard);
+    client_transport
+        .enable_segmentation_offload(true)
+        .congestion_controller_factory(Arc::new(client_bbr));
+    let mut client = client_config();
+    client.transport_config(Arc::new(client_transport));
+
+    let mut pair = Pair::new(Default::default(), server);
+    pair.latency = Duration::from_millis(135);
+    let (client_ch, server_ch) = pair.connect_with(client);
+    let stream = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
+
+    const PAYLOAD_LEN: usize = 512 * 1024;
+    let payload = vec![0x5a; PAYLOAD_LEN];
+    let mut offset = 0;
+    while offset < payload.len() {
+        offset += pair
+            .client_send(client_ch, stream)
+            .write(&payload[offset..])
+            .unwrap();
+    }
+    pair.client_send(client_ch, stream).finish().unwrap();
+
+    pair.client.drive_outgoing(pair.time);
+    assert!(
+        pair.client.outbound.len() > 4,
+        "test must produce a multi-packet GSO flight"
+    );
+    let _ = pair.client.outbound.remove(2).unwrap();
+    let transfer_started_at = pair.time;
+    pair.drive();
+    let transfer_time = pair.time.saturating_duration_since(transfer_started_at);
+    eprintln!("BBR GSO transfer completed in {transfer_time:?}");
+    assert!(
+        transfer_time < Duration::from_secs(3),
+        "BBR took too long to recover after one packet loss"
+    );
+
+    assert_matches!(
+        pair.server_conn_mut(server_ch).poll(),
+        Some(Event::Stream(StreamEvent::Opened { dir: Dir::Uni }))
+    );
+    assert_matches!(
+        pair.server_streams(server_ch).accept(Dir::Uni),
+        Some(id) if id == stream
+    );
+
+    let mut received = 0;
+    let mut recv = pair.server_recv(server_ch, stream);
+    let mut chunks = recv.read(false).unwrap();
+    while let Some(chunk) = chunks.next(usize::MAX).unwrap() {
+        received += chunk.bytes.len();
+    }
+    let _ = chunks.finalize();
+    assert_eq!(received, PAYLOAD_LEN);
 }
 
 #[test]

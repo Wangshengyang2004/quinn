@@ -85,7 +85,7 @@ pub use streams::{
 };
 
 mod timer;
-use crate::congestion::Controller;
+use crate::congestion::{AckedPacket, CongestionEvent, Controller, LostPacket};
 use timer::{Timer, TimerTable};
 
 /// Protocol state and logic for a single QUIC connection
@@ -221,6 +221,8 @@ pub struct Connection {
     /// Whether the last `poll_transmit` call yielded no data because there was
     /// no outgoing application data.
     app_limited: bool,
+    /// Monotonic packet identifier used by congestion control across QUIC packet number spaces.
+    next_congestion_packet_number: u64,
 
     streams: StreamsState,
     /// Surplus remote CIDs for future use on new paths
@@ -233,6 +235,12 @@ pub struct Connection {
     stats: ConnectionStats,
     /// QUIC version used for the connection.
     version: u32,
+}
+
+#[derive(Debug, Default)]
+struct DetectedLoss {
+    packets: Vec<LostPacket>,
+    is_persistent_congestion: bool,
 }
 
 impl Connection {
@@ -333,6 +341,7 @@ impl Connection {
             pto_count: 0,
 
             app_limited: false,
+            next_congestion_packet_number: 0,
             receiving_ecn: false,
             total_authed_packets: 0,
 
@@ -1421,7 +1430,9 @@ impl Connection {
             return Ok(());
         }
 
+        let prior_in_flight = self.path.in_flight.bytes;
         let mut ack_eliciting_acked = false;
+        let mut acked_packets = Vec::new();
         for packet in newly_acked.elts() {
             if let Some(info) = self.spaces[space].take(packet) {
                 if let Some(acked) = info.largest_acked {
@@ -1445,16 +1456,11 @@ impl Connection {
                 // Notify ack frequency that a packet was acked, because it might contain an ACK_FREQUENCY frame
                 self.ack_frequency.on_acked(packet);
 
-                self.on_packet_acked(now, packet, info);
+                if let Some(packet) = self.on_packet_acked(packet, info) {
+                    acked_packets.push(packet);
+                }
             }
         }
-
-        self.path.congestion.on_end_acks(
-            now,
-            self.path.in_flight.bytes,
-            self.app_limited,
-            self.spaces[space].largest_acked_packet,
-        );
 
         if new_largest && ack_eliciting_acked {
             let ack_delay = if space != SpaceId::Data {
@@ -1474,13 +1480,15 @@ impl Connection {
         }
 
         // Must be called before crypto/pto_count are clobbered
-        self.detect_lost_packets(now, space, true);
+        let detected_loss = self.detect_lost_packets(now, space, true);
 
         if self.peer_completed_address_validation() {
             self.pto_count = 0;
         }
 
         // Explicit congestion notification
+        let mut ecn_congestion = false;
+        let mut ecn_sent = None;
         if self.path.sending_ecn {
             if let Some(ecn) = ack.ecn {
                 // We only examine ECN counters from ACKs that we are certain we received in transmit
@@ -1489,7 +1497,8 @@ impl Connection {
                 // reordering.
                 if new_largest {
                     let sent = self.spaces[space].largest_acked_packet_sent;
-                    self.process_ecn(now, space, newly_acked.len() as u64, ecn, sent);
+                    ecn_congestion = self.process_ecn(space, newly_acked.len() as u64, ecn);
+                    ecn_sent = ecn_congestion.then_some(sent);
                 }
             } else {
                 // We always start out sending ECN, so any ack that doesn't acknowledge it disables it.
@@ -1498,19 +1507,22 @@ impl Connection {
             }
         }
 
+        self.notify_congestion_event(
+            now,
+            prior_in_flight,
+            &acked_packets,
+            &detected_loss.packets,
+            ecn_congestion,
+            ecn_sent,
+            detected_loss.is_persistent_congestion,
+        );
+
         self.set_loss_detection_timer(now);
         Ok(())
     }
 
     /// Process a new ECN block from an in-order ACK
-    fn process_ecn(
-        &mut self,
-        now: Instant,
-        space: SpaceId,
-        newly_acked: u64,
-        ecn: frame::EcnCounts,
-        largest_sent_time: Instant,
-    ) {
+    fn process_ecn(&mut self, space: SpaceId, newly_acked: u64, ecn: frame::EcnCounts) -> bool {
         match self.spaces[space].detect_ecn(newly_acked, ecn) {
             Err(e) => {
                 debug!("halting ECN due to verification failure: {}", e);
@@ -1518,32 +1530,56 @@ impl Connection {
                 // Wipe out the existing value because it might be garbage and could interfere with
                 // future attempts to use ECN on new paths.
                 self.spaces[space].ecn_feedback = frame::EcnCounts::ZERO;
+                false
             }
-            Ok(false) => {}
+            Ok(false) => false,
             Ok(true) => {
                 self.stats.path.congestion_events += 1;
-                self.path
-                    .congestion
-                    .on_congestion_event(now, largest_sent_time, false, 0);
+                true
             }
         }
     }
 
+    fn notify_congestion_event(
+        &mut self,
+        now: Instant,
+        prior_in_flight: u64,
+        acked_packets: &[AckedPacket],
+        lost_packets: &[LostPacket],
+        ecn: bool,
+        ecn_sent: Option<Instant>,
+        is_persistent_congestion: bool,
+    ) {
+        if acked_packets.is_empty() && lost_packets.is_empty() && !ecn {
+            return;
+        }
+
+        let app_limited = self.app_limited;
+        let in_flight = self.path.in_flight.bytes;
+        let rtt = &self.path.rtt;
+        self.path.congestion.on_ack_and_loss(CongestionEvent {
+            now,
+            prior_in_flight,
+            in_flight,
+            app_limited,
+            rtt,
+            acked_packets,
+            lost_packets,
+            ecn,
+            ecn_sent,
+            is_persistent_congestion,
+        });
+    }
+
     // Not timing-aware, so it's safe to call this for inferred acks, such as arise from
     // high-latency handshakes
-    fn on_packet_acked(&mut self, now: Instant, pn: u64, info: SentPacket) {
+    fn on_packet_acked(&mut self, pn: u64, info: SentPacket) -> Option<AckedPacket> {
         self.remove_in_flight(pn, &info);
-        if info.ack_eliciting && self.path.challenge.is_none() {
-            // Only pass ACKs to the congestion controller if we are not validating the current
-            // path, so as to ignore any ACKs from older paths still coming in.
-            self.path.congestion.on_ack(
-                now,
-                info.time_sent,
-                info.size.into(),
-                self.app_limited,
-                &self.path.rtt,
-            );
-        }
+        let acked = (info.ack_eliciting && self.path.challenge.is_none()).then_some(AckedPacket {
+            packet_number: info.congestion_packet_number,
+            sent: info.time_sent,
+            bytes: info.size.into(),
+        });
 
         // Update state for confirmed delivery of frames
         if let Some(retransmits) = info.retransmits.get() {
@@ -1555,6 +1591,8 @@ impl Connection {
         for frame in info.stream_frames {
             self.streams.received_ack_of(frame);
         }
+
+        acked
     }
 
     fn set_key_discard_timer(&mut self, now: Instant, space: SpaceId) {
@@ -1576,7 +1614,17 @@ impl Connection {
     fn on_loss_detection_timeout(&mut self, now: Instant) {
         if let Some((_, pn_space)) = self.loss_time_and_space() {
             // Time threshold loss Detection
-            self.detect_lost_packets(now, pn_space, false);
+            let prior_in_flight = self.path.in_flight.bytes;
+            let detected_loss = self.detect_lost_packets(now, pn_space, false);
+            self.notify_congestion_event(
+                now,
+                prior_in_flight,
+                &[],
+                &detected_loss.packets,
+                false,
+                None,
+                detected_loss.is_persistent_congestion,
+            );
             self.set_loss_detection_timer(now);
             return;
         }
@@ -1610,8 +1658,14 @@ impl Connection {
         self.set_loss_detection_timer(now);
     }
 
-    fn detect_lost_packets(&mut self, now: Instant, pn_space: SpaceId, due_to_ack: bool) {
+    fn detect_lost_packets(
+        &mut self,
+        now: Instant,
+        pn_space: SpaceId,
+        due_to_ack: bool,
+    ) -> DetectedLoss {
         let mut lost_packets = Vec::<u64>::new();
+        let mut congestion_lost_packets = Vec::new();
         let mut lost_mtu_probe = None;
         let in_flight_mtu_probe = self.path.mtud.in_flight_mtu_probe();
         let rtt = self.path.rtt.conservative();
@@ -1683,9 +1737,8 @@ impl Connection {
         }
 
         // OnPacketsLost
-        if let Some(largest_lost) = lost_packets.last().cloned() {
+        if !lost_packets.is_empty() {
             let old_bytes_in_flight = self.path.in_flight.bytes;
-            let largest_lost_sent = self.spaces[pn_space].sent_packets[&largest_lost].time_sent;
             self.lost_packets += lost_packets.len() as u64;
             self.stats.path.lost_packets += lost_packets.len() as u64;
             self.stats.path.lost_bytes += size_of_lost_packets;
@@ -1697,6 +1750,13 @@ impl Connection {
             for &packet in &lost_packets {
                 let info = self.spaces[pn_space].take(packet).unwrap(); // safe: lost_packets is populated just above
                 self.remove_in_flight(packet, &info);
+                if info.ack_eliciting && self.path.challenge.is_none() {
+                    congestion_lost_packets.push(LostPacket {
+                        packet_number: info.congestion_packet_number,
+                        sent: info.time_sent,
+                        bytes: info.size.into(),
+                    });
+                }
                 for frame in info.stream_frames {
                     self.streams.retransmit(frame);
                 }
@@ -1719,12 +1779,6 @@ impl Connection {
 
             if lost_ack_eliciting {
                 self.stats.path.congestion_events += 1;
-                self.path.congestion.on_congestion_event(
-                    now,
-                    largest_lost_sent,
-                    in_persistent_congestion,
-                    size_of_lost_packets,
-                );
             }
         }
 
@@ -1734,6 +1788,11 @@ impl Connection {
             self.remove_in_flight(packet, &info);
             self.path.mtud.on_probe_lost();
             self.stats.path.lost_plpmtud_probes += 1;
+        }
+
+        DetectedLoss {
+            packets: congestion_lost_packets,
+            is_persistent_congestion: in_persistent_congestion,
         }
     }
 
@@ -2120,6 +2179,11 @@ impl Connection {
         space.in_flight = 0;
         let sent_packets = mem::take(&mut space.sent_packets);
         for (pn, packet) in sent_packets.into_iter() {
+            if packet.ack_eliciting {
+                self.path
+                    .congestion
+                    .on_packet_neutered(packet.congestion_packet_number);
+            }
             self.remove_in_flight(pn, &packet);
         }
         self.set_loss_detection_timer(now)
@@ -2403,7 +2467,18 @@ impl Connection {
 
                 let space = &mut self.spaces[SpaceId::Initial];
                 if let Some(info) = space.take(0) {
-                    self.on_packet_acked(now, 0, info);
+                    let prior_in_flight = self.path.in_flight.bytes;
+                    if let Some(acked) = self.on_packet_acked(0, info) {
+                        self.notify_congestion_event(
+                            now,
+                            prior_in_flight,
+                            &[acked],
+                            &[],
+                            false,
+                            None,
+                            false,
+                        );
+                    }
                 };
 
                 self.discard_space(now, SpaceId::Initial); // Make sure we clean up after any retransmitted Initials
@@ -2424,6 +2499,11 @@ impl Connection {
                 // Retransmit all 0-RTT data
                 let zero_rtt = mem::take(&mut self.spaces[SpaceId::Data].sent_packets);
                 for (pn, info) in zero_rtt {
+                    if info.ack_eliciting {
+                        self.path
+                            .congestion
+                            .on_packet_neutered(info.congestion_packet_number);
+                    }
                     self.remove_in_flight(pn, &info);
                     self.spaces[SpaceId::Data].pending |= info.retransmits;
                 }
@@ -2490,6 +2570,11 @@ impl Connection {
                             let sent_packets =
                                 mem::take(&mut self.spaces[SpaceId::Data].sent_packets);
                             for (pn, packet) in sent_packets {
+                                if packet.ack_eliciting {
+                                    self.path
+                                        .congestion
+                                        .on_packet_neutered(packet.congestion_packet_number);
+                                }
                                 self.remove_in_flight(pn, &packet);
                             }
                         } else {

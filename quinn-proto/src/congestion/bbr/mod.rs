@@ -4,14 +4,17 @@ use std::sync::Arc;
 
 use rand::{Rng, SeedableRng};
 
-use crate::congestion::bbr::bw_estimation::BandwidthEstimation;
+use crate::congestion::bbr::bandwidth_sampler::{
+    BandwidthSampler, SendTimeState, bandwidth_from_delta,
+};
 use crate::congestion::bbr::min_max::MinMax;
+#[cfg(test)]
 use crate::connection::RttEstimator;
 use crate::{Duration, Instant};
 
-use super::{BASE_DATAGRAM_SIZE, Controller, ControllerFactory};
+use super::{BASE_DATAGRAM_SIZE, CongestionEvent, Controller, ControllerFactory, SentPacketInfo};
 
-mod bw_estimation;
+mod bandwidth_sampler;
 mod min_max;
 
 /// Experimental! Use at your own risk.
@@ -24,7 +27,8 @@ mod min_max;
 pub struct Bbr {
     config: Arc<BbrConfig>,
     current_mtu: u64,
-    max_bandwidth: BandwidthEstimation,
+    bandwidth_sampler: BandwidthSampler,
+    max_bandwidth: MinMax,
     acked_bytes: u64,
     mode: Mode,
     loss_state: LossState,
@@ -53,9 +57,9 @@ pub struct Bbr {
     current_cycle_offset: u8,
     init_cwnd: u64,
     min_cwnd: u64,
-    prev_in_flight_count: u64,
     exit_probe_rtt_at: Option<Instant>,
-    probe_rtt_last_started_at: Option<Instant>,
+    probe_rtt_round_passed: bool,
+    min_rtt_timestamp: Option<Instant>,
     min_rtt: Duration,
     exiting_quiescence: bool,
     pacing_rate: u64,
@@ -63,7 +67,7 @@ pub struct Bbr {
     max_sent_packet_number: u64,
     end_recovery_at_packet_number: u64,
     cwnd: u64,
-    current_round_trip_end_packet_number: u64,
+    current_round_trip_end_packet_number: Option<u64>,
     round_count: u64,
     bw_at_last_round: u64,
     round_wo_bw_gain: u64,
@@ -79,7 +83,8 @@ impl Bbr {
         Self {
             config,
             current_mtu: current_mtu as u64,
-            max_bandwidth: BandwidthEstimation::default(),
+            bandwidth_sampler: BandwidthSampler::default(),
+            max_bandwidth: MinMax::new(K_BANDWIDTH_WINDOW_SIZE),
             acked_bytes: 0,
             mode: Mode::Startup,
             loss_state: Default::default(),
@@ -108,9 +113,9 @@ impl Bbr {
             current_cycle_offset: 0,
             init_cwnd: initial_window,
             min_cwnd: calculate_min_window(current_mtu as u64),
-            prev_in_flight_count: 0,
             exit_probe_rtt_at: None,
-            probe_rtt_last_started_at: None,
+            probe_rtt_round_passed: false,
+            min_rtt_timestamp: None,
             min_rtt: Default::default(),
             exiting_quiescence: false,
             pacing_rate: 0,
@@ -118,7 +123,7 @@ impl Bbr {
             max_sent_packet_number: 0,
             end_recovery_at_packet_number: 0,
             cwnd: initial_window,
-            current_round_trip_end_packet_number: 0,
+            current_round_trip_end_packet_number: None,
             round_count: 0,
             bw_at_last_round: 0,
             round_wo_bw_gain: 0,
@@ -151,6 +156,9 @@ impl Bbr {
     }
 
     fn update_recovery_state(&mut self, is_round_start: bool) {
+        if !self.is_at_full_bandwidth {
+            return;
+        }
         // Exit recovery when there are no losses for a round.
         if self.loss_state.has_losses() {
             self.end_recovery_at_packet_number = self.max_sent_packet_number;
@@ -164,7 +172,7 @@ impl Bbr {
                 self.recovery_window = 0;
                 // Since the conservation phase is meant to be lasting for a whole
                 // round, extend the current round as if it were started right now.
-                self.current_round_trip_end_packet_number = self.max_sent_packet_number;
+                self.current_round_trip_end_packet_number = Some(self.max_sent_packet_number);
             }
             RecoveryState::Growth | RecoveryState::Conservation => {
                 if self.recovery_state == RecoveryState::Conservation && is_round_start {
@@ -194,7 +202,7 @@ impl Bbr {
         // hold that much.
         if self.pacing_gain > 1.0
             && !self.loss_state.has_losses()
-            && self.prev_in_flight_count < self.get_target_cwnd(self.pacing_gain)
+            && in_flight < self.get_target_cwnd(self.pacing_gain)
         {
             should_advance_gain_cycling = false;
         }
@@ -235,12 +243,18 @@ impl Bbr {
         }
     }
 
-    fn is_min_rtt_expired(&self, now: Instant, app_limited: bool) -> bool {
-        !app_limited
-            && self
-                .probe_rtt_last_started_at
-                .map(|last| now.saturating_duration_since(last) > Duration::from_secs(10))
-                .unwrap_or(true)
+    fn is_min_rtt_expired(&self, now: Instant) -> bool {
+        self.min_rtt_timestamp
+            .is_some_and(|timestamp| now.saturating_duration_since(timestamp) > K_MIN_RTT_EXPIRY)
+    }
+
+    fn maybe_update_min_rtt(&mut self, now: Instant, sample_rtt: Duration) -> bool {
+        let expired = self.is_min_rtt_expired(now);
+        if self.min_rtt.is_zero() || sample_rtt < self.min_rtt || expired {
+            self.min_rtt = sample_rtt;
+            self.min_rtt_timestamp = Some(now);
+        }
+        expired
     }
 
     fn maybe_enter_or_exit_probe_rtt(
@@ -248,16 +262,14 @@ impl Bbr {
         now: Instant,
         is_round_start: bool,
         bytes_in_flight: u64,
-        app_limited: bool,
+        min_rtt_expired: bool,
     ) {
-        let min_rtt_expired = self.is_min_rtt_expired(now, app_limited);
         if min_rtt_expired && !self.exiting_quiescence && self.mode != Mode::ProbeRtt {
             self.mode = Mode::ProbeRtt;
             self.pacing_gain = 1.0;
             // Do not decide on the time to exit ProbeRtt until the
             // |bytes_in_flight| is at the target small value.
             self.exit_probe_rtt_at = None;
-            self.probe_rtt_last_started_at = Some(now);
         }
 
         if self.mode == Mode::ProbeRtt {
@@ -269,8 +281,14 @@ impl Bbr {
                 if bytes_in_flight < self.get_probe_rtt_cwnd() + self.current_mtu {
                     const K_PROBE_RTT_TIME: Duration = Duration::from_millis(200);
                     self.exit_probe_rtt_at = Some(now + K_PROBE_RTT_TIME);
+                    self.probe_rtt_round_passed = false;
                 }
-            } else if is_round_start && now >= self.exit_probe_rtt_at.unwrap() {
+            } else {
+                self.probe_rtt_round_passed |= is_round_start;
+            }
+            if self.exit_probe_rtt_at.is_some_and(|exit| now >= exit) && self.probe_rtt_round_passed
+            {
+                self.min_rtt_timestamp = Some(now);
                 if !self.is_at_full_bandwidth {
                     self.enter_startup_mode();
                 } else {
@@ -283,7 +301,7 @@ impl Bbr {
     }
 
     fn get_target_cwnd(&self, gain: f32) -> u64 {
-        let bw = self.max_bandwidth.get_estimate();
+        let bw = self.max_bandwidth.get();
         let bdp = self.min_rtt.as_micros() as u64 * bw;
         let bdpf = bdp as f64;
         let cwnd = ((gain as f64 * bdpf) / 1_000_000f64) as u64;
@@ -305,15 +323,11 @@ impl Bbr {
     }
 
     fn get_probe_rtt_cwnd(&self) -> u64 {
-        const K_MODERATE_PROBE_RTT_MULTIPLIER: f32 = 0.75;
-        if PROBE_RTT_BASED_ON_BDP {
-            return self.get_target_cwnd(K_MODERATE_PROBE_RTT_MULTIPLIER);
-        }
         self.min_cwnd
     }
 
     fn calculate_pacing_rate(&mut self, bytes_lost: u64) {
-        let bw = self.max_bandwidth.get_estimate();
+        let bw = self.max_bandwidth.get();
         if bw == 0 {
             return;
         }
@@ -326,8 +340,7 @@ impl Bbr {
         // Pace at the rate of initial_window / RTT as soon as RTT measurements are
         // available.
         if self.pacing_rate == 0 && self.min_rtt.as_nanos() != 0 {
-            self.pacing_rate =
-                BandwidthEstimation::bw_from_delta(self.init_cwnd, self.min_rtt).unwrap();
+            self.pacing_rate = bandwidth_from_delta(self.init_cwnd, self.min_rtt);
             return;
         }
 
@@ -343,11 +356,8 @@ impl Bbr {
                         .saturating_mul(self.bytes_lost_multiplier_while_detecting_overshooting)
                         > self.init_cwnd)
             {
-                let min_rate = BandwidthEstimation::bw_from_delta(
-                    self.cwnd_to_calculate_min_pacing_rate,
-                    self.min_rtt,
-                )
-                .unwrap_or(0);
+                let min_rate =
+                    bandwidth_from_delta(self.cwnd_to_calculate_min_pacing_rate, self.min_rtt);
                 self.pacing_rate = target_rate.max(min_rate);
                 self.bytes_lost_while_detecting_overshooting = 0;
                 self.detect_overshooting = false;
@@ -428,12 +438,12 @@ impl Bbr {
     }
 
     /// <https://datatracker.ietf.org/doc/html/draft-cardwell-iccrg-bbr-congestion-control#section-4.3.2.2>
-    fn check_if_full_bw_reached(&mut self, app_limited: bool) {
-        if app_limited {
+    fn check_if_full_bw_reached(&mut self, last_packet_send_state: Option<SendTimeState>) {
+        if last_packet_send_state.is_some_and(|state| state.is_app_limited) {
             return;
         }
         let target = (self.bw_at_last_round as f64 * K_STARTUP_GROWTH_TARGET as f64) as u64;
-        let bw = self.max_bandwidth.get_estimate();
+        let bw = self.max_bandwidth.get();
         if bw >= target {
             self.bw_at_last_round = bw;
             self.round_wo_bw_gain = 0;
@@ -446,9 +456,11 @@ impl Bbr {
         self.round_wo_bw_gain += 1;
         let excessive_startup_loss = self.exit_startup_on_loss
             && self.loss_events_in_round >= K_STARTUP_FULL_LOSS_COUNT
-            && self.prev_in_flight_count > 0
-            && self.bytes_lost_in_round
-                > (self.prev_in_flight_count as f64 * K_STARTUP_LOSS_THRESHOLD) as u64;
+            && last_packet_send_state.is_some_and(|state| {
+                state.bytes_in_flight > 0
+                    && self.bytes_lost_in_round
+                        > (state.bytes_in_flight as f64 * K_STARTUP_LOSS_THRESHOLD) as u64
+            });
         if self.round_wo_bw_gain >= self.startup_rounds || excessive_startup_loss {
             self.is_at_full_bandwidth = true;
         }
@@ -456,77 +468,104 @@ impl Bbr {
 }
 
 impl Controller for Bbr {
-    fn on_sent(&mut self, now: Instant, bytes: u64, last_packet_number: u64) {
-        self.max_sent_packet_number = last_packet_number;
-        self.max_bandwidth.on_sent(now, bytes);
-    }
-
-    fn on_ack(
-        &mut self,
-        now: Instant,
-        sent: Instant,
-        bytes: u64,
-        app_limited: bool,
-        rtt: &RttEstimator,
-    ) {
-        self.max_bandwidth
-            .on_ack(now, sent, bytes, self.round_count, app_limited);
-        self.has_non_app_limited_sample |= !app_limited;
-        self.acked_bytes += bytes;
-        if self.is_min_rtt_expired(now, app_limited) || self.min_rtt > rtt.min() {
-            self.min_rtt = rtt.min();
+    fn on_packet_sent(&mut self, packet: SentPacketInfo) {
+        self.max_sent_packet_number = packet.packet_number;
+        if packet.bytes_in_flight == 0 {
+            self.exiting_quiescence = true;
         }
+        self.bandwidth_sampler.on_packet_sent(
+            packet.now,
+            packet.packet_number,
+            packet.bytes,
+            packet.bytes_in_flight,
+            packet.app_limited,
+        );
     }
 
-    fn on_end_acks(
-        &mut self,
-        now: Instant,
-        in_flight: u64,
-        app_limited: bool,
-        largest_packet_num_acked: Option<u64>,
-    ) {
-        let bytes_acked = self.max_bandwidth.bytes_acked_this_window();
-        let excess_acked = self.ack_aggregation.update_ack_aggregation_bytes(
-            bytes_acked,
-            now,
-            self.round_count,
-            self.max_bandwidth.get_estimate(),
+    fn on_ack_and_loss(&mut self, event: CongestionEvent<'_>) {
+        if event.app_limited || event.prior_in_flight < self.get_target_cwnd(1.0) {
+            self.bandwidth_sampler.on_app_limited();
+        }
+        let sample = self.bandwidth_sampler.on_congestion_event(
+            event.now,
+            event.acked_packets,
+            event.lost_packets,
         );
-        self.max_bandwidth.end_acks(self.round_count, app_limited);
-        if let Some(largest_acked_packet) = largest_packet_num_acked {
-            self.max_acked_packet_number = largest_acked_packet;
+        self.loss_state.lost_bytes = sample.bytes_lost;
+        if sample.bytes_lost > 0 {
+            self.loss_events_in_round = self.loss_events_in_round.saturating_add(1);
+            self.bytes_lost_in_round = self.bytes_lost_in_round.saturating_add(sample.bytes_lost);
         }
 
         let mut is_round_start = false;
-        if bytes_acked > 0 {
-            is_round_start =
-                self.max_acked_packet_number > self.current_round_trip_end_packet_number;
-            if is_round_start {
-                self.current_round_trip_end_packet_number = self.max_sent_packet_number;
-                self.round_count += 1;
+        if sample.bytes_acked > 0 {
+            if let Some(largest_acked_packet) = event.acked_packets.last() {
+                self.max_acked_packet_number = largest_acked_packet.packet_number;
             }
+            is_round_start = self
+                .current_round_trip_end_packet_number
+                .is_none_or(|end| self.max_acked_packet_number > end);
+            if is_round_start {
+                self.current_round_trip_end_packet_number = Some(self.max_sent_packet_number);
+                self.round_count = self.round_count.saturating_add(1);
+            }
+            self.update_recovery_state(is_round_start);
         }
 
-        self.update_recovery_state(is_round_start);
+        if sample.bytes_acked > 0
+            && (!sample.sample_is_app_limited || sample.max_bandwidth > self.max_bandwidth.get())
+        {
+            self.max_bandwidth
+                .update_max(self.round_count, sample.max_bandwidth);
+        }
+
+        self.has_non_app_limited_sample |=
+            sample.max_bandwidth > 0 && !sample.sample_is_app_limited;
+        self.acked_bytes = self.acked_bytes.saturating_add(sample.bytes_acked);
+        let min_rtt_expired = sample
+            .sample_rtt
+            .is_some_and(|rtt| self.maybe_update_min_rtt(event.now, rtt));
+
+        let excess_acked = if sample.bytes_acked == 0 {
+            0
+        } else {
+            self.ack_aggregation.update_ack_aggregation_bytes(
+                sample.bytes_acked,
+                event.now,
+                self.round_count,
+                self.max_bandwidth.get(),
+            )
+        };
 
         if self.mode == Mode::ProbeBw {
-            self.update_gain_cycle_phase(now, in_flight);
+            self.update_gain_cycle_phase(event.now, event.prior_in_flight);
         }
 
         if is_round_start && !self.is_at_full_bandwidth {
-            self.check_if_full_bw_reached(app_limited);
+            self.check_if_full_bw_reached(sample.last_packet_send_state);
         }
 
-        self.maybe_exit_startup_or_drain(now, in_flight);
+        self.maybe_exit_startup_or_drain(event.now, event.in_flight);
 
-        self.maybe_enter_or_exit_probe_rtt(now, is_round_start, in_flight, app_limited);
+        self.maybe_enter_or_exit_probe_rtt(
+            event.now,
+            is_round_start,
+            event.in_flight,
+            min_rtt_expired,
+        );
+        if self.mode == Mode::ProbeRtt {
+            self.bandwidth_sampler.on_app_limited();
+        }
 
         // After the model is updated, recalculate the pacing rate and congestion window.
         self.calculate_pacing_rate(self.loss_state.lost_bytes);
-        self.calculate_cwnd(bytes_acked, excess_acked);
-        self.calculate_recovery_window(bytes_acked, self.loss_state.lost_bytes, in_flight);
+        self.calculate_cwnd(sample.bytes_acked, excess_acked);
+        self.calculate_recovery_window(
+            sample.bytes_acked,
+            self.loss_state.lost_bytes,
+            event.in_flight,
+        );
 
-        self.prev_in_flight_count = in_flight;
         if is_round_start {
             self.loss_events_in_round = 0;
             self.bytes_lost_in_round = 0;
@@ -557,6 +596,10 @@ impl Controller for Bbr {
             .max(self.min_cwnd);
         self.cwnd = self.clamp_cwnd(self.cwnd);
         self.recovery_window = self.recovery_window.min(self.max_cwnd());
+    }
+
+    fn on_packet_neutered(&mut self, packet_number: u64) {
+        self.bandwidth_sampler.on_packet_neutered(packet_number);
     }
 
     fn window(&self) -> u64 {
@@ -825,16 +868,197 @@ const K_STARTUP_FULL_LOSS_COUNT: u64 = 8;
 const K_STARTUP_LOSS_THRESHOLD: f64 = 0.02;
 const K_HYSTERIA_INITIAL_WINDOW_PACKETS: u64 = 32;
 const K_HYSTERIA_MAX_CONGESTION_WINDOW_PACKETS: u64 = 20_000;
+const K_BANDWIDTH_WINDOW_SIZE: u64 = 10;
+const K_MIN_RTT_EXPIRY: Duration = Duration::from_secs(10);
 
 // Do not allow initial congestion window to be greater than 200 packets.
 const K_MAX_INITIAL_CONGESTION_WINDOW: u64 = 200;
 
-const PROBE_RTT_BASED_ON_BDP: bool = true;
 const DRAIN_TO_TARGET: bool = true;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ack_one_packet(bbr: &mut Bbr, sent_at: Instant, acked_at: Instant, packet_number: u64) {
+        let bytes_in_flight = if packet_number == 0 {
+            0
+        } else {
+            BASE_DATAGRAM_SIZE
+        };
+        bbr.on_packet_sent(super::super::SentPacketInfo {
+            now: sent_at,
+            packet_number,
+            bytes: BASE_DATAGRAM_SIZE,
+            bytes_in_flight,
+            app_limited: false,
+        });
+        bbr.on_ack_and_loss(super::super::CongestionEvent {
+            now: acked_at,
+            prior_in_flight: bytes_in_flight + BASE_DATAGRAM_SIZE,
+            in_flight: bytes_in_flight,
+            app_limited: false,
+            rtt: &RttEstimator::new(Duration::from_millis(333)),
+            acked_packets: &[super::super::AckedPacket {
+                packet_number,
+                sent: sent_at,
+                bytes: BASE_DATAGRAM_SIZE,
+            }],
+            lost_packets: &[],
+            ecn: false,
+            ecn_sent: None,
+            is_persistent_congestion: false,
+        });
+    }
+
+    #[test]
+    fn first_rtt_sample_starts_the_probe_rtt_expiry_clock() {
+        let start = Instant::now();
+        let mut bbr = Bbr::new(Arc::new(BbrConfig::default()), BASE_DATAGRAM_SIZE as u16);
+
+        ack_one_packet(&mut bbr, start, start + Duration::from_millis(100), 0);
+        assert_eq!(bbr.mode, Mode::Startup);
+        assert_eq!(bbr.round_count, 1);
+        assert_eq!(
+            bbr.min_rtt_timestamp,
+            Some(start + Duration::from_millis(100))
+        );
+
+        ack_one_packet(
+            &mut bbr,
+            start + Duration::from_secs(9),
+            start + Duration::from_millis(9_100),
+            1,
+        );
+        assert_eq!(bbr.mode, Mode::Startup);
+
+        ack_one_packet(
+            &mut bbr,
+            start + Duration::from_secs(11),
+            start + Duration::from_millis(11_100),
+            2,
+        );
+        assert_eq!(bbr.mode, Mode::ProbeRtt);
+    }
+
+    #[test]
+    fn startup_loss_does_not_enter_recovery_before_full_bandwidth() {
+        let start = Instant::now();
+        let mut bbr = Bbr::new(Arc::new(BbrConfig::default()), BASE_DATAGRAM_SIZE as u16);
+        bbr.on_packet_sent(super::super::SentPacketInfo {
+            now: start,
+            packet_number: 0,
+            bytes: BASE_DATAGRAM_SIZE,
+            bytes_in_flight: 0,
+            app_limited: false,
+        });
+        bbr.on_packet_sent(super::super::SentPacketInfo {
+            now: start + Duration::from_millis(1),
+            packet_number: 1,
+            bytes: BASE_DATAGRAM_SIZE,
+            bytes_in_flight: BASE_DATAGRAM_SIZE,
+            app_limited: false,
+        });
+
+        bbr.on_ack_and_loss(super::super::CongestionEvent {
+            now: start + Duration::from_millis(100),
+            prior_in_flight: 2 * BASE_DATAGRAM_SIZE,
+            in_flight: 0,
+            app_limited: false,
+            rtt: &RttEstimator::new(Duration::from_millis(333)),
+            acked_packets: &[super::super::AckedPacket {
+                packet_number: 0,
+                sent: start,
+                bytes: BASE_DATAGRAM_SIZE,
+            }],
+            lost_packets: &[super::super::LostPacket {
+                packet_number: 1,
+                sent: start + Duration::from_millis(1),
+                bytes: BASE_DATAGRAM_SIZE,
+            }],
+            ecn: false,
+            ecn_sent: None,
+            is_persistent_congestion: false,
+        });
+
+        assert_eq!(bbr.recovery_state, RecoveryState::NotInRecovery);
+        assert_eq!(bbr.bytes_lost_in_round, 0);
+    }
+
+    #[test]
+    fn startup_loss_uses_inflight_captured_when_the_packet_was_sent() {
+        let mut config = BbrConfig::default();
+        config.hysteria_profile(BbrProfile::HysteriaStandard);
+        let mut bbr = Bbr::new(Arc::new(config), BASE_DATAGRAM_SIZE as u16);
+        bbr.bw_at_last_round = 1_000;
+        bbr.max_bandwidth.update_max(0, 1_000);
+        bbr.loss_events_in_round = K_STARTUP_FULL_LOSS_COUNT;
+        bbr.bytes_lost_in_round = 21;
+        bbr.check_if_full_bw_reached(Some(SendTimeState {
+            packet_number: 9,
+            is_app_limited: false,
+            total_bytes_sent: 1_000,
+            total_bytes_acked: 0,
+            bytes_in_flight: 1_000,
+        }));
+
+        assert!(bbr.is_at_full_bandwidth);
+    }
+
+    #[test]
+    fn probe_rtt_round_can_complete_before_the_timer() {
+        let start = Instant::now();
+        let mut bbr = Bbr::new(Arc::new(BbrConfig::default()), BASE_DATAGRAM_SIZE as u16);
+        bbr.mode = Mode::ProbeRtt;
+        bbr.is_at_full_bandwidth = true;
+        bbr.exit_probe_rtt_at = Some(start + Duration::from_millis(200));
+        bbr.probe_rtt_round_passed = false;
+
+        bbr.maybe_enter_or_exit_probe_rtt(start + Duration::from_millis(100), true, 0, false);
+        assert_eq!(bbr.mode, Mode::ProbeRtt);
+        bbr.maybe_enter_or_exit_probe_rtt(start + Duration::from_millis(250), false, 0, false);
+
+        assert_eq!(bbr.mode, Mode::ProbeBw);
+        assert_eq!(bbr.get_probe_rtt_cwnd(), bbr.min_cwnd);
+    }
+
+    #[test]
+    fn loss_only_event_does_not_reset_ack_aggregation_epoch() {
+        let start = Instant::now();
+        let mut bbr = Bbr::new(Arc::new(BbrConfig::default()), BASE_DATAGRAM_SIZE as u16);
+        bbr.ack_aggregation.aggregation_epoch_start_time = Some(start);
+        bbr.ack_aggregation.aggregation_epoch_bytes = 4_000;
+        bbr.on_packet_sent(super::super::SentPacketInfo {
+            now: start,
+            packet_number: 0,
+            bytes: BASE_DATAGRAM_SIZE,
+            bytes_in_flight: 0,
+            app_limited: false,
+        });
+
+        bbr.on_ack_and_loss(super::super::CongestionEvent {
+            now: start + Duration::from_millis(100),
+            prior_in_flight: BASE_DATAGRAM_SIZE,
+            in_flight: 0,
+            app_limited: false,
+            rtt: &RttEstimator::new(Duration::from_millis(100)),
+            acked_packets: &[],
+            lost_packets: &[super::super::LostPacket {
+                packet_number: 0,
+                sent: start,
+                bytes: BASE_DATAGRAM_SIZE,
+            }],
+            ecn: false,
+            ecn_sent: None,
+            is_persistent_congestion: false,
+        });
+
+        assert_eq!(
+            bbr.ack_aggregation.aggregation_epoch_start_time,
+            Some(start)
+        );
+        assert_eq!(bbr.ack_aggregation.aggregation_epoch_bytes, 4_000);
+    }
 
     #[test]
     fn startup_loss_does_not_end_bandwidth_growth_early() {
@@ -843,7 +1067,13 @@ mod tests {
         bbr.round_wo_bw_gain = 1;
         bbr.recovery_state = RecoveryState::Conservation;
 
-        bbr.check_if_full_bw_reached(false);
+        bbr.check_if_full_bw_reached(Some(SendTimeState {
+            packet_number: 0,
+            is_app_limited: false,
+            total_bytes_sent: 0,
+            total_bytes_acked: 0,
+            bytes_in_flight: BASE_DATAGRAM_SIZE,
+        }));
 
         assert_eq!(bbr.round_wo_bw_gain, 2);
         assert!(!bbr.is_at_full_bandwidth);

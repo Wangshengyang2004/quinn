@@ -277,6 +277,8 @@ impl IndexMut<SpaceId> for [PacketSpace; 3] {
 /// Represents one or more packets subject to retransmission
 #[derive(Debug, Clone)]
 pub(super) struct SentPacket {
+    /// Monotonic identifier used by congestion control across packet number spaces.
+    pub(super) congestion_packet_number: u64,
     /// The time the packet was sent.
     pub(super) time_sent: Instant,
     /// The number of bytes sent in the packet, not including UDP or IP overhead, but including QUIC
