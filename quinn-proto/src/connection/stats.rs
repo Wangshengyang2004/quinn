@@ -159,6 +159,8 @@ pub struct PathStats {
 #[derive(Debug, Default, Copy, Clone)]
 #[non_exhaustive]
 pub struct ConnectionStats {
+    /// Compact congestion model observation, read without cloning per-packet state.
+    pub congestion_model: Option<crate::congestion::ControllerDiagnostics>,
     /// Statistics about UDP datagrams transmitted on a connection
     pub udp_tx: UdpStats,
     /// Statistics about UDP datagrams received on a connection

@@ -35,6 +35,7 @@ use crate::{
 mod util;
 use util::*;
 
+mod supply;
 mod token;
 
 #[derive(Clone)]

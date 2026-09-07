@@ -5,7 +5,7 @@ use std::sync::Arc;
 use rand::{Rng, SeedableRng};
 
 use crate::congestion::bbr::bandwidth_sampler::{
-    BandwidthSampler, SendTimeState, bandwidth_from_delta,
+    BandwidthSampler, CongestionEventSample, SendTimeState, bandwidth_from_delta,
 };
 use crate::congestion::bbr::min_max::MinMax;
 #[cfg(test)]
@@ -25,6 +25,15 @@ mod min_max;
 /// More discussion and links at <https://groups.google.com/g/bbr-dev>.
 #[derive(Debug, Clone)]
 pub struct Bbr {
+    diagnostic_feedback: super::FeedbackDiagnostics,
+    ramp_budget: Option<(Instant, u64)>,
+    ramp_exit: &'static str,
+    probe_cycle_bw: u64,
+    probe_extensions: u64,
+    probe_episode: Option<(Instant, Instant)>,
+    probe_restarts: u64,
+    probe_episode_count: u64,
+    probe_aborts: u64,
     config: Arc<BbrConfig>,
     current_mtu: u64,
     bandwidth_sampler: BandwidthSampler,
@@ -81,6 +90,15 @@ impl Bbr {
         let initial_window = config.computed_initial_window(current_mtu);
         let profile = config.profile.config();
         Self {
+            diagnostic_feedback: super::FeedbackDiagnostics::default(),
+            ramp_budget: None,
+            ramp_exit: "none",
+            probe_cycle_bw: 0,
+            probe_extensions: 0,
+            probe_episode: None,
+            probe_restarts: 0,
+            probe_episode_count: 0,
+            probe_aborts: 0,
             config,
             current_mtu: current_mtu as u64,
             bandwidth_sampler: BandwidthSampler::default(),
@@ -142,6 +160,7 @@ impl Bbr {
         self.mode = Mode::ProbeBw;
         self.cwnd_gain = self.cwnd_gain_constant;
         self.last_cycle_start = Some(now);
+        self.probe_cycle_bw = self.max_bandwidth.get();
         // Pick a random offset for the gain cycle out of {0, 2..7} range. 1 is
         // excluded because in that case increased gain and decreased gain would not
         // follow each other.
@@ -189,7 +208,108 @@ impl Bbr {
         }
     }
 
-    fn update_gain_cycle_phase(&mut self, now: Instant, in_flight: u64) {
+    fn has_clear_probe_growth(
+        &self,
+        event: &CongestionEvent<'_>,
+        sample: &CongestionEventSample,
+    ) -> bool {
+        if !self.config.feedback_probe
+            || self.mode != Mode::ProbeBw
+            || self.min_rtt.is_zero()
+            || self.probe_cycle_bw == 0
+            || sample.bytes_acked == 0
+            || sample.sample_is_app_limited
+            || event.app_limited
+            || sample.bytes_lost != 0
+            || self.bytes_lost_in_round != 0
+            || self.recovery_state.in_recovery()
+            || event.ecn
+            || event.is_persistent_congestion
+        {
+            return false;
+        }
+        let queue_limit = self.min_rtt.saturating_add(self.min_rtt / 20);
+        u128::from(sample.max_bandwidth) * 10 >= u128::from(self.probe_cycle_bw) * 11
+            && sample
+                .sample_rtt
+                .is_some_and(|rtt| !rtt.is_zero() && rtt <= queue_limit)
+            && event.rtt.get() <= queue_limit
+    }
+
+    fn can_extend_growth_probe(
+        &self,
+        event: &CongestionEvent<'_>,
+        sample: &CongestionEventSample,
+    ) -> bool {
+        self.has_clear_probe_growth(event, sample)
+            && self.pacing_gain > 1.0
+            && self
+                .probe_episode
+                .is_some_and(|(deadline, _)| event.now < deadline)
+            && self.last_cycle_start.is_some_and(|start| {
+                event.now >= start
+                    && event.now.duration_since(start) < self.min_rtt.saturating_mul(8)
+            })
+    }
+
+    fn update_growth_probe(
+        &mut self,
+        event: &CongestionEvent<'_>,
+        sample: &CongestionEventSample,
+    ) -> bool {
+        if !self.config.feedback_probe || self.mode != Mode::ProbeBw {
+            return false;
+        }
+        let queue_limit = self.min_rtt.saturating_add(self.min_rtt / 20);
+        let congested = sample.bytes_lost != 0
+            || self.bytes_lost_in_round != 0
+            || self.recovery_state.in_recovery()
+            || event.ecn
+            || event.is_persistent_congestion
+            || sample.sample_rtt.is_some_and(|rtt| rtt > queue_limit)
+            || event.rtt.get() > queue_limit;
+        if congested {
+            if let Some((deadline, ready)) = self.probe_episode {
+                if event.now < deadline {
+                    self.probe_episode = Some((event.now, ready));
+                    self.probe_aborts = self.probe_aborts.saturating_add(1);
+                }
+            }
+            return false;
+        }
+        if !self.has_clear_probe_growth(event, sample) {
+            return false;
+        }
+        let needs_episode = match self.probe_episode {
+            Some((deadline, ready)) if event.now >= deadline && event.now < ready => return false,
+            Some((_, ready)) => event.now >= ready,
+            None => true,
+        };
+        if needs_episode {
+            let duration = self.min_rtt.saturating_mul(8);
+            let Some(deadline) = event.now.checked_add(duration) else {
+                return false;
+            };
+            let Some(ready) = deadline.checked_add(duration) else {
+                return false;
+            };
+            self.probe_episode = Some((deadline, ready));
+            self.probe_episode_count = self.probe_episode_count.saturating_add(1);
+        }
+        // A probe's delivery feedback can arrive after its UP phase has ended.
+        // Restart only after flight fits the newly measured BDP; keep one budget.
+        if self.pacing_gain <= 1.0 && event.in_flight <= self.get_target_cwnd(1.0) {
+            self.current_cycle_offset = 0;
+            self.pacing_gain = K_PACING_GAIN[0];
+            self.last_cycle_start = Some(event.now);
+            self.probe_cycle_bw = self.max_bandwidth.get();
+            self.probe_restarts = self.probe_restarts.saturating_add(1);
+            return true;
+        }
+        false
+    }
+
+    fn update_gain_cycle_phase(&mut self, now: Instant, in_flight: u64, extend_growth: bool) {
         // In most cases, the cycle is advanced after an RTT passes.
         let mut should_advance_gain_cycling = self
             .last_cycle_start
@@ -216,6 +336,10 @@ impl Bbr {
             should_advance_gain_cycling = true;
         }
 
+        if should_advance_gain_cycling && extend_growth {
+            self.probe_extensions = self.probe_extensions.saturating_add(1);
+            should_advance_gain_cycling = false;
+        }
         if should_advance_gain_cycling {
             self.current_cycle_offset = (self.current_cycle_offset + 1) % K_PACING_GAIN.len() as u8;
             self.last_cycle_start = Some(now);
@@ -229,6 +353,9 @@ impl Bbr {
                 return;
             }
             self.pacing_gain = K_PACING_GAIN[self.current_cycle_offset as usize];
+            if self.pacing_gain > 1.0 {
+                self.probe_cycle_bw = self.max_bandwidth.get();
+            }
         }
     }
 
@@ -388,7 +515,12 @@ impl Bbr {
         // time.
         if self.is_at_full_bandwidth {
             self.cwnd = target_window.min(self.cwnd + bytes_acked);
-        } else if self.cwnd < target_window || self.acked_bytes < self.init_cwnd {
+        } else if self.cwnd < target_window
+            || self.acked_bytes < self.init_cwnd
+            || (self.config.guarded_startup
+                && self.mode == Mode::Startup
+                && self.ramp_budget.is_some())
+        {
             // If the connection is not yet out of startup phase, do not decrease
             // the window.
             self.cwnd += bytes_acked;
@@ -437,6 +569,59 @@ impl Bbr {
             .min(self.max_cwnd());
     }
 
+    fn maybe_exit_guarded_startup(
+        &mut self,
+        event: &CongestionEvent<'_>,
+        sample: &CongestionEventSample,
+    ) {
+        if !self.config.guarded_startup
+            || self.mode != Mode::Startup
+            || self.is_at_full_bandwidth
+            || self.min_rtt.is_zero()
+        {
+            return;
+        }
+        // ACK growth begins only after actual outstanding traffic establishes demand.
+        if self.ramp_budget.is_none()
+            && sample.bytes_acked > 0
+            && event.prior_in_flight >= self.init_cwnd / 2
+        {
+            let deadline = event
+                .now
+                .checked_add(self.min_rtt.saturating_mul(8))
+                .unwrap_or(event.now);
+            self.ramp_budget = Some((deadline, self.round_count));
+        }
+        let Some((deadline, first_round)) = self.ramp_budget else {
+            return;
+        };
+        let queue_limit = self.min_rtt.saturating_add(self.min_rtt / 8);
+        let excessive_loss = self.exit_startup_on_loss
+            && self.loss_events_in_round >= K_STARTUP_FULL_LOSS_COUNT
+            && self.bytes_lost_in_round
+                > (event.prior_in_flight.max(self.init_cwnd) as f64 * K_STARTUP_LOSS_THRESHOLD)
+                    as u64;
+        let reason = if event.ecn || event.is_persistent_congestion {
+            Some("ecn_or_persistent")
+        } else if excessive_loss {
+            Some("loss")
+        } else if sample.sample_rtt.is_some_and(|rtt| rtt > queue_limit)
+            && event.rtt.get() > queue_limit
+        {
+            Some("queue")
+        } else if event.now >= deadline || self.round_count.saturating_sub(first_round) >= 8 {
+            Some("budget")
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            // Congestion/budget exits do not depend on an app-limited growth sample.
+            self.is_at_full_bandwidth = true;
+            self.ramp_exit = reason;
+            self.ramp_budget = None;
+        }
+    }
+
     /// <https://datatracker.ietf.org/doc/html/draft-cardwell-iccrg-bbr-congestion-control#section-4.3.2.2>
     fn check_if_full_bw_reached(&mut self, last_packet_send_state: Option<SendTimeState>) {
         if last_packet_send_state.is_some_and(|state| state.is_app_limited) {
@@ -468,7 +653,43 @@ impl Bbr {
 }
 
 impl Controller for Bbr {
+    fn pacing_enabled(&self) -> bool {
+        !(self.config.window_startup && self.mode == Mode::Startup)
+    }
+
+    fn diagnostics(&self) -> Option<super::ControllerDiagnostics> {
+        Some(super::ControllerDiagnostics {
+            ramp_active: self.mode == Mode::Startup && self.ramp_budget.is_some(),
+            ramp_exit: self.ramp_exit,
+            probe_extensions: self.probe_extensions,
+            probe_restarts: self.probe_restarts,
+            probe_episodes: self.probe_episode_count,
+            probe_aborts: self.probe_aborts,
+            probe_cycle_bw: self.probe_cycle_bw,
+            phase: match self.mode {
+                Mode::Startup => "startup",
+                Mode::Drain => "drain",
+                Mode::ProbeBw => "probe_bw",
+                Mode::ProbeRtt => "probe_rtt",
+            },
+            recovery: match self.recovery_state {
+                RecoveryState::NotInRecovery => "none",
+                RecoveryState::Conservation => "conservation",
+                RecoveryState::Growth => "growth",
+            },
+            bandwidth: self.max_bandwidth.get(),
+            pacing: self.pacing_rate,
+            min_rtt_us: self.min_rtt.as_micros().min(u64::MAX as u128) as u64,
+            rounds: self.round_count,
+            full_bandwidth: self.is_at_full_bandwidth,
+            no_growth_rounds: self.round_wo_bw_gain,
+            pacing_gain: self.pacing_gain,
+            feedback: self.diagnostic_feedback,
+        })
+    }
+
     fn on_packet_sent(&mut self, packet: SentPacketInfo) {
+        self.diagnostic_feedback.last_send_limited = packet.app_limited;
         self.max_sent_packet_number = packet.packet_number;
         if packet.bytes_in_flight == 0 {
             self.exiting_quiescence = true;
@@ -483,7 +704,10 @@ impl Controller for Bbr {
     }
 
     fn on_ack_and_loss(&mut self, event: CongestionEvent<'_>) {
-        if event.app_limited || event.prior_in_flight < self.get_target_cwnd(1.0) {
+        if event.app_limited
+            || (!self.config.transport_supply_signal
+                && event.prior_in_flight < self.get_target_cwnd(1.0))
+        {
             self.bandwidth_sampler.on_app_limited();
         }
         let sample = self.bandwidth_sampler.on_congestion_event(
@@ -491,6 +715,19 @@ impl Controller for Bbr {
             event.acked_packets,
             event.lost_packets,
         );
+        self.diagnostic_feedback.event_limited = event.app_limited;
+        self.diagnostic_feedback.sample_limited = sample.sample_is_app_limited;
+        self.diagnostic_feedback.sample_bandwidth = sample.max_bandwidth;
+        self.diagnostic_feedback.prior_in_flight = event.prior_in_flight;
+        self.diagnostic_feedback.in_flight = event.in_flight;
+        self.diagnostic_feedback.acked_bytes = self
+            .diagnostic_feedback
+            .acked_bytes
+            .saturating_add(sample.bytes_acked);
+        self.diagnostic_feedback.lost_bytes = self
+            .diagnostic_feedback
+            .lost_bytes
+            .saturating_add(sample.bytes_lost);
         self.loss_state.lost_bytes = sample.bytes_lost;
         if sample.bytes_lost > 0 {
             self.loss_events_in_round = self.loss_events_in_round.saturating_add(1);
@@ -538,13 +775,23 @@ impl Controller for Bbr {
         };
 
         if self.mode == Mode::ProbeBw {
-            self.update_gain_cycle_phase(event.now, event.prior_in_flight);
+            if !self.update_growth_probe(&event, &sample) {
+                let extend_growth = self.can_extend_growth_probe(&event, &sample);
+                self.update_gain_cycle_phase(event.now, event.prior_in_flight, extend_growth);
+            }
         }
 
+        self.maybe_exit_guarded_startup(&event, &sample);
         if is_round_start && !self.is_at_full_bandwidth {
             self.check_if_full_bw_reached(sample.last_packet_send_state);
         }
 
+        if self.config.guarded_startup && self.is_at_full_bandwidth {
+            if self.ramp_exit == "none" {
+                self.ramp_exit = "model";
+            }
+            self.ramp_budget = None;
+        }
         self.maybe_exit_startup_or_drain(event.now, event.in_flight);
 
         self.maybe_enter_or_exit_probe_rtt(
@@ -635,6 +882,10 @@ pub struct BbrConfig {
     initial_window_packets: Option<u64>,
     max_window_packets: Option<u64>,
     profile: BbrProfile,
+    transport_supply_signal: bool,
+    window_startup: bool,
+    guarded_startup: bool,
+    feedback_probe: bool,
 }
 
 impl BbrConfig {
@@ -647,9 +898,14 @@ impl BbrConfig {
         self
     }
 
-    /// Apply the congestion-control tuning used by Hysteria 2.10.
+    /// Select a Hysteria tuning profile or the adaptive tunnel controller.
     pub fn hysteria_profile(&mut self, profile: BbrProfile) -> &mut Self {
         self.profile = profile;
+        let adaptive = profile == BbrProfile::Adaptive;
+        self.transport_supply_signal = adaptive;
+        self.window_startup = adaptive;
+        self.guarded_startup = adaptive;
+        self.feedback_probe = adaptive;
         self.initial_window_packets = Some(K_HYSTERIA_INITIAL_WINDOW_PACKETS);
         self.max_window_packets = Some(K_HYSTERIA_MAX_CONGESTION_WINDOW_PACKETS);
         self
@@ -670,16 +926,22 @@ impl Default for BbrConfig {
             initial_window_packets: None,
             max_window_packets: None,
             profile: BbrProfile::Quinn,
+            transport_supply_signal: false,
+            window_startup: false,
+            guarded_startup: false,
+            feedback_probe: false,
         }
     }
 }
 
-/// BBR tuning profiles. Hysteria variants mirror Hysteria 2.10's public profiles.
+/// BBR tuning profiles. Hysteria variants mirror Hysteria 2.10; Adaptive is a local extension.
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
 pub enum BbrProfile {
     /// Preserve Quinn's default BBR behavior.
     #[default]
     Quinn,
+    /// Bounded ACK-clocked startup and feedback-driven reprobes for reliable tunnels.
+    Adaptive,
     /// Hysteria's conservative profile for unstable or shallow-buffered paths.
     HysteriaConservative,
     /// Hysteria's standard profile.
@@ -705,7 +967,7 @@ struct BbrProfileConfig {
 impl BbrProfile {
     fn config(self) -> BbrProfileConfig {
         match self {
-            Self::HysteriaConservative => BbrProfileConfig {
+            Self::HysteriaConservative | Self::Adaptive => BbrProfileConfig {
                 high_gain: 2.25,
                 high_cwnd_gain: 1.75,
                 cwnd_gain_constant: 1.75,
@@ -1151,5 +1413,631 @@ mod tests {
         bbr.cwnd = u64::MAX;
         bbr.on_mtu_update(1400);
         assert_eq!(bbr.cwnd, K_HYSTERIA_MAX_CONGESTION_WINDOW_PACKETS * 1400);
+    }
+}
+
+#[cfg(test)]
+mod feedback_tests {
+    use super::*;
+    fn ack_one_packet(bbr: &mut Bbr, sent_at: Instant, acked_at: Instant, packet_number: u64) {
+        let bytes_in_flight = if packet_number == 0 {
+            0
+        } else {
+            BASE_DATAGRAM_SIZE
+        };
+        bbr.on_packet_sent(super::super::SentPacketInfo {
+            now: sent_at,
+            packet_number,
+            bytes: BASE_DATAGRAM_SIZE,
+            bytes_in_flight,
+            app_limited: false,
+        });
+        bbr.on_ack_and_loss(super::super::CongestionEvent {
+            now: acked_at,
+            prior_in_flight: bytes_in_flight + BASE_DATAGRAM_SIZE,
+            in_flight: bytes_in_flight,
+            app_limited: false,
+            rtt: &RttEstimator::new(Duration::from_millis(333)),
+            acked_packets: &[super::super::AckedPacket {
+                packet_number,
+                sent: sent_at,
+                bytes: BASE_DATAGRAM_SIZE,
+            }],
+            lost_packets: &[],
+            ecn: false,
+            ecn_sent: None,
+            is_persistent_congestion: false,
+        });
+    }
+    #[test]
+    fn supply_signal_distinguishes_small_flight_from_no_supply() {
+        for enabled in [false, true] {
+            let mut config = BbrConfig::default();
+            config.transport_supply_signal = enabled;
+            let mut bbr = Bbr::new(Arc::new(config), 1200);
+            let start = Instant::now();
+            bbr.min_rtt = Duration::from_millis(200);
+            bbr.max_bandwidth.update_max(0, 12_500_000);
+            // The old model is much larger than the current flight. A transport
+            // with pending data must still provide non-limited samples.
+            for n in 0..3 {
+                ack_one_packet(
+                    &mut bbr,
+                    start + Duration::from_millis(n * 210),
+                    start + Duration::from_millis(n * 210 + 200),
+                    n,
+                );
+            }
+            assert_eq!(bbr.diagnostic_feedback.sample_limited, !enabled);
+            // Explicit lack of supply continues to mark subsequent samples.
+            bbr.on_packet_sent(SentPacketInfo {
+                now: start + Duration::from_secs(1),
+                packet_number: 3,
+                bytes: BASE_DATAGRAM_SIZE,
+                bytes_in_flight: BASE_DATAGRAM_SIZE,
+                app_limited: true,
+            });
+            bbr.on_ack_and_loss(CongestionEvent {
+                now: start + Duration::from_millis(1200),
+                prior_in_flight: 2 * BASE_DATAGRAM_SIZE,
+                in_flight: BASE_DATAGRAM_SIZE,
+                app_limited: true,
+                rtt: &RttEstimator::new(Duration::from_millis(200)),
+                acked_packets: &[super::super::AckedPacket {
+                    packet_number: 3,
+                    sent: start + Duration::from_secs(1),
+                    bytes: BASE_DATAGRAM_SIZE,
+                }],
+                lost_packets: &[],
+                ecn: false,
+                ecn_sent: None,
+                is_persistent_congestion: false,
+            });
+            assert!(bbr.diagnostic_feedback.sample_limited);
+        }
+    }
+}
+
+#[cfg(test)]
+mod window_startup_tests {
+    use super::*;
+
+    #[test]
+    fn pacing_bypass_is_opt_in_and_ends_after_startup() {
+        for enabled in [false, true] {
+            let mut config = BbrConfig::default();
+            config.hysteria_profile(BbrProfile::HysteriaConservative);
+            config.window_startup = enabled;
+            let mut controller = Bbr::new(Arc::new(config), 1200);
+            let mut baseline_config = BbrConfig::default();
+            baseline_config.hysteria_profile(BbrProfile::HysteriaConservative);
+            let mut baseline = Bbr::new(Arc::new(baseline_config), 1200);
+            for mode in [Mode::Startup, Mode::Drain, Mode::ProbeBw, Mode::ProbeRtt] {
+                controller.mode = mode;
+                assert_eq!(
+                    controller.pacing_enabled(),
+                    !(enabled && mode == Mode::Startup)
+                );
+                baseline.mode = mode;
+                assert_eq!(controller.window(), baseline.window());
+            }
+        }
+        assert!(!BbrConfig::default().window_startup);
+    }
+}
+
+#[cfg(test)]
+mod ack_clock_tests {
+    use super::*;
+
+    #[test]
+    fn acknowledged_growth_is_opt_in_bounded_and_startup_only() {
+        for enabled in [false, true] {
+            for mode in [Mode::Startup, Mode::Drain, Mode::ProbeBw] {
+                let mut config = BbrConfig::default();
+                config.hysteria_profile(BbrProfile::HysteriaConservative);
+                config.guarded_startup = enabled;
+                let mut bbr = Bbr::new(Arc::new(config), 1200);
+                bbr.mode = mode;
+                bbr.ramp_budget = Some((Instant::now() + Duration::from_secs(1), 0));
+                bbr.cwnd = 2 * bbr.init_cwnd;
+                bbr.acked_bytes = bbr.cwnd;
+                let before = bbr.cwnd;
+                bbr.calculate_cwnd(1200, 0);
+                assert_eq!(
+                    bbr.cwnd,
+                    before
+                        + if enabled && mode == Mode::Startup {
+                            1200
+                        } else {
+                            0
+                        }
+                );
+                bbr.cwnd = bbr.max_cwnd() - 600;
+                bbr.calculate_cwnd(1200, 0);
+                assert!(bbr.cwnd <= bbr.max_cwnd());
+                bbr.is_at_full_bandwidth = true;
+                bbr.calculate_cwnd(1200, 0);
+                assert_eq!(bbr.cwnd, bbr.get_target_cwnd(bbr.cwnd_gain));
+            }
+        }
+        assert!(!BbrConfig::default().guarded_startup);
+    }
+}
+
+#[cfg(test)]
+mod guarded_ramp_tests {
+    use super::*;
+
+    fn controller() -> Bbr {
+        let mut config = BbrConfig::default();
+        config.hysteria_profile(BbrProfile::HysteriaConservative);
+        config.hysteria_profile(BbrProfile::Adaptive);
+        let mut bbr = Bbr::new(Arc::new(config), 1200);
+        bbr.min_rtt = Duration::from_millis(200);
+        bbr.cwnd = 2 * bbr.init_cwnd;
+        bbr.acked_bytes = bbr.cwnd;
+        bbr
+    }
+    fn event(rtt: &RttEstimator, now: Instant, flight: u64) -> CongestionEvent<'_> {
+        CongestionEvent {
+            now,
+            prior_in_flight: flight,
+            in_flight: flight / 2,
+            app_limited: true,
+            rtt,
+            acked_packets: &[],
+            lost_packets: &[],
+            ecn: false,
+            ecn_sent: None,
+            is_persistent_congestion: false,
+        }
+    }
+    fn sample() -> CongestionEventSample {
+        CongestionEventSample {
+            bytes_acked: 1200,
+            max_bandwidth: 1_000_000,
+            sample_is_app_limited: true,
+            sample_rtt: Some(Duration::from_millis(200)),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn idle_acks_cannot_start_unbounded_window_growth() {
+        let mut bbr = controller();
+        let now = Instant::now();
+        let rtt = RttEstimator::new(Duration::from_millis(200));
+        let mut event = event(&rtt, now, 1200);
+        bbr.maybe_exit_guarded_startup(&event, &sample());
+        assert!(bbr.ramp_budget.is_none());
+        let before = bbr.cwnd;
+        bbr.calculate_cwnd(1200, 0);
+        assert_eq!(bbr.cwnd, before);
+        event.prior_in_flight = bbr.init_cwnd;
+        bbr.maybe_exit_guarded_startup(&event, &sample());
+        assert!(bbr.ramp_budget.is_some());
+        bbr.calculate_cwnd(1200, 0);
+        assert_eq!(bbr.cwnd, before + 1200);
+        bbr.cwnd = bbr.max_cwnd() - 600;
+        bbr.calculate_cwnd(1200, 0);
+        assert_eq!(bbr.cwnd, bbr.max_cwnd());
+    }
+
+    #[test]
+    fn congestion_exits_survive_app_limited_and_growing_model_feedback() {
+        for reason in ["queue", "loss", "ecn_or_persistent"] {
+            let mut bbr = controller();
+            let now = Instant::now();
+            let rtt = RttEstimator::new(Duration::from_millis(if reason == "queue" {
+                250
+            } else {
+                200
+            }));
+            let mut event = event(&rtt, now, bbr.init_cwnd);
+            let mut sample = sample();
+            sample.sample_rtt = Some(rtt.get());
+            sample.last_packet_send_state = Some(SendTimeState {
+                packet_number: 1,
+                is_app_limited: true,
+                total_bytes_sent: bbr.init_cwnd,
+                total_bytes_acked: 1200,
+                bytes_in_flight: bbr.init_cwnd,
+            });
+            bbr.max_bandwidth.update_max(0, 100_000_000);
+            if reason == "loss" {
+                bbr.loss_events_in_round = K_STARTUP_FULL_LOSS_COUNT;
+                bbr.bytes_lost_in_round = bbr.init_cwnd / 10;
+            }
+            if reason == "ecn_or_persistent" {
+                event.ecn = true;
+            }
+            bbr.maybe_exit_guarded_startup(&event, &sample);
+            assert!(bbr.is_at_full_bandwidth, "{reason}");
+            assert_eq!(bbr.ramp_exit, reason);
+            assert!(bbr.ramp_budget.is_none());
+            bbr.check_if_full_bw_reached(sample.last_packet_send_state);
+            assert!(bbr.is_at_full_bandwidth);
+            bbr.maybe_exit_startup_or_drain(now, event.in_flight);
+            assert!(bbr.pacing_enabled());
+            assert_ne!(bbr.mode, Mode::Startup);
+        }
+    }
+
+    #[test]
+    fn active_ramp_ends_at_either_frozen_deadline_or_round_budget() {
+        for by_round in [false, true] {
+            let mut bbr = controller();
+            let now = Instant::now();
+            let rtt = RttEstimator::new(Duration::from_millis(200));
+            let mut event = event(&rtt, now, bbr.init_cwnd);
+            bbr.maybe_exit_guarded_startup(&event, &sample());
+            let original = bbr.ramp_budget;
+            event.now += Duration::from_millis(100);
+            bbr.maybe_exit_guarded_startup(&event, &sample());
+            assert_eq!(bbr.ramp_budget, original);
+            assert!(!bbr.is_at_full_bandwidth);
+            if by_round {
+                bbr.round_count += 8;
+            } else {
+                event.now = now + Duration::from_millis(1600);
+            }
+            bbr.maybe_exit_guarded_startup(&event, &sample());
+            assert_eq!(bbr.ramp_exit, "budget");
+            assert!(bbr.is_at_full_bandwidth);
+        }
+    }
+
+    #[test]
+    fn guarded_policy_is_opt_in_and_tolerates_subthreshold_loss() {
+        let mut bbr = controller();
+        let now = Instant::now();
+        let rtt = RttEstimator::new(Duration::from_millis(200));
+        let mut event = event(&rtt, now, bbr.init_cwnd);
+        bbr.loss_events_in_round = K_STARTUP_FULL_LOSS_COUNT;
+        bbr.bytes_lost_in_round = bbr.init_cwnd / 100;
+        bbr.maybe_exit_guarded_startup(&event, &sample());
+        assert!(!bbr.is_at_full_bandwidth);
+        event.is_persistent_congestion = true;
+        bbr.maybe_exit_guarded_startup(&event, &sample());
+        assert!(bbr.is_at_full_bandwidth);
+        let mut default = controller();
+        Arc::get_mut(&mut default.config).unwrap().guarded_startup = false;
+        default.maybe_exit_guarded_startup(&event, &sample());
+        assert!(!default.is_at_full_bandwidth);
+        assert!(default.ramp_budget.is_none());
+        assert!(!BbrConfig::default().guarded_startup);
+    }
+}
+
+#[cfg(test)]
+mod feedback_probe_tests {
+    use super::*;
+
+    fn controller(now: Instant) -> Bbr {
+        let mut config = BbrConfig::default();
+        config.hysteria_profile(BbrProfile::HysteriaConservative);
+        config.feedback_probe = true;
+        let mut bbr = Bbr::new(Arc::new(config), 1200);
+        bbr.min_rtt = Duration::from_millis(200);
+        bbr.mode = Mode::ProbeBw;
+        bbr.is_at_full_bandwidth = true;
+        bbr.pacing_gain = 1.25;
+        bbr.current_cycle_offset = 0;
+        bbr.last_cycle_start = Some(now);
+        bbr.probe_cycle_bw = 1_000_000;
+        bbr.probe_episode = Some((
+            now + Duration::from_millis(1600),
+            now + Duration::from_millis(3200),
+        ));
+        bbr.max_bandwidth.update_max(0, 1_200_000);
+        bbr.cwnd = 1_000_000;
+        bbr
+    }
+    fn event(rtt: &RttEstimator, now: Instant) -> CongestionEvent<'_> {
+        CongestionEvent {
+            now,
+            prior_in_flight: 600_000,
+            in_flight: 590_000,
+            app_limited: false,
+            rtt,
+            acked_packets: &[],
+            lost_packets: &[],
+            ecn: false,
+            ecn_sent: None,
+            is_persistent_congestion: false,
+        }
+    }
+    fn sample() -> CongestionEventSample {
+        CongestionEventSample {
+            bytes_acked: 1200,
+            max_bandwidth: 1_200_000,
+            sample_is_app_limited: false,
+            sample_rtt: Some(Duration::from_millis(200)),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn growth_extension_requires_fresh_supply_and_clear_congestion_feedback() {
+        let now = Instant::now();
+        let rtt = RttEstimator::new(Duration::from_millis(200));
+        let queued = RttEstimator::new(Duration::from_millis(240));
+        assert!(
+            controller(now)
+                .can_extend_growth_probe(&event(&rtt, now + Duration::from_millis(400)), &sample())
+        );
+        for invalid in [
+            "disabled",
+            "sample_idle",
+            "transport_idle",
+            "no_ack",
+            "no_growth",
+            "no_sample_rtt",
+            "zero_sample_rtt",
+            "queued_sample",
+            "queued_smoothed",
+            "sample_loss",
+            "round_loss",
+            "recovery",
+            "ecn",
+            "persistent",
+            "zero_baseline",
+            "zero_min_rtt",
+            "wrong_phase",
+            "wrong_gain",
+        ] {
+            let mut bbr = controller(now);
+            let mut sample = sample();
+            let mut event = event(&rtt, now + Duration::from_millis(400));
+            match invalid {
+                "disabled" => Arc::get_mut(&mut bbr.config).unwrap().feedback_probe = false,
+                "sample_idle" => sample.sample_is_app_limited = true,
+                "transport_idle" => event.app_limited = true,
+                "no_ack" => sample.bytes_acked = 0,
+                "no_growth" => sample.max_bandwidth = 1_050_000,
+                "no_sample_rtt" => sample.sample_rtt = None,
+                "zero_sample_rtt" => sample.sample_rtt = Some(Duration::ZERO),
+                "queued_sample" => sample.sample_rtt = Some(Duration::from_millis(240)),
+                "queued_smoothed" => event.rtt = &queued,
+                "sample_loss" => sample.bytes_lost = 1200,
+                "round_loss" => bbr.bytes_lost_in_round = 1200,
+                "recovery" => bbr.recovery_state = RecoveryState::Growth,
+                "ecn" => event.ecn = true,
+                "persistent" => event.is_persistent_congestion = true,
+                "zero_baseline" => bbr.probe_cycle_bw = 0,
+                "zero_min_rtt" => bbr.min_rtt = Duration::ZERO,
+                "wrong_phase" => bbr.mode = Mode::Drain,
+                "wrong_gain" => bbr.pacing_gain = 1.0,
+                _ => unreachable!(),
+            }
+            assert!(!bbr.can_extend_growth_probe(&event, &sample), "{invalid}");
+        }
+        assert!(!BbrConfig::default().feedback_probe);
+    }
+
+    #[test]
+    fn extension_preserves_window_and_original_clock_then_returns_to_normal_cycle() {
+        let now = Instant::now();
+        let rtt = RttEstimator::new(Duration::from_millis(200));
+        let mut event = event(&rtt, now + Duration::from_millis(400));
+        let mut bbr = controller(now);
+        let before_window = bbr.window();
+        let extend = bbr.can_extend_growth_probe(&event, &sample());
+        bbr.update_gain_cycle_phase(event.now, event.prior_in_flight, extend);
+        assert_eq!(bbr.pacing_gain, 1.25);
+        assert_eq!(bbr.probe_extensions, 1);
+        assert_eq!(bbr.last_cycle_start, Some(now));
+        assert_eq!(bbr.window(), before_window);
+        event.now = now + Duration::from_millis(1600);
+        let extend = bbr.can_extend_growth_probe(&event, &sample());
+        assert!(!extend);
+        bbr.update_gain_cycle_phase(event.now, event.prior_in_flight, extend);
+        assert_eq!(bbr.pacing_gain, 0.75);
+        assert_eq!(bbr.probe_extensions, 1);
+        assert_eq!(bbr.probe_cycle_bw, 1_000_000);
+        assert_eq!(bbr.last_cycle_start, Some(event.now));
+        assert_eq!(bbr.window(), before_window);
+        let mut original = controller(now);
+        Arc::get_mut(&mut original.config).unwrap().feedback_probe = false;
+        event.now = now + Duration::from_millis(400);
+        let extend = original.can_extend_growth_probe(&event, &sample());
+        original.update_gain_cycle_phase(event.now, event.prior_in_flight, extend);
+        assert_eq!(original.pacing_gain, 0.75);
+        assert_eq!(original.probe_extensions, 0);
+    }
+
+    #[test]
+    fn existing_under_target_hold_and_new_phase_baseline_are_preserved() {
+        let now = Instant::now();
+        let rtt = RttEstimator::new(Duration::from_millis(200));
+        let event = event(&rtt, now + Duration::from_secs(2));
+        let mut bbr = controller(now);
+        assert!(!bbr.can_extend_growth_probe(&event, &sample()));
+        bbr.update_gain_cycle_phase(event.now, 1, false);
+        assert_eq!(bbr.pacing_gain, 1.25);
+        assert_eq!(bbr.probe_extensions, 0);
+        bbr.enter_probe_bandwidth_mode(event.now);
+        assert_eq!(bbr.probe_cycle_bw, bbr.max_bandwidth.get());
+        assert_eq!(bbr.last_cycle_start, Some(event.now));
+    }
+}
+
+#[cfg(test)]
+mod feedback_reprobe_tests {
+    use super::*;
+
+    fn controller(now: Instant, bandwidth: u64) -> Bbr {
+        let mut config = BbrConfig::default();
+        config.hysteria_profile(BbrProfile::HysteriaConservative);
+        config.feedback_probe = true;
+        let mut bbr = Bbr::new(Arc::new(config), 1200);
+        bbr.min_rtt = Duration::from_millis(200);
+        bbr.mode = Mode::ProbeBw;
+        bbr.is_at_full_bandwidth = true;
+        bbr.pacing_gain = 1.0;
+        bbr.current_cycle_offset = 2;
+        bbr.last_cycle_start = Some(now);
+        bbr.probe_cycle_bw = 1_000_000;
+        bbr.max_bandwidth.update_max(0, bandwidth);
+        bbr.cwnd = 1_000_000;
+        bbr
+    }
+    fn event(rtt: &RttEstimator, now: Instant) -> CongestionEvent<'_> {
+        CongestionEvent {
+            now,
+            prior_in_flight: 600_000,
+            in_flight: 200_000,
+            app_limited: false,
+            rtt,
+            acked_packets: &[],
+            lost_packets: &[],
+            ecn: false,
+            ecn_sent: None,
+            is_persistent_congestion: false,
+        }
+    }
+    fn sample(bandwidth: u64) -> CongestionEventSample {
+        CongestionEventSample {
+            bytes_acked: 1200,
+            max_bandwidth: bandwidth,
+            sample_is_app_limited: false,
+            sample_rtt: Some(Duration::from_millis(200)),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn late_growth_feedback_can_restart_after_original_up_phase_ended() {
+        let now = Instant::now();
+        let rtt = RttEstimator::new(Duration::from_millis(200));
+        let mut bbr = controller(now, 1_000_000);
+        bbr.pacing_gain = 1.25;
+        bbr.current_cycle_offset = 0;
+        let mut event = event(&rtt, now + Duration::from_millis(400));
+        assert!(!bbr.update_growth_probe(&event, &sample(1_000_000)));
+        bbr.update_gain_cycle_phase(event.now, event.prior_in_flight, false);
+        assert_eq!(bbr.pacing_gain, 0.75);
+        assert_eq!(bbr.probe_cycle_bw, 1_000_000);
+        bbr.max_bandwidth.update_max(1, 1_200_000);
+        event.now += Duration::from_millis(50);
+        let before_window = bbr.window();
+        assert!(bbr.update_growth_probe(&event, &sample(1_200_000)));
+        assert_eq!(bbr.pacing_gain, 1.25);
+        assert_eq!(bbr.probe_restarts, 1);
+        assert_eq!(bbr.probe_cycle_bw, 1_200_000);
+        assert_eq!(bbr.window(), before_window);
+        assert_eq!(bbr.last_cycle_start, Some(event.now));
+    }
+
+    #[test]
+    fn restarts_require_drained_flight_and_share_deadline_and_cooldown() {
+        let now = Instant::now();
+        let rtt = RttEstimator::new(Duration::from_millis(200));
+        let mut bbr = controller(now, 1_200_000);
+        let mut event = event(&rtt, now + Duration::from_millis(400));
+        event.in_flight = 500_000;
+        assert!(!bbr.update_growth_probe(&event, &sample(1_200_000)));
+        assert_eq!(bbr.probe_restarts, 0);
+        let budget = bbr.probe_episode.unwrap();
+        event.now += Duration::from_millis(100);
+        event.in_flight = 200_000;
+        assert!(bbr.update_growth_probe(&event, &sample(1_200_000)));
+        bbr.pacing_gain = 1.0;
+        bbr.current_cycle_offset = 2;
+        bbr.max_bandwidth.update_max(2, 1_500_000);
+        event.now += Duration::from_millis(400);
+        assert!(bbr.update_growth_probe(&event, &sample(1_500_000)));
+        assert_eq!(bbr.probe_restarts, 2);
+        assert_eq!(bbr.probe_episode, Some(budget));
+        bbr.pacing_gain = 1.0;
+        bbr.max_bandwidth.update_max(3, 1_900_000);
+        event.now = budget.0;
+        assert!(!bbr.update_growth_probe(&event, &sample(1_900_000)));
+        bbr.pacing_gain = 1.25;
+        bbr.last_cycle_start = Some(event.now);
+        assert!(!bbr.can_extend_growth_probe(&event, &sample(1_900_000)));
+        bbr.pacing_gain = 1.0;
+        event.now = budget.1;
+        assert!(bbr.update_growth_probe(&event, &sample(1_900_000)));
+        assert_eq!(bbr.probe_episode_count, 2);
+        assert_eq!(bbr.probe_restarts, 3);
+    }
+
+    #[test]
+    fn congestion_aborts_episode_without_renewing_cooldown_and_default_is_inert() {
+        let now = Instant::now();
+        let rtt = RttEstimator::new(Duration::from_millis(200));
+        let queued = RttEstimator::new(Duration::from_millis(240));
+        for cause in ["queue", "loss", "ecn"] {
+            let mut bbr = controller(now, 1_200_000);
+            let mut event = event(&rtt, now + Duration::from_millis(400));
+            assert!(bbr.update_growth_probe(&event, &sample(1_200_000)));
+            let ready = bbr.probe_episode.unwrap().1;
+            event.now += Duration::from_millis(100);
+            let mut bad = sample(1_500_000);
+            match cause {
+                "queue" => {
+                    event.rtt = &queued;
+                    bad.sample_rtt = Some(queued.get());
+                }
+                "loss" => bad.bytes_lost = 1200,
+                "ecn" => event.ecn = true,
+                _ => unreachable!(),
+            }
+            assert!(!bbr.update_growth_probe(&event, &bad));
+            assert_eq!(bbr.probe_aborts, 1);
+            assert_eq!(bbr.probe_episode, Some((event.now, ready)));
+            event.rtt = &rtt;
+            event.ecn = false;
+            event.now += Duration::from_millis(100);
+            bbr.pacing_gain = 1.0;
+            bbr.max_bandwidth.update_max(2, 1_500_000);
+            assert!(!bbr.update_growth_probe(&event, &sample(1_500_000)));
+            assert_eq!(bbr.probe_restarts, 1);
+        }
+        let mut default = controller(now, 1_200_000);
+        Arc::get_mut(&mut default.config).unwrap().feedback_probe = false;
+        assert!(!default.update_growth_probe(
+            &event(&rtt, now + Duration::from_millis(400)),
+            &sample(1_200_000)
+        ));
+        assert!(default.probe_episode.is_none());
+        assert_eq!(default.probe_restarts, 0);
+        assert_eq!(default.pacing_gain, 1.0);
+    }
+}
+
+#[cfg(test)]
+mod adaptive_profile_tests {
+    use super::*;
+    #[test]
+    fn profile_selection_enables_bounded_components_and_resets_them() {
+        let mut config = BbrConfig::default();
+        config.hysteria_profile(BbrProfile::Adaptive);
+        assert!(
+            config.transport_supply_signal
+                && config.window_startup
+                && config.guarded_startup
+                && config.feedback_probe
+        );
+        let bbr = Bbr::new(Arc::new(config.clone()), 1200);
+        assert_eq!(bbr.initial_window(), 32 * 1200);
+        assert_eq!(bbr.high_gain, 2.25);
+        assert!(bbr.ramp_budget.is_none());
+        for profile in [
+            BbrProfile::Quinn,
+            BbrProfile::HysteriaConservative,
+            BbrProfile::HysteriaStandard,
+            BbrProfile::HysteriaAggressive,
+        ] {
+            config.hysteria_profile(profile);
+            assert!(
+                !config.transport_supply_signal
+                    && !config.window_startup
+                    && !config.guarded_startup
+                    && !config.feedback_probe
+            );
+        }
     }
 }

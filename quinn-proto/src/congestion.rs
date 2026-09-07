@@ -74,8 +74,79 @@ pub struct CongestionEvent<'a> {
     pub is_persistent_congestion: bool,
 }
 
+/// Compact model diagnostics, without cloning per-packet state.
+#[derive(Debug, Copy, Clone)]
+pub struct ControllerDiagnostics {
+    /// Current controller phase.
+    pub phase: &'static str,
+    /// Whether the bounded additional Startup ramp is active.
+    pub ramp_active: bool,
+    /// Reason the last Startup ramp ended, or `none`.
+    pub ramp_exit: &'static str,
+    /// Number of upward phase advances suppressed by adaptive probing.
+    pub probe_extensions: u64,
+    /// Number of upward probes restarted by fresh growth feedback.
+    pub probe_restarts: u64,
+    /// Number of bounded adaptive probing episodes started.
+    pub probe_episodes: u64,
+    /// Number of adaptive probing episodes ended by congestion.
+    pub probe_aborts: u64,
+    /// Reference bandwidth before the preceding upward probe, in bytes/s.
+    pub probe_cycle_bw: u64,
+    /// Current loss-recovery state.
+    pub recovery: &'static str,
+    /// Estimated delivery bandwidth, in bytes/s.
+    pub bandwidth: u64,
+    /// Configured pacing rate, in bytes/s.
+    pub pacing: u64,
+    /// Estimated minimum RTT, in microseconds.
+    pub min_rtt_us: u64,
+    /// Completed packet-timed rounds.
+    pub rounds: u64,
+    /// Whether Startup has completed its bandwidth search.
+    pub full_bandwidth: bool,
+    /// Consecutive Startup rounds without sufficient model growth.
+    pub no_growth_rounds: u64,
+    /// Current pacing-rate multiplier.
+    pub pacing_gain: f32,
+    /// Most recent delivery and application-limitation signals.
+    pub feedback: FeedbackDiagnostics,
+}
+
+/// Last ACK event and send-side limiting state (diagnostic only).
+#[derive(Debug, Copy, Clone, Default)]
+pub struct FeedbackDiagnostics {
+    /// Application-limited flag recorded for the most recently sent packet.
+    pub last_send_limited: bool,
+    /// Application-limited flag on the most recent transport feedback event.
+    pub event_limited: bool,
+    /// Whether the most recent delivery sample was application-limited.
+    pub sample_limited: bool,
+    /// Bandwidth of the most recent delivery sample, in bytes/s.
+    pub sample_bandwidth: u64,
+    /// Outstanding congestion-controlled bytes before the feedback event.
+    pub prior_in_flight: u64,
+    /// Outstanding congestion-controlled bytes after the feedback event.
+    pub in_flight: u64,
+    /// Bytes acknowledged by the most recent feedback event.
+    pub acked_bytes: u64,
+    /// Bytes declared lost by the most recent feedback event.
+    pub lost_bytes: u64,
+}
+
 /// Common interface for different congestion controllers
 pub trait Controller: Send + Sync {
+    /// Whether transmission should apply rate pacing in addition to the window.
+    /// Controllers may disable pacing while retaining congestion limits.
+    fn pacing_enabled(&self) -> bool {
+        true
+    }
+
+    /// Return a compact model snapshot when supported. Does not change control state.
+    fn diagnostics(&self) -> Option<ControllerDiagnostics> {
+        None
+    }
+
     /// A congestion-controlled packet was just sent.
     ///
     /// Controllers that need per-packet send state should override this method.

@@ -613,27 +613,29 @@ impl Connection {
                         continue;
                     }
 
-                    // Check whether the next datagram is blocked by pacing
-                    let smoothed_rtt = self.path.rtt.get();
-                    let pacing_window = pacing::pacing_window(
-                        self.path.congestion.pacing_rate(),
-                        smoothed_rtt,
-                        self.path.congestion.window(),
-                        self.path.current_mtu(),
-                    );
-                    if let Some(delay) = self.path.pacing.delay(
-                        smoothed_rtt,
-                        bytes_to_send,
-                        self.path.current_mtu(),
-                        pacing_window,
-                        now,
-                    ) {
-                        self.timers.set(Timer::Pacing, delay);
-                        congestion_blocked = true;
-                        // Loss probes should be subject to pacing, even though
-                        // they are not congestion controlled.
-                        trace!("blocked by pacing");
-                        break;
+                    if self.path.congestion.pacing_enabled() {
+                        // Check whether the next datagram is blocked by pacing
+                        let smoothed_rtt = self.path.rtt.get();
+                        let pacing_window = pacing::pacing_window(
+                            self.path.congestion.pacing_rate(),
+                            smoothed_rtt,
+                            self.path.congestion.window(),
+                            self.path.current_mtu(),
+                        );
+                        if let Some(delay) = self.path.pacing.delay(
+                            smoothed_rtt,
+                            bytes_to_send,
+                            self.path.current_mtu(),
+                            pacing_window,
+                            now,
+                        ) {
+                            self.timers.set(Timer::Pacing, delay);
+                            congestion_blocked = true;
+                            // Loss probes should be subject to pacing, even though
+                            // they are not congestion controlled.
+                            trace!("blocked by pacing");
+                            break;
+                        }
                     }
                 }
 
@@ -1237,6 +1239,7 @@ impl Connection {
     /// Returns connection statistics
     pub fn stats(&self) -> ConnectionStats {
         let mut stats = self.stats;
+        stats.congestion_model = self.path.congestion.diagnostics();
         stats.path.rtt = self.path.rtt.get();
         stats.path.cwnd = self.path.congestion.window();
         stats.path.current_mtu = self.path.mtud.current_mtu();
@@ -1307,6 +1310,15 @@ impl Connection {
     /// Whether 0-RTT is/was possible during the handshake
     pub fn has_0rtt(&self) -> bool {
         self.zero_rtt_enabled
+    }
+
+    #[cfg(test)]
+    pub(crate) fn supply_state(&self) -> (bool, bool, u64) {
+        (
+            self.app_limited,
+            self.streams.can_send_stream_data(),
+            self.path.in_flight.bytes,
+        )
     }
 
     /// Whether there are any pending retransmits
