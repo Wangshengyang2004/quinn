@@ -5,6 +5,7 @@ use tracing::trace;
 use super::{
     mtud::MtuDiscovery,
     pacing::Pacer,
+    reordering::LossReordering,
     spaces::{PacketSpace, SentPacket},
 };
 use crate::{Duration, Instant, TIMER_GRANULARITY, TransportConfig, congestion, packet::SpaceId};
@@ -19,6 +20,7 @@ pub(super) struct PathData {
     pub(super) congestion: Box<dyn congestion::Controller>,
     /// Pacing state
     pub(super) pacing: Pacer,
+    pub(super) reordering: LossReordering,
     pub(super) challenge: Option<u64>,
     pub(super) challenge_pending: bool,
     /// Whether we're certain the peer can both send and receive on this address
@@ -90,6 +92,7 @@ impl PathData {
             first_packet_after_rtt_sample: None,
             in_flight: InFlight::new(),
             first_packet: None,
+            reordering: LossReordering::new(now),
         }
     }
 
@@ -111,6 +114,7 @@ impl PathData {
             first_packet_after_rtt_sample: prev.first_packet_after_rtt_sample,
             in_flight: InFlight::new(),
             first_packet: None,
+            reordering: LossReordering::new(now),
         }
     }
 
@@ -119,6 +123,7 @@ impl PathData {
     /// This is useful when it is known the underlying path has changed.
     pub(super) fn reset(&mut self, now: Instant, config: &TransportConfig) {
         self.rtt = RttEstimator::new(config.initial_rtt);
+        self.reordering = LossReordering::new(now);
         self.congestion = config
             .congestion_controller_factory
             .clone()

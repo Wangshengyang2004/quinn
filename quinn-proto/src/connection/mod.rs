@@ -51,6 +51,7 @@ pub use datagrams::{Datagrams, SendDatagramError};
 
 mod mtud;
 mod pacing;
+mod reordering;
 
 mod packet_builder;
 use packet_builder::PacketBuilder;
@@ -1426,6 +1427,17 @@ impl Connection {
             }
         }
 
+        if space == SpaceId::Data && self.config.adaptive_loss_thresholds {
+            self.path.reordering.threshold(
+                now,
+                self.path.rtt.conservative(),
+                self.config.packet_threshold,
+            );
+            for range in ack.iter() {
+                self.path.reordering.on_ack(now, range);
+            }
+        }
+
         if newly_acked.is_empty() {
             return Ok(());
         }
@@ -1669,12 +1681,26 @@ impl Connection {
         let mut lost_mtu_probe = None;
         let in_flight_mtu_probe = self.path.mtud.in_flight_mtu_probe();
         let rtt = self.path.rtt.conservative();
-        let loss_delay = cmp::max(rtt.mul_f32(self.config.time_threshold), TIMER_GRANULARITY);
+        let time_threshold = if pn_space == SpaceId::Data && self.config.adaptive_loss_thresholds {
+            self.path
+                .reordering
+                .time_threshold(now, rtt, self.config.time_threshold)
+        } else {
+            self.config.time_threshold
+        };
+        let loss_delay = cmp::max(rtt.mul_f32(time_threshold), TIMER_GRANULARITY);
 
         // Packets sent before this time are deemed lost.
         let lost_send_time = now.checked_sub(loss_delay).unwrap();
         let largest_acked_packet = self.spaces[pn_space].largest_acked_packet.unwrap();
-        let packet_threshold = self.config.packet_threshold as u64;
+        let packet_threshold = if pn_space == SpaceId::Data && self.config.adaptive_loss_thresholds
+        {
+            self.path
+                .reordering
+                .threshold(now, rtt, self.config.packet_threshold)
+        } else {
+            self.config.packet_threshold as u64
+        };
         let mut size_of_lost_packets = 0u64;
 
         // InPersistentCongestion: Determine if all packets in the time period before the newest
@@ -1749,6 +1775,18 @@ impl Connection {
 
             for &packet in &lost_packets {
                 let info = self.spaces[pn_space].take(packet).unwrap(); // safe: lost_packets is populated just above
+                if pn_space == SpaceId::Data
+                    && self.config.adaptive_loss_thresholds
+                    && info.ack_eliciting
+                {
+                    self.path.reordering.record_loss(
+                        now,
+                        info.time_sent,
+                        packet,
+                        largest_acked_packet - packet,
+                        rtt,
+                    );
+                }
                 self.remove_in_flight(packet, &info);
                 if info.ack_eliciting && self.path.challenge.is_none() {
                     congestion_lost_packets.push(LostPacket {

@@ -24,6 +24,7 @@ pub struct TransportConfig {
     pub(crate) send_fairness: bool,
 
     pub(crate) packet_threshold: u32,
+    pub(crate) adaptive_loss_thresholds: bool,
     pub(crate) time_threshold: f32,
     pub(crate) initial_rtt: Duration,
     pub(crate) initial_mtu: u16,
@@ -137,6 +138,21 @@ impl TransportConfig {
     /// many small streams.
     pub fn send_fairness(&mut self, value: bool) -> &mut Self {
         self.send_fairness = value;
+        self
+    }
+
+    /// Adapt packet and time loss thresholds using ACKs of packets previously declared lost.
+    ///
+    /// Disabled by default. The configured thresholds remain lower bounds. Learning is
+    /// per path and bounded to 1024 packets and 1.5 times the RTT; a larger configured
+    /// threshold is preserved. Learned allowances halve after 32 RTTs without evidence
+    /// and reset when the path changes.
+    ///
+    /// At most 1024 recent loss records are retained. ACKs received more than three RTTs
+    /// after a loss declaration do not train the thresholds. Increased tolerance can
+    /// delay detection of genuine loss in exchange for fewer spurious retransmissions.
+    pub fn adaptive_loss_thresholds(&mut self, enabled: bool) -> &mut Self {
+        self.adaptive_loss_thresholds = enabled;
         self
     }
 
@@ -335,6 +351,7 @@ impl Default for TransportConfig {
             send_fairness: true,
 
             packet_threshold: 3,
+            adaptive_loss_thresholds: false,
             time_threshold: 9.0 / 8.0,
             initial_rtt: Duration::from_millis(333), // per spec, intentionally distinct from EXPECTED_RTT
             initial_mtu: INITIAL_MTU,
@@ -369,6 +386,7 @@ impl fmt::Debug for TransportConfig {
             send_window,
             send_fairness,
             packet_threshold,
+            adaptive_loss_thresholds,
             time_threshold,
             initial_rtt,
             initial_mtu,
@@ -395,6 +413,7 @@ impl fmt::Debug for TransportConfig {
             .field("send_window", send_window)
             .field("send_fairness", send_fairness)
             .field("packet_threshold", packet_threshold)
+            .field("adaptive_loss_thresholds", adaptive_loss_thresholds)
             .field("time_threshold", time_threshold)
             .field("initial_rtt", initial_rtt)
             .field("initial_mtu", initial_mtu)

@@ -3574,3 +3574,5 @@ fn reject_short_idcid() {
 }
 
 mod deep_reordering;
+
+mod adaptive_reordering;

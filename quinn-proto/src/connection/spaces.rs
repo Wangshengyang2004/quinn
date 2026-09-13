@@ -1,5 +1,4 @@
 use std::{
-    cmp,
     collections::{BTreeMap, VecDeque},
     mem,
     ops::{Bound, Index, IndexMut},
