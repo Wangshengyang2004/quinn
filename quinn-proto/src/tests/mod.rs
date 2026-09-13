@@ -3572,3 +3572,5 @@ fn reject_short_idcid() {
         panic!("expected an initial close");
     };
 }
+
+mod deep_reordering;
