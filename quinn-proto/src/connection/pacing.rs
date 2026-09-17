@@ -153,7 +153,7 @@ struct RatePacer {
 impl RatePacer {
     const BYTE_SCALE: u128 = 1_000_000_000;
     const WAKEUP_SLACK_NANOS: u128 = 4_000_000;
-    const MIN_WAKEUP: Duration = Duration::from_millis(1);
+    const MIN_WAKEUP: Duration = Duration::from_micros(200);
 
     fn capacity(rate: u64, mtu: u16) -> u128 {
         (u128::from(rate) * Self::WAKEUP_SLACK_NANOS)
