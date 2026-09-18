@@ -823,7 +823,7 @@ impl PacketNumberFilter {
 }
 
 /// Ensures we can always fit all our ACKs in a single minimum-MTU packet with room to spare
-const MAX_ACK_BLOCKS: usize = 64;
+const MAX_ACK_BLOCKS: usize = 256;
 
 #[cfg(test)]
 mod test {
