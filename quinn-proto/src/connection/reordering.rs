@@ -4,8 +4,8 @@ use crate::{Duration, Instant, TIMER_GRANULARITY};
 
 // Bound per-path metadata independently of bandwidth and peer ACK ranges.
 const MAX_RECENT_LOSSES: usize = 1024;
-const MAX_LEARNED_THRESHOLD: u64 = 1024;
-const MAX_LEARNED_TIME_THRESHOLD: f32 = 1.5;
+const MAX_LEARNED_THRESHOLD: u64 = 128;
+const MAX_LEARNED_TIME_THRESHOLD: f32 = 1.25;
 const TIME_REORDERING_MARGIN: f32 = 1.0 / 32.0;
 const QUIET_ROUNDS_BEFORE_DECAY: u32 = 32;
 

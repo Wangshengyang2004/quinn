@@ -167,11 +167,11 @@ fn learned_time_allowance_is_capped_and_decays_after_quiet_rtts() {
     let prior_rtt = pair.client_conn_mut(ch).stats().path.rtt;
     let bounded = delayed_flight(&mut pair, ch, sh, true, delay);
     assert!(
-        bounded.2 >= Duration::from_millis(215),
+        bounded.2 >= Duration::from_millis(180),
         "late ACK should increase the allowance"
     );
     assert!(
-        bounded.2 <= Duration::from_millis(225) + Duration::from_micros(250),
+        bounded.2 <= Duration::from_millis(190) + Duration::from_micros(250),
         "learned allowance must be capped: delay={:?}, smoothed RTT before flight={:?}",
         bounded.2,
         prior_rtt
