@@ -2,17 +2,15 @@
 
 `dev` is the maintained custom integration branch. Its runtime source is based on
 `checkpoint/easytier-fe44e654`, commit
-`fe44e654b2b2d18dd2b502931945cbdff4a96af4`. Maintenance documentation may advance
-the branch without changing the dependency checkpoint.
+`fe44e654b2b2d18dd2b502931945cbdff4a96af4`. The dependency checkpoint identifies
+runtime source independently of later maintenance documentation.
 
 EasyTier's Cargo.toml and Cargo.lock select this exact revision for
 `quinn-proto` 0.11.12. Its `quinn` wrapper is registry version 0.11.8. Builds use
-the pinned Git dependency, not a neighboring local checkout.
+the pinned Git dependency.
 
-The existing `main` reference is retained as a separate upstream-tracking
-snapshot. Advancing it or changing to a newer official Quinn release requires
-its own compatibility review. Dependency cleanup does not select a new release
-or retune congestion control.
+`main` tracks `origin/main`. Review API and consumer compatibility when selecting
+a newer official release.
 
 ## Integrated patch boundary
 
@@ -22,9 +20,8 @@ receive history, optional learned loss thresholds and bounded explicit-rate
 pacing credit. Older pacing and BBR/sampler branch tips are ancestors of this
 checkpoint and need no additional merge.
 
-These patches have different roles and should be evaluated separately when
-changing the dependency. The adaptive BBR profile experiment below is distinct
-from the optional adaptive loss recovery already included in the checkpoint.
+The adaptive BBR profile experiment below is distinct from the optional adaptive
+loss recovery already included in the checkpoint.
 
 ## Retained experiments
 
@@ -37,12 +34,5 @@ from the optional adaptive loss recovery already included in the checkpoint.
 | `archive/easytier-pacing-42cb8962` | Historical ancestor of the maintained checkpoint. |
 | `archive/bbr-startup-loss-67611d64` | Historical ancestor of the maintained checkpoint. |
 
-The additional experimental changes are preserved without selecting them for
-the maintained dependency. Restore a scoped worktree from a tag, compare with
-current `dev`, and validate both protocol behavior and affected EasyTier paths
-before integration.
-
-The consolidation changes documentation and Git organization only. It preserves
-the exact deployed dependency source; it does not establish new performance
-claims. Independent Git backup/restore evidence and historical experiment build
-caches are kept in the private operations archive.
+Restore a scoped worktree from a tag, compare it with current `dev`, and validate
+protocol behavior and affected EasyTier paths before integration.
