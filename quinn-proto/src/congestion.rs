@@ -65,6 +65,15 @@ pub trait Controller: Send + Sync {
     /// Number of ack-eliciting bytes that may be in flight
     fn window(&self) -> u64;
 
+    /// Explicit pacing rate in bytes per second.
+    ///
+    /// A positive rate opts into bounded-credit rate pacing. `None` (the default)
+    /// and zero retain upstream congestion-window pacing. This uses bytes per
+    /// second, unlike the bits per second reported by [`ControllerMetrics`].
+    fn pacing_rate(&self) -> Option<u64> {
+        None
+    }
+
     /// Retrieve implementation-specific metrics used to populate `qlog` traces when they are enabled
     fn metrics(&self) -> ControllerMetrics {
         ControllerMetrics {
