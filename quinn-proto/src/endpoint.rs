@@ -8,7 +8,10 @@ use std::{
 };
 
 use bytes::{BufMut, Bytes, BytesMut};
-use rand::{Rng, RngCore, SeedableRng, rngs::StdRng};
+use rand::{
+    Rng, RngExt, SeedableRng,
+    rngs::{StdRng, SysRng},
+};
 use rustc_hash::FxHashMap;
 use slab::Slab;
 use thiserror::Error;
@@ -72,9 +75,12 @@ impl Endpoint {
         allow_mtud: bool,
         rng_seed: Option<[u8; 32]>,
     ) -> Self {
-        let rng_seed = rng_seed.or(config.rng_seed);
         Self {
-            rng: rng_seed.map_or(StdRng::from_os_rng(), StdRng::from_seed),
+            rng: match rng_seed.or(config.rng_seed) {
+                Some(seed) => StdRng::from_seed(seed),
+                None => StdRng::try_from_rng(&mut SysRng)
+                    .expect("failed to seed random number generator from system"),
+            },
             index: ConnectionIndex::default(),
             connections: Slab::new(),
             local_cid_generator: (config.connection_id_generator_factory.as_ref())(),
@@ -88,6 +94,8 @@ impl Endpoint {
     }
 
     /// Replace the server configuration, affecting new incoming connections only
+    ///
+    /// Pending incoming connections retain the configuration active when they first arrived.
     pub fn set_server_config(&mut self, server_config: Option<Arc<ServerConfig>>) {
         self.server_config = server_config;
     }
@@ -170,6 +178,13 @@ impl Endpoint {
                     debug!("dropping packet with unsupported version");
                     return None;
                 }
+                // RFC 9000 §5.2.2: "Servers MUST drop smaller packets that specify unsupported
+                // versions." Responding to short packets would let a spoofed source elicit a
+                // Version Negotiation packet larger than the datagram that triggered it.
+                if datagram_len < MIN_INITIAL_SIZE as usize {
+                    debug!("dropping short packet with unsupported version");
+                    return None;
+                }
                 trace!("sending version negotiation");
                 // Negotiate versions
                 Header::VersionNegotiate {
@@ -208,7 +223,7 @@ impl Endpoint {
             match route_to {
                 RouteDatagramTo::Incoming(incoming_idx) => {
                     let incoming_buffer = &mut self.incoming_buffers[incoming_idx];
-                    let config = &self.server_config.as_ref().unwrap();
+                    let config = &incoming_buffer.server_config;
 
                     if incoming_buffer
                         .total_bytes
@@ -244,15 +259,14 @@ impl Endpoint {
         } else if !event.first_decode.is_initial()
             && self.local_cid_generator.validate(dst_cid).is_err()
         {
-            // If we got this far, we're receiving a seemingly valid packet for an unknown
-            // connection. Send a stateless reset if possible.
-
             debug!("dropping packet with invalid CID");
             None
         } else if dst_cid.is_empty() {
             trace!("dropping unrecognized short packet without ID");
             None
         } else {
+            // If we got this far, we're receiving a seemingly valid packet for an unknown
+            // connection. Send a stateless reset if possible.
             self.stateless_reset(now, datagram_len, addresses, *dst_cid, buf)
                 .map(DatagramEvent::Response)
         }
@@ -353,7 +367,11 @@ impl Endpoint {
         );
         let tls = config
             .crypto
-            .start_session(config.version, server_name, &params)?;
+            .start_session(config.version, server_name, &params)
+            .inspect_err(|_| {
+                // Remove just issued connection id
+                self.index.connection_ids.remove(&loc_cid);
+            })?;
 
         let conn = self.add_connection(
             ch,
@@ -436,6 +454,16 @@ impl Endpoint {
             return None;
         }
 
+        // Saturation only happens under heavy load, where deriving initial keys per Initial just to
+        // reply with CONNECTION_REFUSED would starve packet processing for existing connections.
+        if self.cids_exhausted() || self.incoming_buffers.len() >= server_config.max_incoming {
+            debug!(
+                "ignoring initial for connection {} due to saturation",
+                dst_cid
+            );
+            return None;
+        }
+
         let crypto = match server_config.crypto.initial_keys(header.version, dst_cid) {
             Ok(keys) => keys,
             Err(UnsupportedVersion) => {
@@ -494,7 +522,11 @@ impl Endpoint {
             }
         };
 
-        let incoming_idx = self.incoming_buffers.insert(IncomingBuffer::default());
+        let incoming_idx = self.incoming_buffers.insert(IncomingBuffer {
+            server_config,
+            datagrams: Vec::new(),
+            total_bytes: 0,
+        });
         self.index
             .insert_initial_incoming(header.dst_cid, incoming_idx);
 
@@ -516,6 +548,8 @@ impl Endpoint {
     }
 
     /// Attempt to accept this incoming connection (an error may still occur)
+    // AcceptError cannot be made smaller without semver breakage
+    #[allow(clippy::result_large_err)]
     pub fn accept(
         &mut self,
         mut incoming: Incoming,
@@ -535,8 +569,7 @@ impl Endpoint {
             version,
             ..
         } = incoming.packet.header;
-        let server_config =
-            server_config.unwrap_or_else(|| self.server_config.as_ref().unwrap().clone());
+        let server_config = server_config.unwrap_or_else(|| incoming_buffer.server_config.clone());
 
         if server_config
             .transport
@@ -602,9 +635,7 @@ impl Endpoint {
         params.original_dst_cid = Some(incoming.token.orig_dst_cid);
         params.retry_src_cid = incoming.token.retry_src_cid;
         let mut pref_addr_cid = None;
-        if server_config.preferred_address_v4.is_some()
-            || server_config.preferred_address_v6.is_some()
-        {
+        if server_config.has_preferred_address() {
             let cid = self.new_cid(ch);
             pref_addr_cid = Some(cid);
             params.preferred_address = Some(PreferredAddress {
@@ -676,11 +707,6 @@ impl Endpoint {
         &mut self,
         header: &ProtectedInitialHeader,
     ) -> Result<(), TransportError> {
-        let config = &self.server_config.as_ref().unwrap();
-        if self.cids_exhausted() || self.incoming_buffers.len() >= config.max_incoming {
-            return Err(TransportError::CONNECTION_REFUSED(""));
-        }
-
         // RFC9000 §7.2 dictates that initial (client-chosen) destination CIDs must be at least 8
         // bytes. If this is a Retry packet, then the length must instead match our usual CID
         // length. If we ever issue non-Retry address validation tokens via `NEW_TOKEN`, then we'll
@@ -721,13 +747,14 @@ impl Endpoint {
     /// Errors if `incoming.may_retry()` is false.
     pub fn retry(&mut self, incoming: Incoming, buf: &mut Vec<u8>) -> Result<Transmit, RetryError> {
         if !incoming.may_retry() {
-            return Err(RetryError(incoming));
+            return Err(RetryError(Box::new(incoming)));
         }
 
+        let server_config = self.incoming_buffers[incoming.incoming_idx]
+            .server_config
+            .clone();
         self.clean_up_incoming(&incoming);
         incoming.improper_drop_warner.dismiss();
-
-        let server_config = self.server_config.as_ref().unwrap();
 
         // First Initial
         // The peer will use this as the DCID of its following Initials. Initial DCIDs are
@@ -947,8 +974,8 @@ impl fmt::Debug for Endpoint {
 }
 
 /// Buffered Initial and 0-RTT messages for a pending incoming connection
-#[derive(Default)]
 struct IncomingBuffer {
+    server_config: Arc<ServerConfig>,
     datagrams: Vec<DatagramConnectionEvent>,
     total_bytes: u64,
 }
@@ -1276,12 +1303,12 @@ pub struct AcceptError {
 /// Error for attempting to retry an [`Incoming`] which already bears a token from a previous retry
 #[derive(Debug, Error)]
 #[error("retry() with validated Incoming")]
-pub struct RetryError(Incoming);
+pub struct RetryError(Box<Incoming>);
 
 impl RetryError {
     /// Get the [`Incoming`]
     pub fn into_incoming(self) -> Incoming {
-        self.0
+        *self.0
     }
 }
 

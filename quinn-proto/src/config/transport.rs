@@ -1,6 +1,16 @@
 use std::{fmt, sync::Arc};
+#[cfg(feature = "qlog")]
+use std::{io, sync::Mutex, time::Instant};
 
-use crate::{Duration, INITIAL_MTU, MAX_UDP_PAYLOAD, VarInt, VarIntBoundsExceeded, congestion};
+#[cfg(feature = "qlog")]
+use qlog::streamer::QlogStreamer;
+
+#[cfg(feature = "qlog")]
+use crate::QlogStream;
+use crate::{
+    Duration, INITIAL_MTU, MAX_UDP_PAYLOAD, VarInt, VarIntBoundsExceeded, congestion,
+    connection::qlog::QlogSink,
+};
 
 /// Parameters governing the core QUIC state machine
 ///
@@ -24,12 +34,12 @@ pub struct TransportConfig {
     pub(crate) send_fairness: bool,
 
     pub(crate) packet_threshold: u32,
-    pub(crate) adaptive_loss_thresholds: bool,
     pub(crate) time_threshold: f32,
     pub(crate) initial_rtt: Duration,
     pub(crate) initial_mtu: u16,
     pub(crate) min_mtu: u16,
     pub(crate) mtu_discovery_config: Option<MtuDiscoveryConfig>,
+    pub(crate) pad_to_mtu: bool,
     pub(crate) ack_frequency_config: Option<AckFrequencyConfig>,
 
     pub(crate) persistent_congestion_threshold: u32,
@@ -44,6 +54,8 @@ pub struct TransportConfig {
     pub(crate) congestion_controller_factory: Arc<dyn congestion::ControllerFactory + Send + Sync>,
 
     pub(crate) enable_segmentation_offload: bool,
+
+    pub(crate) qlog_sink: QlogSink,
 }
 
 impl TransportConfig {
@@ -115,12 +127,18 @@ impl TransportConfig {
         self
     }
 
-    /// Maximum number of bytes to transmit to a peer without acknowledgment
+    /// Maximum number of bytes retained from application writes across all streams of a connection
     ///
-    /// Provides an upper bound on memory when communicating with peers that issue large amounts of
-    /// flow control credit. Endpoints that wish to handle large numbers of connections robustly
-    /// should take care to set this low enough to guarantee memory exhaustion does not occur if
-    /// every connection uses the entire window.
+    /// Acknowledged data continues to count against this limit until its storage is released. This
+    /// can keep writes blocked while earlier data is awaiting acknowledgment or only part of a buffer
+    /// has been acknowledged.
+    ///
+    /// Limits memory use when communicating with peers that issue large amounts of flow control
+    /// credit. Endpoints that wish to handle large numbers of connections robustly should take care
+    /// to set this low enough to avoid memory exhaustion if every connection uses the entire window.
+    ///
+    /// The limit counts bytes accepted from application buffers. Slices of larger allocations can
+    /// retain more memory than this limit accounts for.
     pub fn send_window(&mut self, value: u64) -> &mut Self {
         self.send_window = value;
         self
@@ -138,21 +156,6 @@ impl TransportConfig {
     /// many small streams.
     pub fn send_fairness(&mut self, value: bool) -> &mut Self {
         self.send_fairness = value;
-        self
-    }
-
-    /// Adapt packet and time loss thresholds using ACKs of packets previously declared lost.
-    ///
-    /// Disabled by default. The configured thresholds remain lower bounds. Learning is
-    /// per path and bounded to 1024 packets and 1.5 times the RTT; a larger configured
-    /// threshold is preserved. Learned allowances halve after 32 RTTs without evidence
-    /// and reset when the path changes.
-    ///
-    /// At most 1024 recent loss records are retained. ACKs received more than three RTTs
-    /// after a loss declaration do not train the thresholds. Increased tolerance can
-    /// delay detection of genuine loss in exchange for fewer spurious retransmissions.
-    pub fn adaptive_loss_thresholds(&mut self, enabled: bool) -> &mut Self {
-        self.adaptive_loss_thresholds = enabled;
         self
     }
 
@@ -198,11 +201,12 @@ impl TransportConfig {
     /// Must be at least 1200, which is the default, and lower than or equal to
     /// [`TransportConfig::initial_mtu`].
     ///
+    /// Client Initial datagrams and ack-eliciting server Initial datagrams are padded to at least
+    /// this size, subject to the peer's maximum UDP payload size.
+    ///
     /// Real-world MTUs can vary according to ISP, VPN, and properties of intermediate network links
-    /// outside of either endpoint's control. Extreme care should be used when raising this value
-    /// outside of private networks where these factors are fully controlled. If the provided value
-    /// is higher than what the network path actually supports, the result will be unpredictable and
-    /// catastrophic packet loss, without a possibility of repair. Prefer
+    /// outside of either endpoint's control. If this value exceeds what the network path supports,
+    /// connections may fail to be established because Initial datagrams cannot be delivered. Prefer
     /// [`TransportConfig::initial_mtu`] together with
     /// [`TransportConfig::mtu_discovery_config`] to set a maximum UDP payload size that robustly
     /// adapts to the network.
@@ -216,6 +220,20 @@ impl TransportConfig {
     /// Enabled by default.
     pub fn mtu_discovery_config(&mut self, value: Option<MtuDiscoveryConfig>) -> &mut Self {
         self.mtu_discovery_config = value;
+        self
+    }
+
+    /// Pad UDP datagrams carrying application data to current maximum UDP payload size
+    ///
+    /// Disabled by default. UDP datagrams containing loss probes are exempt from padding.
+    ///
+    /// Enabling this helps mitigate traffic analysis by network observers, but it increases
+    /// bandwidth usage. Without this mitigation precise plain text size of application datagrams as
+    /// well as the total size of stream write bursts can be inferred by observers under certain
+    /// conditions. This analysis requires either an uncongested connection or application datagrams
+    /// too large to be coalesced.
+    pub fn pad_to_mtu(&mut self, value: bool) -> &mut Self {
+        self.pad_to_mtu = value;
         self
     }
 
@@ -271,6 +289,8 @@ impl TransportConfig {
     /// The peer is forbidden to send single datagrams larger than this size. If the aggregate size
     /// of all datagrams that have been received from the peer but not consumed by the application
     /// exceeds this value, old datagrams are dropped until it is no longer exceeded.
+    ///
+    /// The amount of payload data buffered may be smaller than `value` due to overhead.
     pub fn datagram_receive_buffer_size(&mut self, value: Option<usize>) -> &mut Self {
         self.datagram_receive_buffer_size = value;
         self
@@ -282,6 +302,8 @@ impl TransportConfig {
     /// than the link, or even the underlying hardware, can transmit them. This limits the amount of
     /// memory that may be consumed in that case. When the send buffer is full and a new datagram is
     /// sent, older datagrams are dropped until sufficient space is available.
+    ///
+    /// The amount of payload data buffered may be smaller than `value` due to overhead.
     pub fn datagram_send_buffer_size(&mut self, value: usize) -> &mut Self {
         self.datagram_send_buffer_size = value;
         self
@@ -330,6 +352,13 @@ impl TransportConfig {
         self.enable_segmentation_offload = enabled;
         self
     }
+
+    /// qlog capture configuration to use for a particular connection
+    #[cfg(feature = "qlog")]
+    pub fn qlog_stream(&mut self, stream: Option<QlogStream>) -> &mut Self {
+        self.qlog_sink = stream.into();
+        self
+    }
 }
 
 impl Default for TransportConfig {
@@ -351,12 +380,12 @@ impl Default for TransportConfig {
             send_fairness: true,
 
             packet_threshold: 3,
-            adaptive_loss_thresholds: false,
             time_threshold: 9.0 / 8.0,
             initial_rtt: Duration::from_millis(333), // per spec, intentionally distinct from EXPECTED_RTT
             initial_mtu: INITIAL_MTU,
             min_mtu: INITIAL_MTU,
             mtu_discovery_config: Some(MtuDiscoveryConfig::default()),
+            pad_to_mtu: false,
             ack_frequency_config: None,
 
             persistent_congestion_threshold: 3,
@@ -371,6 +400,8 @@ impl Default for TransportConfig {
             congestion_controller_factory: Arc::new(congestion::CubicConfig::default()),
 
             enable_segmentation_offload: true,
+
+            qlog_sink: QlogSink::default(),
         }
     }
 }
@@ -386,12 +417,12 @@ impl fmt::Debug for TransportConfig {
             send_window,
             send_fairness,
             packet_threshold,
-            adaptive_loss_thresholds,
             time_threshold,
             initial_rtt,
             initial_mtu,
             min_mtu,
             mtu_discovery_config,
+            pad_to_mtu,
             ack_frequency_config,
             persistent_congestion_threshold,
             keep_alive_interval,
@@ -403,9 +434,11 @@ impl fmt::Debug for TransportConfig {
                 deterministic_packet_numbers: _,
             congestion_controller_factory: _,
             enable_segmentation_offload,
+            qlog_sink,
         } = self;
-        fmt.debug_struct("TransportConfig")
-            .field("max_concurrent_bidi_streams", max_concurrent_bidi_streams)
+        let mut s = fmt.debug_struct("TransportConfig");
+
+        s.field("max_concurrent_bidi_streams", max_concurrent_bidi_streams)
             .field("max_concurrent_uni_streams", max_concurrent_uni_streams)
             .field("max_idle_timeout", max_idle_timeout)
             .field("stream_receive_window", stream_receive_window)
@@ -413,12 +446,12 @@ impl fmt::Debug for TransportConfig {
             .field("send_window", send_window)
             .field("send_fairness", send_fairness)
             .field("packet_threshold", packet_threshold)
-            .field("adaptive_loss_thresholds", adaptive_loss_thresholds)
             .field("time_threshold", time_threshold)
             .field("initial_rtt", initial_rtt)
             .field("initial_mtu", initial_mtu)
             .field("min_mtu", min_mtu)
             .field("mtu_discovery_config", mtu_discovery_config)
+            .field("pad_to_mtu", pad_to_mtu)
             .field("ack_frequency_config", ack_frequency_config)
             .field(
                 "persistent_congestion_threshold",
@@ -430,8 +463,12 @@ impl fmt::Debug for TransportConfig {
             .field("datagram_receive_buffer_size", datagram_receive_buffer_size)
             .field("datagram_send_buffer_size", datagram_send_buffer_size)
             // congestion_controller_factory not debug
-            .field("enable_segmentation_offload", enable_segmentation_offload)
-            .finish_non_exhaustive()
+            .field("enable_segmentation_offload", enable_segmentation_offload);
+        if cfg!(feature = "qlog") {
+            s.field("qlog_stream", &qlog_sink.is_enabled());
+        }
+
+        s.finish_non_exhaustive()
     }
 }
 
@@ -509,6 +546,94 @@ impl Default for AckFrequencyConfig {
             ack_eliciting_threshold: VarInt(1),
             max_ack_delay: None,
             reordering_threshold: VarInt(2),
+        }
+    }
+}
+
+/// Configuration for qlog trace logging
+#[cfg(feature = "qlog")]
+pub struct QlogConfig {
+    writer: Option<Box<dyn io::Write + Send + Sync>>,
+    title: Option<String>,
+    description: Option<String>,
+    start_time: Instant,
+}
+
+#[cfg(feature = "qlog")]
+impl QlogConfig {
+    /// Where to write a qlog `TraceSeq`
+    pub fn writer(&mut self, writer: Box<dyn io::Write + Send + Sync>) -> &mut Self {
+        self.writer = Some(writer);
+        self
+    }
+
+    /// Title to record in the qlog capture
+    pub fn title(&mut self, title: Option<String>) -> &mut Self {
+        self.title = title;
+        self
+    }
+
+    /// Description to record in the qlog capture
+    pub fn description(&mut self, description: Option<String>) -> &mut Self {
+        self.description = description;
+        self
+    }
+
+    /// Epoch qlog event times are recorded relative to
+    pub fn start_time(&mut self, start_time: Instant) -> &mut Self {
+        self.start_time = start_time;
+        self
+    }
+
+    /// Construct the [`QlogStream`] described by this configuration
+    pub fn into_stream(self) -> Option<QlogStream> {
+        use tracing::warn;
+
+        let writer = self.writer?;
+        let trace = qlog::TraceSeq::new(
+            qlog::VantagePoint {
+                name: None,
+                ty: qlog::VantagePointType::Unknown,
+                flow: None,
+            },
+            self.title.clone(),
+            self.description.clone(),
+            Some(qlog::Configuration {
+                time_offset: Some(0.0),
+                original_uris: None,
+            }),
+            None,
+        );
+
+        let mut streamer = QlogStreamer::new(
+            qlog::QLOG_VERSION.into(),
+            self.title,
+            self.description,
+            None,
+            self.start_time,
+            trace,
+            qlog::events::EventImportance::Core,
+            writer,
+        );
+
+        match streamer.start_log() {
+            Ok(()) => Some(QlogStream(Arc::new(Mutex::new(streamer)))),
+            Err(e) => {
+                warn!("could not initialize endpoint qlog streamer: {e}");
+                None
+            }
+        }
+    }
+}
+
+#[cfg(feature = "qlog")]
+impl Default for QlogConfig {
+    fn default() -> Self {
+        Self {
+            writer: None,
+            title: None,
+            description: None,
+            start_time: Instant::now(),
         }
     }
 }

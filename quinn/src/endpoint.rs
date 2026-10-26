@@ -8,7 +8,10 @@ use std::{
     net::{SocketAddr, SocketAddrV6},
     pin::Pin,
     str,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
     task::{Context, Poll, Waker},
 };
 
@@ -77,8 +80,8 @@ impl Endpoint {
             }
         }
         socket.bind(&addr.into())?;
-        let runtime = default_runtime()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "no async runtime found"))?;
+        let runtime =
+            default_runtime().ok_or_else(|| io::Error::other("no async runtime found"))?;
         Self::new_with_abstract_socket(
             EndpointConfig::default(),
             None,
@@ -101,8 +104,8 @@ impl Endpoint {
     #[cfg(all(not(wasm_browser), any(feature = "aws-lc-rs", feature = "ring")))] // `EndpointConfig::default()` is only available with these
     pub fn server(config: ServerConfig, addr: SocketAddr) -> io::Result<Self> {
         let socket = std::net::UdpSocket::bind(addr)?;
-        let runtime = default_runtime()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "no async runtime found"))?;
+        let runtime =
+            default_runtime().ok_or_else(|| io::Error::other("no async runtime found"))?;
         Self::new_with_abstract_socket(
             EndpointConfig::default(),
             Some(config),
@@ -258,6 +261,10 @@ impl Endpoint {
             // Ignoring errors from dropped connections
             let _ = sender.send(ConnectionEvent::Rebind(inner.socket.clone()));
         }
+        if let Some(driver) = inner.driver.take() {
+            // Ensure the driver can register for wake-ups from the new socket
+            driver.wake();
+        }
 
         Ok(())
     }
@@ -374,7 +381,9 @@ impl Future for EndpointDriver {
             self.0.shared.incoming.notify_waiters();
         }
 
-        if endpoint.ref_count == 0 && endpoint.recv_state.connections.is_empty() {
+        if self.0.shared.ref_count.load(Ordering::Relaxed) == 0
+            && endpoint.recv_state.connections.is_empty()
+        {
             Poll::Ready(Ok(()))
         } else {
             drop(endpoint);
@@ -397,6 +406,10 @@ impl Drop for EndpointDriver {
         // Drop all outgoing channels, signaling the termination of the endpoint to the associated
         // connections.
         endpoint.recv_state.connections.senders.clear();
+        // Clearing the senders is what makes the endpoint idle, but a waiter already parked on
+        // `idle` only re-reads that after being notified, and with the driver gone nothing else
+        // can wake it.
+        self.0.shared.idle.notify_waiters();
     }
 }
 
@@ -471,8 +484,6 @@ pub(crate) struct State {
     driver: Option<Waker>,
     ipv6: bool,
     events: mpsc::UnboundedReceiver<(ConnectionHandle, EndpointEvent)>,
-    /// Number of live handles that can be used to initiate or handle I/O; excludes the driver
-    ref_count: usize,
     driver_lost: bool,
     runtime: Arc<dyn Runtime>,
     stats: EndpointStats,
@@ -482,6 +493,8 @@ pub(crate) struct State {
 pub(crate) struct Shared {
     incoming: Notify,
     idle: Notify,
+    /// Number of live handles that can be used to initiate or handle I/O; excludes the driver
+    ref_count: AtomicUsize,
 }
 
 impl State {
@@ -681,6 +694,7 @@ impl EndpointRef {
             shared: Shared {
                 incoming: Notify::new(),
                 idle: Notify::new(),
+                ref_count: AtomicUsize::new(0),
             },
             state: Mutex::new(State {
                 socket,
@@ -689,7 +703,6 @@ impl EndpointRef {
                 ipv6,
                 events,
                 driver: None,
-                ref_count: 0,
                 driver_lost: false,
                 recv_state,
                 runtime,
@@ -701,23 +714,22 @@ impl EndpointRef {
 
 impl Clone for EndpointRef {
     fn clone(&self) -> Self {
-        self.0.state.lock().unwrap().ref_count += 1;
+        self.0.shared.ref_count.fetch_add(1, Ordering::Relaxed);
         Self(self.0.clone())
     }
 }
 
 impl Drop for EndpointRef {
     fn drop(&mut self) {
+        if self.shared.ref_count.fetch_sub(1, Ordering::Relaxed) > 1 {
+            return;
+        }
+
         let endpoint = &mut *self.0.state.lock().unwrap();
-        if let Some(x) = endpoint.ref_count.checked_sub(1) {
-            endpoint.ref_count = x;
-            if x == 0 {
-                // If the driver is about to be on its own, ensure it can shut down if the last
-                // connection is gone.
-                if let Some(task) = endpoint.driver.take() {
-                    task.wake();
-                }
-            }
+        // If the driver is about to be on its own, ensure it can shut down if the last
+        // connection is gone.
+        if let Some(task) = endpoint.driver.take() {
+            task.wake();
         }
     }
 }

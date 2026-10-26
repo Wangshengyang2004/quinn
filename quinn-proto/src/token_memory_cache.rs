@@ -159,7 +159,7 @@ mod tests {
     use rand_pcg::Pcg32;
 
     fn new_rng() -> impl Rng {
-        Pcg32::from_seed(0xdeadbeefdeadbeefdeadbeefdeadbeefu128.to_le_bytes())
+        Pcg32::new(0xdeadbeefdeadbeef, 0xdeadbeefdeadbeef)
     }
 
     #[test]
@@ -176,7 +176,7 @@ mod tests {
                 if rng.random_bool(0.666) {
                     // store
                     let token = Bytes::from(vec![i]);
-                    println!("STORE {} {:?}", server_name, token);
+                    println!("STORE {server_name} {token:?}");
                     if let Some((j, _)) = cache_1
                         .iter()
                         .enumerate()
@@ -199,7 +199,7 @@ mod tests {
                     cache_2.insert(&server_name.to_string(), token);
                 } else {
                     // take
-                    println!("TAKE {}", server_name);
+                    println!("TAKE {server_name}");
                     let expecting = cache_1
                         .iter()
                         .enumerate()
@@ -213,7 +213,7 @@ mod tests {
                             }
                             token
                         });
-                    println!("EXPECTING {:?}", expecting);
+                    println!("EXPECTING {expecting:?}");
                     assert_eq!(cache_2.take(&server_name.to_string()), expecting);
                 }
             }

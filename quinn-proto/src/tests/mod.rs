@@ -1,6 +1,6 @@
 use std::{
     convert::TryInto,
-    mem,
+    iter, mem,
     net::{Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::{Arc, Mutex},
 };
@@ -10,7 +10,7 @@ use assert_matches::assert_matches;
 use aws_lc_rs::hmac;
 use bytes::{Bytes, BytesMut};
 use hex_literal::hex;
-use rand::RngCore;
+use rand::Rng;
 #[cfg(feature = "ring")]
 use ring::hmac;
 #[cfg(all(feature = "rustls-aws-lc-rs", not(feature = "rustls-ring")))]
@@ -37,122 +37,6 @@ use util::*;
 
 mod token;
 
-#[derive(Clone)]
-struct SentPacketRecorder {
-    sent: Arc<Mutex<Vec<(u64, u64, u64, bool)>>>,
-}
-
-impl congestion::Controller for SentPacketRecorder {
-    fn on_packet_sent(&mut self, packet: congestion::SentPacketInfo) {
-        self.sent.lock().unwrap().push((
-            packet.bytes,
-            packet.packet_number,
-            packet.bytes_in_flight,
-            packet.app_limited,
-        ));
-    }
-
-    fn on_congestion_event(
-        &mut self,
-        _now: Instant,
-        _sent: Instant,
-        _is_persistent_congestion: bool,
-        _lost_bytes: u64,
-    ) {
-    }
-
-    fn on_mtu_update(&mut self, _new_mtu: u16) {}
-
-    fn window(&self) -> u64 {
-        u64::MAX
-    }
-
-    fn clone_box(&self) -> Box<dyn congestion::Controller> {
-        Box::new(self.clone())
-    }
-
-    fn initial_window(&self) -> u64 {
-        u64::MAX
-    }
-
-    fn into_any(self: Box<Self>) -> Box<dyn std::any::Any> {
-        self
-    }
-}
-
-struct SentPacketRecorderFactory {
-    sent: Arc<Mutex<Vec<(u64, u64, u64, bool)>>>,
-}
-
-#[derive(Clone)]
-struct CongestionEventRecorder {
-    events: Arc<Mutex<Vec<(Vec<u64>, Vec<u64>)>>>,
-}
-
-impl congestion::Controller for CongestionEventRecorder {
-    fn on_ack_and_loss(&mut self, event: congestion::CongestionEvent<'_>) {
-        self.events.lock().unwrap().push((
-            event
-                .acked_packets
-                .iter()
-                .map(|packet| packet.packet_number)
-                .collect(),
-            event
-                .lost_packets
-                .iter()
-                .map(|packet| packet.packet_number)
-                .collect(),
-        ));
-    }
-
-    fn on_congestion_event(
-        &mut self,
-        _now: Instant,
-        _sent: Instant,
-        _is_persistent_congestion: bool,
-        _lost_bytes: u64,
-    ) {
-    }
-
-    fn on_mtu_update(&mut self, _new_mtu: u16) {}
-
-    fn window(&self) -> u64 {
-        u64::MAX
-    }
-
-    fn clone_box(&self) -> Box<dyn congestion::Controller> {
-        Box::new(self.clone())
-    }
-
-    fn initial_window(&self) -> u64 {
-        u64::MAX
-    }
-
-    fn into_any(self: Box<Self>) -> Box<dyn std::any::Any> {
-        self
-    }
-}
-
-struct CongestionEventRecorderFactory {
-    events: Arc<Mutex<Vec<(Vec<u64>, Vec<u64>)>>>,
-}
-
-impl congestion::ControllerFactory for CongestionEventRecorderFactory {
-    fn build(self: Arc<Self>, _now: Instant, _current_mtu: u16) -> Box<dyn congestion::Controller> {
-        Box::new(CongestionEventRecorder {
-            events: self.events.clone(),
-        })
-    }
-}
-
-impl congestion::ControllerFactory for SentPacketRecorderFactory {
-    fn build(self: Arc<Self>, _now: Instant, _current_mtu: u16) -> Box<dyn congestion::Controller> {
-        Box::new(SentPacketRecorder {
-            sent: self.sent.clone(),
-        })
-    }
-}
-
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
 use wasm_bindgen_test::wasm_bindgen_test as test;
 
@@ -160,6 +44,73 @@ use wasm_bindgen_test::wasm_bindgen_test as test;
 // Unfortunately it's either-or: Enable this and you can run in the browser, disable to run in nodejs.
 // #[cfg(all(target_family = "wasm", target_os = "unknown"))]
 // wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
+
+#[test]
+fn pending_incoming_survives_server_config_change() {
+    let _guard = subscribe();
+    let replacement = ServerConfig::with_crypto(Arc::new(server_crypto_with_alpn(vec![
+        "replacement-only".into(),
+    ])));
+    for replacement in [None, Some(Arc::new(replacement))] {
+        let mut pair = Pair::default();
+        let client_ch = pair.begin_connect(client_config());
+        pair.drive_client();
+        let (received, ecn, data) = pair.server.inbound.pop_front().unwrap();
+        let mut response = Vec::new();
+        let Some(DatagramEvent::NewConnection(incoming)) = pair.server.handle(
+            received,
+            pair.client.addr,
+            None,
+            ecn,
+            data.clone(),
+            &mut response,
+        ) else {
+            panic!("expected an incoming connection");
+        };
+
+        pair.server.set_server_config(replacement);
+        // Retransmitted Initials must still be buffered after the configuration changes.
+        assert!(
+            pair.server
+                .handle(received, pair.client.addr, None, ecn, data, &mut response)
+                .is_none()
+        );
+        let server_ch = pair.server.try_accept(incoming, pair.time).unwrap();
+        pair.drive();
+        for (endpoint, ch) in [(&mut pair.client, client_ch), (&mut pair.server, server_ch)] {
+            let conn = endpoint.connections.get_mut(&ch).unwrap();
+            assert!(
+                std::iter::from_fn(|| conn.poll()).any(|event| matches!(event, Event::Connected))
+            );
+        }
+    }
+}
+
+#[test]
+fn pending_incoming_can_retry_after_disabling_server() {
+    let _guard = subscribe();
+    let config = server_config();
+    let mut pair = Pair::new(Default::default(), config.clone());
+    pair.server.handle_incoming = Box::new(|_| IncomingConnectionBehavior::Wait);
+    let client_ch = pair.begin_connect(client_config());
+    pair.drive_client();
+    pair.server.drive_incoming(pair.time, pair.client.addr);
+    let incoming = pair.server.waiting_incoming.pop().unwrap();
+
+    pair.server.set_server_config(None);
+    pair.server.retry(incoming);
+    pair.server.set_server_config(Some(Arc::new(config)));
+    pair.server.handle_incoming = Box::new(|incoming| {
+        assert!(incoming.remote_address_validated());
+        IncomingConnectionBehavior::Accept
+    });
+    pair.drive();
+    pair.server.assert_accept();
+    assert!(
+        std::iter::from_fn(|| pair.client_conn_mut(client_ch).poll())
+            .any(|event| matches!(event, Event::Connected))
+    );
+}
 
 #[test]
 fn version_negotiate_server() {
@@ -173,15 +124,17 @@ fn version_negotiate_server() {
     );
     let now = Instant::now();
     let mut buf = Vec::with_capacity(server.config().get_max_udp_payload_size() as usize);
-    let event = server.handle(
-        now,
-        client_addr,
-        None,
-        None,
-        // Long-header packet with reserved version number
-        hex!("80 0a1a2a3a 04 00000000 04 00000000 00")[..].into(),
-        &mut buf,
-    );
+    // Long-header packet with reserved version number
+    let header = hex!("80 0a1a2a3a 04 00000000 04 00000000 00");
+
+    // RFC 9000 §5.2.2: packets too small to initiate a connection are dropped
+    let event = server.handle(now, client_addr, None, None, header[..].into(), &mut buf);
+    assert!(event.is_none());
+    assert!(buf.is_empty());
+
+    let mut packet = header.to_vec();
+    packet.resize(MIN_INITIAL_SIZE as usize, 0);
+    let event = server.handle(now, client_addr, None, None, packet[..].into(), &mut buf);
     let Some(DatagramEvent::Response(Transmit { .. })) = event else {
         panic!("expected a response");
     };
@@ -567,7 +520,7 @@ fn reject_missing_client_cert() {
     // because it's convenient.
     store.add(CERTIFIED_KEY.cert.der().clone()).unwrap();
 
-    let key = PrivatePkcs8KeyDer::from(CERTIFIED_KEY.key_pair.serialize_der());
+    let key = PrivatePkcs8KeyDer::from(CERTIFIED_KEY.signing_key.serialize_der());
     let cert = CERTIFIED_KEY.cert.der().clone();
 
     let provider = Arc::new(default_provider());
@@ -712,7 +665,7 @@ fn zero_rtt_happypath() {
         Ok(Some(chunk)) if chunk.offset == 0 && chunk.bytes == MSG
     );
     let _ = chunks.finalize();
-    assert_eq!(pair.client_conn_mut(client_ch).lost_packets(), 0);
+    assert_eq!(pair.client_conn_mut(client_ch).stats().path.lost_packets, 0);
 }
 
 #[test]
@@ -767,6 +720,8 @@ fn zero_rtt_rejection() {
     assert!(pair.client_conn_mut(client_ch).has_0rtt());
     let s = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
     const MSG: &[u8] = b"Hello, 0-RTT!";
+    pair.client_conn_mut(client_ch)
+        .set_send_window(MSG.len() as u64);
     pair.client_send(client_ch, s).write(MSG).unwrap();
     pair.drive();
     assert!(!pair.client_conn_mut(client_ch).accepted_0rtt());
@@ -787,7 +742,20 @@ fn zero_rtt_rejection() {
     let mut chunks = recv.read(false).unwrap();
     assert_eq!(chunks.next(usize::MAX), Err(ReadError::Blocked));
     let _ = chunks.finalize();
-    assert_eq!(pair.client_conn_mut(client_ch).lost_packets(), 0);
+    assert_eq!(pair.client_conn_mut(client_ch).stats().path.lost_packets, 0);
+
+    // Rejecting early data must release the entire send window for 1-RTT traffic.
+    assert_eq!(
+        pair.client_send(client_ch, s2).write(MSG).unwrap(),
+        MSG.len()
+    );
+    pair.client_send(client_ch, s2).finish().unwrap();
+    pair.drive();
+    let mut recv = pair.server_recv(server_ch, s2);
+    let mut chunks = recv.read(false).unwrap();
+    assert_eq!(chunks.next(usize::MAX).unwrap().unwrap().bytes, MSG);
+    assert_eq!(chunks.next(usize::MAX).unwrap(), None);
+    let _ = chunks.finalize();
 }
 
 fn test_zero_rtt_incoming_limit<F: FnOnce(&mut ServerConfig)>(configure_server: F) {
@@ -878,7 +846,7 @@ fn test_zero_rtt_incoming_limit<F: FnOnce(&mut ServerConfig)>(configure_server: 
     assert_eq!(offset, CLIENT_WRITES);
     let _ = chunks.finalize();
     assert_eq!(
-        pair.client_conn_mut(client_ch).lost_packets(),
+        pair.client_conn_mut(client_ch).stats().path.lost_packets,
         EXPECTED_DROPPED
     );
 }
@@ -1079,6 +1047,326 @@ fn stream_id_limit() {
 }
 
 #[test]
+fn data_blocked() {
+    let _guard = subscribe();
+    let server = ServerConfig {
+        transport: Arc::new(TransportConfig {
+            receive_window: 10u32.into(),
+            ..TransportConfig::default()
+        }),
+        ..server_config()
+    };
+    let mut pair = Pair::new(Default::default(), server);
+    let (client_ch, server_ch) = pair.connect();
+
+    // Fill the connection-level window, then run into the limit
+    let s = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
+    assert_eq!(
+        pair.client_send(client_ch, s)
+            .write(b"0123456789ab")
+            .unwrap(),
+        10
+    );
+    assert_matches!(
+        pair.client_send(client_ch, s).write(b"c"),
+        Err(WriteError::Blocked)
+    );
+    pair.drive();
+    assert_eq!(
+        pair.client_conn_mut(client_ch)
+            .stats()
+            .frame_tx
+            .data_blocked,
+        1
+    );
+    assert_eq!(
+        pair.server_conn_mut(server_ch)
+            .stats()
+            .frame_rx
+            .data_blocked,
+        1
+    );
+
+    // Being refused again at the same limit does not repeat the frame
+    assert_matches!(
+        pair.client_send(client_ch, s).write(b"c"),
+        Err(WriteError::Blocked)
+    );
+    pair.drive();
+    assert_eq!(
+        pair.client_conn_mut(client_ch)
+            .stats()
+            .frame_tx
+            .data_blocked,
+        1
+    );
+
+    // Running into the raised limit is reported again
+    assert_matches!(pair.server_streams(server_ch).accept(Dir::Uni), Some(stream) if stream == s);
+    let mut recv = pair.server_recv(server_ch, s);
+    let mut chunks = recv.read(true).unwrap();
+    assert_matches!(chunks.next(usize::MAX), Ok(Some(chunk)) if chunk.bytes.len() == 10);
+    let _ = chunks.finalize();
+    pair.drive();
+    assert_eq!(
+        pair.client_send(client_ch, s)
+            .write(b"0123456789ab")
+            .unwrap(),
+        10
+    );
+    assert_matches!(
+        pair.client_send(client_ch, s).write(b"c"),
+        Err(WriteError::Blocked)
+    );
+    pair.drive();
+    let stats = pair.client_conn_mut(client_ch).stats();
+    assert_eq!(stats.frame_tx.data_blocked, 2);
+    assert_eq!(stats.frame_tx.stream_data_blocked, 0);
+}
+
+#[test]
+fn stream_data_blocked() {
+    let _guard = subscribe();
+    let server = ServerConfig {
+        transport: Arc::new(TransportConfig {
+            stream_receive_window: 10u32.into(),
+            ..TransportConfig::default()
+        }),
+        ..server_config()
+    };
+    let mut pair = Pair::new(Default::default(), server);
+    let (client_ch, server_ch) = pair.connect();
+
+    // Fill the stream-level window, then run into the limit
+    let s = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
+    assert_eq!(
+        pair.client_send(client_ch, s)
+            .write(b"0123456789ab")
+            .unwrap(),
+        10
+    );
+    assert_matches!(
+        pair.client_send(client_ch, s).write(b"c"),
+        Err(WriteError::Blocked)
+    );
+    pair.drive();
+    assert_eq!(
+        pair.client_conn_mut(client_ch)
+            .stats()
+            .frame_tx
+            .stream_data_blocked,
+        1
+    );
+    assert_eq!(
+        pair.server_conn_mut(server_ch)
+            .stats()
+            .frame_rx
+            .stream_data_blocked,
+        1
+    );
+
+    // Being refused again at the same limit does not repeat the frame
+    assert_matches!(
+        pair.client_send(client_ch, s).write(b"c"),
+        Err(WriteError::Blocked)
+    );
+    pair.drive();
+    assert_eq!(
+        pair.client_conn_mut(client_ch)
+            .stats()
+            .frame_tx
+            .stream_data_blocked,
+        1
+    );
+
+    // Running into the raised limit is reported again
+    assert_matches!(pair.server_streams(server_ch).accept(Dir::Uni), Some(stream) if stream == s);
+    let mut recv = pair.server_recv(server_ch, s);
+    let mut chunks = recv.read(true).unwrap();
+    assert_matches!(chunks.next(usize::MAX), Ok(Some(chunk)) if chunk.bytes.len() == 10);
+    let _ = chunks.finalize();
+    pair.drive();
+    assert_eq!(
+        pair.client_send(client_ch, s)
+            .write(b"0123456789ab")
+            .unwrap(),
+        10
+    );
+    assert_matches!(
+        pair.client_send(client_ch, s).write(b"c"),
+        Err(WriteError::Blocked)
+    );
+    pair.drive();
+    let stats = pair.client_conn_mut(client_ch).stats();
+    assert_eq!(stats.frame_tx.stream_data_blocked, 2);
+    assert_eq!(stats.frame_tx.data_blocked, 0);
+}
+
+#[test]
+fn data_blocked_not_sent_under_limit() {
+    let _guard = subscribe();
+    let mut pair = Pair::default();
+    let (client_ch, _server_ch) = pair.connect();
+
+    // Default windows are far larger than this write, so nothing is blocked
+    let s = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
+    pair.client_send(client_ch, s).write(b"hi").unwrap();
+    pair.drive();
+
+    let stats = pair.client_conn_mut(client_ch).stats();
+    assert_eq!(stats.frame_tx.data_blocked, 0);
+    assert_eq!(stats.frame_tx.stream_data_blocked, 0);
+}
+
+#[test]
+fn data_blocked_not_sent_for_local_send_window() {
+    let _guard = subscribe();
+    let mut pair = Pair::default();
+    let (client_ch, _server_ch) = pair.connect();
+
+    // Running out of our own send window is not the peer's flow control limit
+    pair.client_conn_mut(client_ch).set_send_window(5);
+    let s = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
+    assert_eq!(
+        pair.client_send(client_ch, s).write(b"0123456789").unwrap(),
+        5
+    );
+    assert_matches!(
+        pair.client_send(client_ch, s).write(b"x"),
+        Err(WriteError::Blocked)
+    );
+    pair.drive();
+
+    assert_eq!(
+        pair.client_conn_mut(client_ch)
+            .stats()
+            .frame_tx
+            .data_blocked,
+        0
+    );
+}
+
+#[test]
+fn data_blocked_dropped_when_limit_raised() {
+    let _guard = subscribe();
+    let server = ServerConfig {
+        transport: Arc::new(TransportConfig {
+            receive_window: 10u32.into(),
+            ..TransportConfig::default()
+        }),
+        ..server_config()
+    };
+    let mut pair = Pair::new(Default::default(), server);
+    let (client_ch, server_ch) = pair.connect();
+
+    let s = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
+    assert_eq!(
+        pair.client_send(client_ch, s)
+            .write(b"0123456789ab")
+            .unwrap(),
+        10
+    );
+    assert_matches!(
+        pair.client_send(client_ch, s).write(b"c"),
+        Err(WriteError::Blocked)
+    );
+
+    // The peer raises the limit before the queued frame gets transmitted
+    pair.server_conn_mut(server_ch)
+        .set_receive_window(100u32.into());
+    pair.drive_server();
+    pair.drive();
+
+    assert_eq!(
+        pair.client_conn_mut(client_ch)
+            .stats()
+            .frame_tx
+            .data_blocked,
+        0
+    );
+}
+
+#[test]
+fn stream_data_blocked_not_sent_after_reset() {
+    let _guard = subscribe();
+    let server = ServerConfig {
+        transport: Arc::new(TransportConfig {
+            stream_receive_window: 10u32.into(),
+            ..TransportConfig::default()
+        }),
+        ..server_config()
+    };
+    let mut pair = Pair::new(Default::default(), server);
+    let (client_ch, _server_ch) = pair.connect();
+
+    let s = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
+    assert_eq!(
+        pair.client_send(client_ch, s)
+            .write(b"0123456789ab")
+            .unwrap(),
+        10
+    );
+    assert_matches!(
+        pair.client_send(client_ch, s).write(b"c"),
+        Err(WriteError::Blocked)
+    );
+
+    // Resetting the stream before the queued frame gets transmitted discards it
+    pair.client_send(client_ch, s).reset(0u32.into()).unwrap();
+    pair.drive();
+
+    let stats = pair.client_conn_mut(client_ch).stats();
+    assert_eq!(stats.frame_tx.stream_data_blocked, 0);
+    assert_eq!(stats.frame_tx.reset_stream, 1);
+}
+
+#[test]
+fn data_blocked_retransmit() {
+    let _guard = subscribe();
+    let server = ServerConfig {
+        transport: Arc::new(TransportConfig {
+            receive_window: 10u32.into(),
+            ..TransportConfig::default()
+        }),
+        ..server_config()
+    };
+    let mut pair = Pair::new(Default::default(), server);
+    let (client_ch, server_ch) = pair.connect();
+
+    let s = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
+    assert_eq!(
+        pair.client_send(client_ch, s)
+            .write(b"0123456789ab")
+            .unwrap(),
+        10
+    );
+    assert_matches!(
+        pair.client_send(client_ch, s).write(b"c"),
+        Err(WriteError::Blocked)
+    );
+    pair.drive_client();
+    pair.server.inbound.clear(); // Lose the packet carrying the frame
+    pair.drive();
+
+    // Still blocked at the same limit, so the frame is sent again. A PTO may send several probes,
+    // each carrying the frame, so only check that it was repeated and got through.
+    assert!(
+        pair.client_conn_mut(client_ch)
+            .stats()
+            .frame_tx
+            .data_blocked
+            > 1
+    );
+    assert!(
+        pair.server_conn_mut(server_ch)
+            .stats()
+            .frame_rx
+            .data_blocked
+            > 0
+    );
+}
+
+#[test]
 fn key_update_simple() {
     let _guard = subscribe();
     let mut pair = Pair::default();
@@ -1127,8 +1415,8 @@ fn key_update_simple() {
     );
     let _ = chunks.finalize();
 
-    assert_eq!(pair.client_conn_mut(client_ch).lost_packets(), 0);
-    assert_eq!(pair.server_conn_mut(server_ch).lost_packets(), 0);
+    assert_eq!(pair.client_conn_mut(client_ch).stats().path.lost_packets, 0);
+    assert_eq!(pair.server_conn_mut(server_ch).stats().path.lost_packets, 0);
 }
 
 #[test]
@@ -1160,7 +1448,7 @@ fn key_update_reordered() {
     pair.client.finish_delay();
     pair.drive();
 
-    assert_eq!(pair.client_conn_mut(client_ch).lost_packets(), 0);
+    assert_eq!(pair.client_conn_mut(client_ch).stats().path.lost_packets, 0);
     assert_matches!(
         pair.server_conn_mut(server_ch).poll(),
         Some(Event::Stream(StreamEvent::Opened { dir: Dir::Bi }))
@@ -1175,8 +1463,8 @@ fn key_update_reordered() {
     assert_eq!(buf2.bytes, MSG2);
     let _ = chunks.finalize();
 
-    assert_eq!(pair.client_conn_mut(client_ch).lost_packets(), 0);
-    assert_eq!(pair.server_conn_mut(server_ch).lost_packets(), 0);
+    assert_eq!(pair.client_conn_mut(client_ch).stats().path.lost_packets, 0);
+    assert_eq!(pair.server_conn_mut(server_ch).stats().path.lost_packets, 0);
 }
 
 #[test]
@@ -1815,7 +2103,7 @@ fn handshake_1rtt_handling() {
 
     pair.drive();
 
-    assert!(pair.client_conn_mut(client_ch).lost_packets() != 0);
+    assert!(pair.client_conn_mut(client_ch).stats().path.lost_packets != 0);
     let mut recv = pair.server_recv(server_ch, s);
     let mut chunks = recv.read(false).unwrap();
     assert_matches!(
@@ -1945,94 +2233,6 @@ fn tail_loss_small_segment_size() {
     assert_eq!(server_stats.frame_rx.datagram, DGRAM_NUM);
 }
 
-#[test]
-fn congestion_controller_observes_each_packet_in_a_gso_batch() {
-    let _guard = subscribe();
-    let sent = Arc::new(Mutex::new(Vec::new()));
-    let mut transport = TransportConfig::default();
-    transport
-        .enable_segmentation_offload(true)
-        .congestion_controller_factory(Arc::new(SentPacketRecorderFactory { sent: sent.clone() }));
-    let mut config = client_config();
-    config.transport_config(Arc::new(transport));
-
-    let mut pair = Pair::default();
-    let (client_ch, _) = pair.connect_with(config);
-    sent.lock().unwrap().clear();
-    let sent_packets_before = pair.client_conn_mut(client_ch).stats().path.sent_packets;
-
-    for _ in 0..5 {
-        pair.client_datagrams(client_ch)
-            .send(vec![0; 1_000].into(), false)
-            .unwrap();
-    }
-    pair.drive_client();
-
-    let records = sent.lock().unwrap();
-    let sent_packets =
-        pair.client_conn_mut(client_ch).stats().path.sent_packets - sent_packets_before;
-    assert!(
-        sent_packets > 1,
-        "test must produce a multi-packet GSO batch"
-    );
-    assert_eq!(records.len() as u64, sent_packets);
-    assert!(records.iter().all(|(bytes, _, _, _)| *bytes > 0));
-    assert!(
-        records.windows(2).all(|pair| pair[0].1 < pair[1].1),
-        "congestion packet identifiers must be globally monotonic",
-    );
-    assert!(
-        records.windows(2).all(|pair| pair[0].2 < pair[1].2),
-        "each packet in a GSO batch must observe the preceding packet in flight",
-    );
-}
-
-#[test]
-fn congestion_controller_receives_ack_and_induced_loss_in_one_event() {
-    let _guard = subscribe();
-    let events = Arc::new(Mutex::new(Vec::new()));
-    let mut transport = TransportConfig::default();
-    transport
-        .enable_segmentation_offload(false)
-        .deterministic_packet_numbers(true)
-        .congestion_controller_factory(Arc::new(CongestionEventRecorderFactory {
-            events: events.clone(),
-        }));
-    let mut config = client_config();
-    config.transport_config(Arc::new(transport));
-
-    let mut pair = Pair::default();
-    let (client_ch, _) = pair.connect_with(config);
-    events.lock().unwrap().clear();
-
-    for _ in 0..5 {
-        pair.client_datagrams(client_ch)
-            .send(vec![0; 1_000].into(), false)
-            .unwrap();
-    }
-    pair.client.drive_outgoing(pair.time);
-    assert!(pair.client.outbound.len() >= 5);
-
-    let _ = pair.client.outbound.pop_front().unwrap();
-    let delivered: Vec<_> = pair.client.outbound.drain(..).collect();
-    for (transmit, buffer) in delivered {
-        assert_eq!(transmit.destination, pair.server.addr);
-        pair.server
-            .inbound
-            .push_back((pair.time, transmit.ecn, buffer.as_ref().into()));
-    }
-    pair.drive_server();
-    pair.drive_client();
-
-    let events = events.lock().unwrap();
-    assert!(
-        events
-            .iter()
-            .any(|(acked, lost)| !acked.is_empty() && !lost.is_empty()),
-        "packet-threshold loss caused by an ACK must share that ACK's congestion event",
-    );
-}
-
 // Respect max_datagrams when TLP happens
 #[test]
 fn tail_loss_respect_max_datagrams() {
@@ -2102,9 +2302,12 @@ fn datagram_send_recv() {
 #[test]
 fn datagram_recv_buffer_overflow() {
     let _guard = subscribe();
-    const WINDOW: usize = 100;
+    const PAYLOAD_WINDOW: usize = 100;
+    const METADATA_WINDOW: usize = 2 * size_of::<Datagram>();
+    const WINDOW: usize = PAYLOAD_WINDOW + METADATA_WINDOW;
     let server = ServerConfig {
         transport: Arc::new(TransportConfig {
+            // Account for exactly two datagrams of metadata space
             datagram_receive_buffer_size: Some(WINDOW),
             ..TransportConfig::default()
         }),
@@ -2118,9 +2321,9 @@ fn datagram_recv_buffer_overflow() {
         Some(WINDOW - Datagram::SIZE_BOUND)
     );
 
-    const DATA1: &[u8] = &[0xAB; (WINDOW / 3) + 1];
-    const DATA2: &[u8] = &[0xBC; (WINDOW / 3) + 1];
-    const DATA3: &[u8] = &[0xCD; (WINDOW / 3) + 1];
+    const DATA1: &[u8] = &[0xAB; (PAYLOAD_WINDOW / 3) + 1];
+    const DATA2: &[u8] = &[0xBC; (PAYLOAD_WINDOW / 3) + 1];
+    const DATA3: &[u8] = &[0xCD; (PAYLOAD_WINDOW / 3) + 1];
     pair.client_datagrams(client_ch)
         .send(DATA1.into(), true)
         .unwrap();
@@ -2144,6 +2347,180 @@ fn datagram_recv_buffer_overflow() {
         .unwrap();
     pair.drive();
     assert_eq!(pair.server_datagrams(server_ch).recv().unwrap(), DATA1);
+    assert_matches!(pair.server_datagrams(server_ch).recv(), None);
+}
+
+#[test]
+fn datagram_send_buffer_overflow() {
+    let _guard = subscribe();
+    const PAYLOAD_WINDOW: usize = 100;
+    const METADATA_WINDOW: usize = 2 * size_of::<Datagram>();
+    const WINDOW: usize = PAYLOAD_WINDOW + METADATA_WINDOW;
+    let client_config = {
+        let mut config = client_config();
+        let mut transport = TransportConfig::default();
+        transport.datagram_send_buffer_size(WINDOW);
+        config.transport_config(transport.into());
+        config
+    };
+    let mut pair = Pair::default();
+    let (client_ch, server_ch) = pair.connect_with(client_config);
+    assert_matches!(pair.server_conn_mut(server_ch).poll(), None);
+
+    // Keep the send buffer full so most sends evict the oldest queued datagram;
+    // `payload_bytes` bookkeeping must survive sustained eviction
+    const LEN: usize = (PAYLOAD_WINDOW / 3) + 1;
+    for i in 0..10u8 {
+        pair.client_datagrams(client_ch)
+            .send(vec![i; LEN].into(), true)
+            .unwrap();
+    }
+    pair.drive();
+
+    assert_matches!(
+        pair.server_conn_mut(server_ch).poll(),
+        Some(Event::DatagramReceived)
+    );
+    // The window holds two datagrams, including their metadata.
+    for i in 8..10u8 {
+        assert_eq!(
+            pair.server_datagrams(server_ch).recv().unwrap(),
+            vec![i; LEN]
+        );
+    }
+    assert_matches!(pair.server_datagrams(server_ch).recv(), None);
+}
+
+#[test]
+fn datagram_send_buffer_space_preserves_queued_datagrams() {
+    let _guard = subscribe();
+    let mut pair = Pair::default();
+    let mut client_config = client_config();
+    let mut transport_config = TransportConfig::default();
+    transport_config.datagram_send_buffer_size(100 + 3 * size_of::<Datagram>());
+    client_config.transport_config(transport_config.into());
+    let (client_ch, server_ch) = pair.connect_with(client_config);
+
+    let first = Bytes::from_static(&[1; 7]);
+    let second = Bytes::from_static(&[2; 2]);
+    for data in [&first, &second] {
+        pair.client_datagrams(client_ch)
+            .send(data.clone(), true)
+            .unwrap();
+    }
+    let available = pair.client_datagrams(client_ch).send_buffer_space();
+    assert!(available > 0);
+    let third = Bytes::from(vec![3; available]);
+    pair.client_datagrams(client_ch)
+        .send(third.clone(), true)
+        .unwrap();
+    pair.drive();
+
+    for data in [first, second, third] {
+        assert_eq!(pair.server_datagrams(server_ch).recv(), Some(data));
+    }
+    assert_matches!(pair.server_datagrams(server_ch).recv(), None);
+}
+
+#[test]
+fn datagram_larger_than_send_buffer_is_too_large() {
+    let _guard = subscribe();
+    let mut pair = Pair::default();
+    let mut client_config = client_config();
+    let mut transport_config = TransportConfig::default();
+    transport_config.datagram_send_buffer_size(1 + size_of::<Datagram>());
+    client_config.transport_config(transport_config.into());
+    let (client_ch, _) = pair.connect_with(client_config);
+
+    assert_matches!(
+        pair.client_datagrams(client_ch)
+            .send(Bytes::from_static(&[0; 2]), true),
+        Err(SendDatagramError::TooLarge)
+    );
+    assert_matches!(
+        pair.client_datagrams(client_ch)
+            .send(Bytes::from_static(&[0; 2]), false),
+        Err(SendDatagramError::TooLarge)
+    );
+}
+
+#[test]
+fn datagram_send_buffer_metadata_boundaries() {
+    let _guard = subscribe();
+    for window in [
+        0,
+        size_of::<Datagram>() - 1,
+        size_of::<Datagram>(),
+        size_of::<Datagram>() + 1,
+    ] {
+        for drop in [true, false] {
+            let mut pair = Pair::default();
+            let mut client_config = client_config();
+            let mut transport_config = TransportConfig::default();
+            transport_config.datagram_send_buffer_size(window);
+            client_config.transport_config(transport_config.into());
+            let (client_ch, server_ch) = pair.connect_with(client_config);
+
+            let Some(payload_capacity) = window.checked_sub(size_of::<Datagram>()) else {
+                assert_matches!(
+                    pair.client_datagrams(client_ch).send(Bytes::new(), drop),
+                    Err(SendDatagramError::TooLarge)
+                );
+                continue;
+            };
+
+            // An exact fit succeeds, and rejecting a larger datagram preserves the queued one.
+            let data = Bytes::from(vec![0xAB; payload_capacity]);
+            pair.client_datagrams(client_ch)
+                .send(data.clone(), drop)
+                .unwrap();
+            assert_matches!(
+                pair.client_datagrams(client_ch)
+                    .send(vec![0; payload_capacity + 1].into(), drop),
+                Err(SendDatagramError::TooLarge)
+            );
+            pair.drive();
+            assert_eq!(pair.server_datagrams(server_ch).recv(), Some(data));
+            assert_matches!(pair.server_datagrams(server_ch).recv(), None);
+        }
+    }
+}
+
+#[test]
+fn datagram_send_buffer_blocks_until_drained() {
+    let _guard = subscribe();
+    const LEN: usize = 4;
+    let mut pair = Pair::default();
+    let mut client_config = client_config();
+    let mut transport_config = TransportConfig::default();
+    transport_config.datagram_send_buffer_size(2 * (LEN + size_of::<Datagram>()));
+    client_config.transport_config(transport_config.into());
+    let (client_ch, server_ch) = pair.connect_with(client_config);
+
+    for i in 0..2u8 {
+        pair.client_datagrams(client_ch)
+            .send(vec![i; LEN].into(), false)
+            .unwrap();
+    }
+    let data = Bytes::from_static(&[2; LEN]);
+    assert_eq!(
+        pair.client_datagrams(client_ch).send(data.clone(), false),
+        Err(SendDatagramError::Blocked(data.clone()))
+    );
+    pair.drive();
+    for i in 0..2u8 {
+        assert_eq!(
+            pair.server_datagrams(server_ch).recv().unwrap(),
+            vec![i; LEN]
+        );
+    }
+    assert_matches!(pair.server_datagrams(server_ch).recv(), None);
+
+    pair.client_datagrams(client_ch)
+        .send(data.clone(), false)
+        .unwrap();
+    pair.drive();
+    assert_eq!(pair.server_datagrams(server_ch).recv(), Some(data));
     assert_matches!(pair.server_datagrams(server_ch).recv(), None);
 }
 
@@ -2426,7 +2803,7 @@ fn big_cert_and_key() -> (CertificateDer<'static>, PrivateKeyDer<'static>) {
 
     (
         cert.cert.into(),
-        PrivateKeyDer::Pkcs8(cert.key_pair.serialize_der().into()),
+        PrivateKeyDer::Pkcs8(cert.signing_key.serialize_der().into()),
     )
 }
 
@@ -3271,6 +3648,30 @@ fn pure_sender_voluntarily_acks() {
     assert!(receiver_acks_final > receiver_acks_initial);
 }
 
+/// Initials rejected under saturation (here via `max_incoming(0)`) are dropped without
+/// sending a response: the client times out rather than receiving a CONNECTION_REFUSED.
+#[test]
+fn silently_drop_rejected_initials() {
+    let _guard = subscribe();
+    let mut server_config = server_config();
+    server_config.max_incoming(0);
+    let mut pair = Pair::new(Arc::new(EndpointConfig::default()), server_config);
+
+    let client_ch = pair.begin_connect(client_config());
+    pair.drive();
+    pair.server.assert_no_accept();
+    // `drive()` stops once the client's only remaining timer is its idle timeout; advance
+    // past it so the unanswered attempt gives up.
+    pair.time += Duration::from_secs(60);
+    pair.drive();
+    assert_matches!(
+        pair.client_conn_mut(client_ch).poll(),
+        Some(Event::ConnectionLost {
+            reason: ConnectionError::TimedOut,
+        })
+    );
+}
+
 #[test]
 fn reject_manually() {
     let _guard = subscribe();
@@ -3360,82 +3761,17 @@ fn stream_gso() {
 }
 
 #[test]
-fn bbr_gso_recovers_stream_after_loss_on_high_latency_path() {
-    let _guard = subscribe();
-
-    let mut server_transport = TransportConfig::default();
-    let mut server_bbr = congestion::BbrConfig::default();
-    server_bbr.hysteria_profile(congestion::BbrProfile::HysteriaStandard);
-    server_transport
-        .enable_segmentation_offload(true)
-        .congestion_controller_factory(Arc::new(server_bbr));
-    let mut server = server_config();
-    server.transport = Arc::new(server_transport);
-
-    let mut client_transport = TransportConfig::default();
-    let mut client_bbr = congestion::BbrConfig::default();
-    client_bbr.hysteria_profile(congestion::BbrProfile::HysteriaStandard);
-    client_transport
-        .enable_segmentation_offload(true)
-        .congestion_controller_factory(Arc::new(client_bbr));
-    let mut client = client_config();
-    client.transport_config(Arc::new(client_transport));
-
-    let mut pair = Pair::new(Default::default(), server);
-    pair.latency = Duration::from_millis(135);
-    let (client_ch, server_ch) = pair.connect_with(client);
-    let stream = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
-
-    const PAYLOAD_LEN: usize = 512 * 1024;
-    let payload = vec![0x5a; PAYLOAD_LEN];
-    let mut offset = 0;
-    while offset < payload.len() {
-        offset += pair
-            .client_send(client_ch, stream)
-            .write(&payload[offset..])
-            .unwrap();
-    }
-    pair.client_send(client_ch, stream).finish().unwrap();
-
-    pair.client.drive_outgoing(pair.time);
-    assert!(
-        pair.client.outbound.len() > 4,
-        "test must produce a multi-packet GSO flight"
-    );
-    let _ = pair.client.outbound.remove(2).unwrap();
-    let transfer_started_at = pair.time;
-    pair.drive();
-    let transfer_time = pair.time.saturating_duration_since(transfer_started_at);
-    eprintln!("BBR GSO transfer completed in {transfer_time:?}");
-    assert!(
-        transfer_time < Duration::from_secs(3),
-        "BBR took too long to recover after one packet loss"
-    );
-
-    assert_matches!(
-        pair.server_conn_mut(server_ch).poll(),
-        Some(Event::Stream(StreamEvent::Opened { dir: Dir::Uni }))
-    );
-    assert_matches!(
-        pair.server_streams(server_ch).accept(Dir::Uni),
-        Some(id) if id == stream
-    );
-
-    let mut received = 0;
-    let mut recv = pair.server_recv(server_ch, stream);
-    let mut chunks = recv.read(false).unwrap();
-    while let Some(chunk) = chunks.next(usize::MAX).unwrap() {
-        received += chunk.bytes.len();
-    }
-    let _ = chunks.finalize();
-    assert_eq!(received, PAYLOAD_LEN);
-}
-
-#[test]
 fn datagram_gso() {
     let _guard = subscribe();
     let mut pair = Pair::default();
-    let (client_ch, _) = pair.connect();
+    let (client_ch, server_ch) = pair.connect();
+
+    // Sending ack-eliciting packet from server let client send ACK, which prevents
+    // sending bundled ACK for a while.
+    pair.server_datagrams(server_ch)
+        .send(Bytes::new(), false)
+        .unwrap();
+    pair.drive();
 
     let initial_ios = pair.client_conn_mut(client_ch).stats().udp_tx.ios;
     let initial_bytes = pair.client_conn_mut(client_ch).stats().udp_tx.bytes;
@@ -3491,6 +3827,278 @@ fn gso_truncation() {
             len
         );
     }
+}
+
+#[test]
+fn pad_initial_to_min_mtu() {
+    let _guard = subscribe();
+    for min_mtu in [INITIAL_MTU, 1280, 1333] {
+        let mut transport = TransportConfig::default();
+        transport
+            .initial_mtu(1452)
+            .min_mtu(min_mtu)
+            .mtu_discovery_config(None);
+        let mut config = client_config();
+        config.transport_config(Arc::new(transport));
+        let mut pair = Pair::default();
+        let client_ch = pair.begin_connect(config);
+        let expected_size = usize::from(min_mtu);
+
+        // Check the first Initial and two PTO retransmissions after dropping it.
+        for attempt in 0..3 {
+            pair.client.drive(pair.time, pair.server.addr);
+            assert!(!pair.client.outbound.is_empty());
+            for (transmit, data) in &pair.client.outbound {
+                assert_eq!(transmit.size, expected_size);
+                assert_eq!(data.len(), expected_size);
+            }
+            if attempt < 2 {
+                pair.client.outbound.clear();
+                pair.time = pair.client.next_wakeup().unwrap();
+            }
+        }
+
+        pair.drive();
+        let server_ch = pair.server.assert_accept();
+        pair.finish_connect(client_ch, server_ch);
+    }
+}
+
+#[test]
+fn min_mtu_does_not_pad_application_data() {
+    let _guard = subscribe();
+    const MTU: u16 = 1333;
+    let mut transport = TransportConfig::default();
+    transport.min_mtu(MTU).mtu_discovery_config(None);
+    let mut config = client_config();
+    config.transport_config(Arc::new(transport));
+    let mut pair = Pair::default();
+    let (client_ch, server_ch) = pair.connect_with(config);
+
+    let message = Bytes::from_static(b"hello");
+    pair.client_datagrams(client_ch)
+        .send(message.clone(), false)
+        .unwrap();
+    pair.client.drive(pair.time, pair.server.addr);
+    assert_eq!(pair.client.outbound.len(), 1);
+    assert!(pair.client.outbound[0].0.size < usize::from(MTU));
+    assert!(pair.client.outbound[0].1.len() < usize::from(MTU));
+    pair.drive();
+    assert_eq!(pair.server_datagrams(server_ch).recv().unwrap(), message);
+}
+
+#[test]
+fn min_mtu_does_not_pad_zero_rtt_batch_tail() {
+    let _guard = subscribe();
+    const MTU: u16 = 1333;
+    for pad_to_mtu in [false, true] {
+        let mut transport = TransportConfig::default();
+        transport
+            // Allow the Initial and 0-RTT data to be sent in one GSO batch without pacing delays.
+            .initial_rtt(Duration::from_millis(10))
+            .min_mtu(MTU)
+            .mtu_discovery_config(None)
+            .pad_to_mtu(pad_to_mtu);
+        let mut config = client_config();
+        config.transport_config(Arc::new(transport));
+        let mut pair = Pair::default();
+
+        // Establish a session to resume with 0-RTT.
+        let (client_ch, _) = pair.connect_with(config.clone());
+        let now = pair.time;
+        pair.client_conn_mut(client_ch)
+            .close(now, VarInt(0), Bytes::new());
+        pair.drive();
+
+        let client_ch = pair.begin_connect(config);
+        assert!(pair.client_conn_mut(client_ch).has_0rtt());
+        let stream = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
+        let data = vec![42; 3_000];
+        assert_eq!(
+            pair.client_send(client_ch, stream).write(&data),
+            Ok(data.len())
+        );
+        pair.client_send(client_ch, stream).finish().unwrap();
+        pair.client.drive(pair.time, pair.server.addr);
+
+        // The first datagram contains the Initial; the last contains only 0-RTT data.
+        assert_eq!(pair.client_conn_mut(client_ch).stats().udp_tx.ios, 1);
+        assert!(pair.client.outbound.len() > 1);
+        assert_eq!(
+            pair.client.outbound.front().unwrap().0.size,
+            usize::from(MTU)
+        );
+        let (transmit, buffer) = pair.client.outbound.back().unwrap();
+        assert_eq!(transmit.size, buffer.len());
+        if pad_to_mtu {
+            assert_eq!(transmit.size, usize::from(MTU));
+        } else {
+            assert!(transmit.size < usize::from(MTU));
+        }
+
+        pair.drive();
+        assert!(pair.client_conn_mut(client_ch).accepted_0rtt());
+        let server_ch = pair.server.assert_accept();
+        let mut recv = pair.server_recv(server_ch, stream);
+        let mut chunks = recv.read(true).unwrap();
+        let mut received = Vec::new();
+        while let Some(chunk) = chunks.next(usize::MAX).unwrap() {
+            received.extend_from_slice(&chunk.bytes);
+        }
+        let _ = chunks.finalize();
+        assert_eq!(received, data);
+    }
+}
+
+#[test]
+fn min_mtu_limits_application_loss_probes() {
+    let _guard = subscribe();
+    const MIN_MTU: u16 = 1280;
+    const MTU: u16 = 1452;
+    let mut transport = TransportConfig::default();
+    transport
+        .initial_mtu(MTU)
+        .min_mtu(MIN_MTU)
+        .mtu_discovery_config(None)
+        .pad_to_mtu(true);
+    let mut config = client_config();
+    config.transport_config(Arc::new(transport));
+    let mut pair = Pair::default();
+    let (client_ch, _) = pair.connect_with(config);
+
+    pair.client_conn_mut(client_ch).ping();
+    pair.client.drive(pair.time, pair.server.addr);
+    assert_eq!(pair.client.outbound.len(), 1);
+    assert_eq!(pair.client.outbound[0].0.size, usize::from(MTU));
+    pair.client.outbound.clear();
+
+    // Fill the loss probe with stream data to check the configured minimum MTU is the limit.
+    pair.time = pair.client.next_wakeup().unwrap();
+    let now = pair.time;
+    let client = pair.client_conn_mut(client_ch);
+    client.handle_timeout(now);
+    let stream = client.streams().open(Dir::Uni).unwrap();
+    client.send_stream(stream).write(&[42; 3000]).unwrap();
+    let mut buf = Vec::new();
+    let transmit = client.poll_transmit(now, 1, &mut buf).unwrap();
+    assert_eq!(transmit.size, usize::from(MIN_MTU));
+    assert_eq!(buf.len(), usize::from(MIN_MTU));
+    pair.drive();
+}
+
+#[test]
+fn pad_server_initial_to_min_mtu() {
+    let _guard = subscribe();
+    const MIN_MTU: u16 = 1333;
+    let mut transport = TransportConfig::default();
+    transport
+        .initial_mtu(1452)
+        .min_mtu(MIN_MTU)
+        .mtu_discovery_config(None);
+    let mut config = server_config();
+    config.transport_config(Arc::new(transport));
+    let mut pair = Pair::new(Default::default(), config);
+    let client_ch = pair.begin_connect(client_config());
+    pair.drive_client();
+    pair.server.drive(pair.time, pair.client.addr);
+    let (transmit, data) = pair.server.outbound.front().unwrap();
+    assert_eq!(transmit.size, usize::from(MIN_MTU));
+    assert_eq!(data.len(), usize::from(MIN_MTU));
+
+    pair.drive();
+    let server_ch = pair.server.assert_accept();
+    pair.finish_connect(client_ch, server_ch);
+}
+
+#[test]
+fn min_mtu_respects_peer_max_udp_payload_size() {
+    let _guard = subscribe();
+    const PEER_MAX: u16 = 1280;
+    let mut transport = TransportConfig::default();
+    transport.min_mtu(1452).mtu_discovery_config(None);
+    let mut config = server_config();
+    config.transport_config(Arc::new(transport));
+    let server = Endpoint::new(Default::default(), Some(Arc::new(config)), true, None);
+    let mut endpoint_config = EndpointConfig::default();
+    endpoint_config.max_udp_payload_size(PEER_MAX).unwrap();
+    let client = Endpoint::new(Arc::new(endpoint_config), None, true, None);
+    let mut pair = Pair::new_from_endpoint(client, server);
+    let client_ch = pair.begin_connect(client_config());
+    pair.drive_client();
+    pair.server.drive(pair.time, pair.client.addr);
+    let (transmit, data) = pair.server.outbound.front().unwrap();
+    assert_eq!(transmit.size, usize::from(PEER_MAX));
+    assert_eq!(data.len(), usize::from(PEER_MAX));
+
+    pair.drive();
+    let server_ch = pair.server.assert_accept();
+    pair.finish_connect(client_ch, server_ch);
+}
+
+/// Verify that UDP datagrams are padded to MTU if specified in the transport config.
+#[test]
+fn pad_to_mtu() {
+    let _guard = subscribe();
+    const MTU: u16 = 1333;
+    let client_config = {
+        let mut c_config = client_config();
+        let t_config = TransportConfig {
+            initial_mtu: MTU,
+            mtu_discovery_config: None,
+            pad_to_mtu: true,
+            ..TransportConfig::default()
+        };
+        c_config.transport_config(t_config.into());
+        c_config
+    };
+    let mut pair = Pair::default();
+    let (client_ch, server_ch) = pair.connect_with(client_config);
+
+    let initial_ios = pair.client_conn_mut(client_ch).stats().udp_tx.ios;
+    pair.server.capture_inbound_packets = true;
+
+    info!("sending");
+    // Send two datagrams significantly smaller than MTU, but large enough to require two UDP datagrams.
+    const LEN_1: usize = 800;
+    const LEN_2: usize = 600;
+    pair.client_datagrams(client_ch)
+        .send(vec![0; LEN_1].into(), false)
+        .unwrap();
+    pair.client_datagrams(client_ch)
+        .send(vec![0; LEN_2].into(), false)
+        .unwrap();
+    pair.client.drive(pair.time, pair.server.addr);
+
+    // Check padding
+    assert_eq!(pair.client.outbound.len(), 2);
+    assert_eq!(pair.client.outbound[0].0.size, usize::from(MTU));
+    assert_eq!(pair.client.outbound[0].1.len(), usize::from(MTU));
+    assert_eq!(pair.client.outbound[1].0.size, usize::from(MTU));
+    assert_eq!(pair.client.outbound[1].1.len(), usize::from(MTU));
+    pair.drive_client();
+    assert_eq!(pair.server.inbound.len(), 2);
+    assert_eq!(pair.server.inbound[0].2.len(), usize::from(MTU));
+    assert_eq!(pair.server.inbound[1].2.len(), usize::from(MTU));
+    pair.drive();
+
+    // Check that both datagrams ended up in the same GSO batch
+    let final_ios = pair.client_conn_mut(client_ch).stats().udp_tx.ios;
+    assert_eq!(final_ios - initial_ios, 1);
+
+    assert_eq!(
+        pair.server_datagrams(server_ch)
+            .recv()
+            .expect("datagram lost")
+            .len(),
+        LEN_1
+    );
+    assert_eq!(
+        pair.server_datagrams(server_ch)
+            .recv()
+            .expect("datagram lost")
+            .len(),
+        LEN_2
+    );
 }
 
 /// Verify that a large application datagram is sent successfully when an ACK frame too large to fit
@@ -3553,6 +4161,200 @@ fn voluntary_ack_with_large_datagrams() {
 }
 
 #[test]
+fn path_changes_unblock_oversized_datagrams() {
+    let _guard = subscribe();
+    for migrate in [false, true] {
+        let mut pair = Pair::default();
+        let (client_ch, server_ch) = pair.connect();
+        pair.drive();
+        let old_max = pair.server_datagrams(server_ch).max_size().unwrap();
+        assert!(old_max > 1200);
+        let empty_space = pair.server_datagrams(server_ch).send_buffer_space();
+        let data = Bytes::from(vec![42; old_max]);
+        loop {
+            match pair.server_datagrams(server_ch).send(data.clone(), false) {
+                Ok(()) => {}
+                Err(SendDatagramError::Blocked(_)) => break,
+                Err(error) => panic!("unexpected send error: {error}"),
+            }
+        }
+        while pair.server_conn_mut(server_ch).poll().is_some() {}
+
+        pair.mtu = 1200;
+        if migrate {
+            pair.client
+                .addr
+                .set_port(CLIENT_PORTS.lock().unwrap().next().unwrap());
+            pair.client_conn_mut(client_ch).ping();
+            pair.drive_client();
+            // Process migration without transmitting, so sends cannot free the buffer first.
+            let mut buf = Vec::new();
+            while let Some((received, ecn, packet)) = pair.server.inbound.pop_front() {
+                let Some(DatagramEvent::ConnectionEvent(ch, event)) =
+                    pair.server
+                        .handle(received, pair.client.addr, None, ecn, packet, &mut buf)
+                else {
+                    panic!("expected a connection event");
+                };
+                assert_eq!(ch, server_ch);
+                pair.server_conn_mut(ch).handle_event(event);
+            }
+            assert_eq!(
+                pair.server_conn_mut(server_ch).remote_address(),
+                pair.client.addr
+            );
+        } else {
+            let now = pair.time;
+            pair.server_conn_mut(server_ch).path_changed(now);
+        }
+
+        assert!(pair.server_datagrams(server_ch).max_size().unwrap() < old_max);
+        assert_eq!(
+            pair.server_datagrams(server_ch).send_buffer_space(),
+            empty_space
+        );
+        assert!(
+            iter::from_fn(|| pair.server_conn_mut(server_ch).poll())
+                .any(|event| matches!(event, Event::DatagramsUnblocked))
+        );
+
+        let small = Bytes::from_static(b"small");
+        pair.server_datagrams(server_ch)
+            .send(small.clone(), false)
+            .unwrap();
+        pair.drive();
+        assert_eq!(pair.client_datagrams(client_ch).recv(), Some(small));
+        assert_eq!(pair.client_datagrams(client_ch).recv(), None);
+    }
+}
+
+/// Verify that dropping oversized datagrams will trigger a DatagramsUnblocked event.
+#[test]
+fn oversized_datagrams_trigger_unblock() {
+    let _guard = subscribe();
+    let mut pair = Pair::default();
+    // Start the connection with a large MTU.
+    const INITIAL_MTU: usize = 1300;
+    pair.mtu = INITIAL_MTU;
+
+    let mut client_config = client_config();
+    let mut transport_config = TransportConfig::default();
+    let send_buffer_size = transport_config.datagram_send_buffer_size;
+    transport_config.initial_mtu(INITIAL_MTU as u16);
+    client_config.transport_config(transport_config.into());
+
+    let (client_ch, _) = pair.connect_with(client_config);
+
+    // Send datagrams until the send buffer is full.
+    let max_size = pair.client_datagrams(client_ch).max_size().unwrap();
+    let data = vec![0; max_size];
+    loop {
+        match pair
+            .client_datagrams(client_ch)
+            .send(data.clone().into(), false)
+        {
+            Ok(_) => {}
+            Err(SendDatagramError::Blocked(_)) => {
+                break;
+            }
+            Err(e) => panic!("unexpected error: {e}"),
+        }
+    }
+    // Set the MTU to a smaller value so the queued datagrams cannot be sent.
+    pair.mtu = 1200;
+
+    // Drive the pair until black hole detection kicks in and the path MTU is adjusted.
+    while pair.step() {
+        let err = loop {
+            if let Err(e) = pair
+                .client_datagrams(client_ch)
+                .send(data.clone().into(), false)
+            {
+                break e;
+            }
+        };
+        match err {
+            SendDatagramError::Blocked(_) => {
+                // continue with the next step but drain the DatagramsUnblocked events
+                // emitted datagrams were sent out.
+                while let Some(event) = pair.client_conn_mut(client_ch).poll() {
+                    tracing::info!("ignoring connection event: {event:?}");
+                }
+            }
+            SendDatagramError::TooLarge => {
+                // mtu adjusted, break the loop
+                break;
+            }
+            _ => panic!("unexpected error: {err}"),
+        }
+    }
+
+    assert_eq!(
+        pair.client_conn_mut(client_ch)
+            .stats()
+            .path
+            .black_holes_detected,
+        1,
+        "expected a black hole to have been detected",
+    );
+
+    assert_eq!(
+        pair.client_datagrams(client_ch).send_buffer_space(),
+        send_buffer_size - size_of::<Datagram>(),
+        "expected the send buffer to be empty after too large datagrams were dropped",
+    );
+    match pair.client_conn_mut(client_ch).poll() {
+        Some(Event::DatagramsUnblocked) => {}
+        _ => panic!("expected DatagramsUnblocked event"),
+    }
+}
+
+#[test]
+fn ack_bundled_with_datagrams() {
+    let _guard = subscribe();
+    let mut pair = Pair::default_with_deterministic_pns();
+    let (client_ch, server_ch) = pair.connect_with(client_config_with_deterministic_pns());
+
+    // Send packet from client and then send from server. the packet from server should include ACKs
+    pair.client_datagrams(client_ch)
+        .send(vec![0; 1].into(), false)
+        .unwrap();
+    pair.drive_client();
+    pair.drive_server();
+
+    let server_tx_acks_before_datagram = pair.server_conn_mut(server_ch).stats().frame_tx.acks;
+    let server_tx_packets_before_datagram =
+        pair.server_conn_mut(server_ch).stats().udp_tx.datagrams;
+
+    pair.server_datagrams(server_ch)
+        .send(vec![0; 1].into(), false)
+        .unwrap();
+    pair.drive_server();
+
+    let server_tx_acks_after_datagram = pair.server_conn_mut(server_ch).stats().frame_tx.acks;
+
+    assert_eq!(
+        server_tx_acks_before_datagram + 1,
+        server_tx_acks_after_datagram,
+        "server should have sent ACK frame along with DATAGRAM frame"
+    );
+    assert_eq!(
+        server_tx_packets_before_datagram + 1,
+        pair.server_conn_mut(server_ch).stats().udp_tx.datagrams,
+        "server should not have sent two or more QUIC packets"
+    );
+
+    pair.drive();
+
+    // No more acks should be sent from server since ACK to the first packet has been sent with the datagram
+    assert_eq!(
+        server_tx_acks_after_datagram,
+        pair.server_conn_mut(server_ch).stats().frame_tx.acks,
+        "server should not sent ACK frames"
+    );
+}
+
+#[test]
 fn reject_short_idcid() {
     let _guard = subscribe();
     let client_addr = "[::2]:7890".parse().unwrap();
@@ -3573,6 +4375,14 @@ fn reject_short_idcid() {
     };
 }
 
-mod deep_reordering;
+/// Ensure that a connection can be made when a preferred address is advertised by the server,
+/// regardless of whether the address is actually used.
+#[test]
+fn preferred_address() {
+    let _guard = subscribe();
+    let mut server_config = server_config();
+    server_config.preferred_address_v6(Some("[::1]:65535".parse().unwrap()));
 
-mod adaptive_reordering;
+    let mut pair = Pair::new(Arc::new(EndpointConfig::default()), server_config);
+    pair.connect();
+}

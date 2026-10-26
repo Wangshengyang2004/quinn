@@ -35,13 +35,6 @@ pub(super) struct MinMax {
 }
 
 impl MinMax {
-    pub(super) fn new(window: u64) -> Self {
-        Self {
-            window,
-            samples: [Default::default(); 3],
-        }
-    }
-
     pub(super) fn get(&self) -> u64 {
         self.samples[0].value
     }
@@ -117,7 +110,10 @@ impl MinMax {
 
 impl Default for MinMax {
     fn default() -> Self {
-        Self::new(10)
+        Self {
+            window: 10,
+            samples: [Default::default(); 3],
+        }
     }
 }
 
@@ -152,19 +148,5 @@ mod test {
         assert_eq!(100, min_max.get());
         min_max.update_max(round + 18, 130);
         assert_eq!(130, min_max.get());
-    }
-
-    #[test]
-    fn max_filter_retains_samples_for_ten_rounds() {
-        let mut filter = MinMax::new(10);
-        filter.update_max(1, 1_000);
-
-        for round in 2..=11 {
-            filter.update_max(round, 100);
-        }
-        assert_eq!(filter.get(), 1_000);
-
-        filter.update_max(12, 100);
-        assert_eq!(filter.get(), 100);
     }
 }

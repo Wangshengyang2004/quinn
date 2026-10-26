@@ -540,18 +540,32 @@ fn recv(io: SockRef<'_>, bufs: &mut [IoSliceMut<'_>], meta: &mut [RecvMeta]) -> 
 
 #[cfg(any(target_os = "openbsd", target_os = "netbsd", solarish, apple_slow))]
 fn recv(io: SockRef<'_>, bufs: &mut [IoSliceMut<'_>], meta: &mut [RecvMeta]) -> io::Result<usize> {
+    recv_single(io, bufs, meta)
+}
+
+#[cfg(any(
+    all(test, not(apple_fast)),
+    target_os = "openbsd",
+    target_os = "netbsd",
+    solarish,
+    apple_slow
+))]
+fn recv_single(
+    io: SockRef<'_>,
+    bufs: &mut [IoSliceMut<'_>],
+    meta: &mut [RecvMeta],
+) -> io::Result<usize> {
     let mut name = MaybeUninit::<libc::sockaddr_storage>::uninit();
     let mut ctrl = cmsg::Aligned(MaybeUninit::<[u8; CMSG_LEN]>::uninit());
     let mut hdr = unsafe { mem::zeroed::<libc::msghdr>() };
-    prepare_recv(&mut bufs[0], &mut name, &mut ctrl, &mut hdr);
     let n = loop {
+        prepare_recv(&mut bufs[0], &mut name, &mut ctrl, &mut hdr);
         let n = unsafe { libc::recvmsg(io.as_raw_fd(), &mut hdr, 0) };
 
-        if hdr.msg_flags & libc::MSG_TRUNC != 0 {
-            continue;
-        }
-
         if n >= 0 {
+            if hdr.msg_flags & libc::MSG_TRUNC != 0 {
+                continue;
+            }
             break n;
         }
 
@@ -797,6 +811,7 @@ pub(crate) const BATCH_SIZE: usize = 1;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 mod gso {
     use super::*;
+    use std::{ffi::CStr, mem, str::FromStr, sync::OnceLock};
 
     #[cfg(not(target_os = "android"))]
     const UDP_SEGMENT: libc::c_int = libc::UDP_SEGMENT;
@@ -804,10 +819,21 @@ mod gso {
     // TODO: Add this to libc
     const UDP_SEGMENT: libc::c_int = 103;
 
-    /// Checks whether GSO support is available by setting the UDP_SEGMENT
-    /// option on a socket
+    // Support for UDP GSO has been added to linux kernel in version 4.18
+    // https://github.com/torvalds/linux/commit/cb586c63e3fc5b227c51fd8c4cb40b34d3750645
+    const SUPPORTED_SINCE: KernelVersion = KernelVersion {
+        version: 4,
+        major_revision: 18,
+    };
+
+    /// Checks whether GSO support is available by checking the kernel version followed by setting
+    /// the UDP_SEGMENT option on a socket
     pub(crate) fn max_gso_segments() -> usize {
         const GSO_SIZE: libc::c_int = 1500;
+
+        if !SUPPORTED_BY_CURRENT_KERNEL.get_or_init(supported_by_current_kernel) {
+            return 1;
+        }
 
         let socket = match std::net::UdpSocket::bind("[::]:0")
             .or_else(|_| std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)))
@@ -832,6 +858,116 @@ mod gso {
 
     pub(crate) fn set_segment_size(encoder: &mut cmsg::Encoder<libc::msghdr>, segment_size: u16) {
         encoder.push(libc::SOL_UDP, UDP_SEGMENT, segment_size);
+    }
+
+    // Avoid calling `supported_by_current_kernel` for each socket by using `OnceLock`.
+    static SUPPORTED_BY_CURRENT_KERNEL: OnceLock<bool> = OnceLock::new();
+
+    fn supported_by_current_kernel() -> bool {
+        let kernel_version_string = match kernel_version_string() {
+            Ok(kernel_version_string) => kernel_version_string,
+            Err(_e) => {
+                crate::log::warn!("GSO disabled: uname returned {_e}");
+                return false;
+            }
+        };
+
+        let Some(kernel_version) = KernelVersion::from_str(&kernel_version_string) else {
+            crate::log::warn!(
+                "GSO disabled: failed to parse kernel version ({kernel_version_string})"
+            );
+            return false;
+        };
+
+        if kernel_version < SUPPORTED_SINCE {
+            crate::log::info!("GSO disabled: kernel too old ({kernel_version_string}); need 4.18+",);
+            return false;
+        }
+
+        true
+    }
+
+    fn kernel_version_string() -> io::Result<String> {
+        let mut n = unsafe { mem::zeroed() };
+        let r = unsafe { libc::uname(&mut n) };
+        if r != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(unsafe {
+            CStr::from_ptr(n.release[..].as_ptr())
+                .to_string_lossy()
+                .into_owned()
+        })
+    }
+
+    // https://www.linfo.org/kernel_version_numbering.html
+    #[derive(Eq, PartialEq, Ord, PartialOrd, Debug)]
+    struct KernelVersion {
+        version: u8,
+        major_revision: u8,
+    }
+
+    impl KernelVersion {
+        fn from_str(release: &str) -> Option<Self> {
+            let mut split = release
+                .split_once('-')
+                .map(|pair| pair.0)
+                .unwrap_or(release)
+                .split('.');
+
+            let version = u8::from_str(split.next()?).ok()?;
+            let major_revision = u8::from_str(split.next()?).ok()?;
+
+            Some(Self {
+                version,
+                major_revision,
+            })
+        }
+    }
+
+    #[cfg(test)]
+    mod test {
+        use super::*;
+
+        #[test]
+        fn parse_current_kernel_version_release_string() {
+            let release = kernel_version_string().unwrap();
+            KernelVersion::from_str(&release).unwrap();
+        }
+
+        #[test]
+        fn parse_kernel_version_release_string() {
+            // These are made up for the test
+            assert_eq!(
+                KernelVersion::from_str("4.14"),
+                Some(KernelVersion {
+                    version: 4,
+                    major_revision: 14
+                })
+            );
+            assert_eq!(
+                KernelVersion::from_str("4.18"),
+                Some(KernelVersion {
+                    version: 4,
+                    major_revision: 18
+                })
+            );
+            // These were seen in the wild
+            assert_eq!(
+                KernelVersion::from_str("4.14.186-27095505"),
+                Some(KernelVersion {
+                    version: 4,
+                    major_revision: 14
+                })
+            );
+            assert_eq!(
+                KernelVersion::from_str("6.8.0-59-generic"),
+                Some(KernelVersion {
+                    version: 6,
+                    major_revision: 8
+                })
+            );
+        }
     }
 }
 
@@ -896,7 +1032,7 @@ mod gro {
 /// Returns whether the given socket option is supported on the current platform
 ///
 /// Yields `Ok(true)` if the option was set successfully, `Ok(false)` if setting
-/// the option raised an `ENOPROTOOPT` error, and `Err` for any other error.
+/// the option raised an `ENOPROTOOPT` or `EOPNOTSUPP` error, and `Err` for any other error.
 fn set_socket_option_supported(
     socket: &impl AsRawFd,
     level: libc::c_int,
@@ -906,6 +1042,7 @@ fn set_socket_option_supported(
     match set_socket_option(socket, level, name, value) {
         Ok(()) => Ok(true),
         Err(err) if err.raw_os_error() == Some(libc::ENOPROTOOPT) => Ok(false),
+        Err(err) if err.raw_os_error() == Some(libc::EOPNOTSUPP) => Ok(false),
         Err(err) => Err(err),
     }
 }
@@ -938,5 +1075,67 @@ const OPTION_ON: libc::c_int = 1;
 mod gro {
     pub(super) fn gro_segments() -> usize {
         1
+    }
+}
+
+#[cfg(all(test, not(apple_fast)))]
+mod tests {
+    use std::{net::UdpSocket, sync::mpsc, thread, time::Duration};
+
+    use super::*;
+
+    #[test]
+    fn recv_single_after_truncation_returns_would_block_instead_of_spin() {
+        let receiver = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        receiver.set_nonblocking(true).unwrap();
+        let address = receiver.local_addr().unwrap();
+        let sender = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        sender.send_to(&[0; 16], address).unwrap();
+
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let mut buffer = [0; 8];
+            let result = recv_single(
+                SockRef::from(&receiver),
+                &mut [IoSliceMut::new(&mut buffer)],
+                &mut [RecvMeta::default()],
+            );
+            done_tx.send(result).unwrap();
+        });
+        let result = done_rx.recv_timeout(Duration::from_secs(1));
+        if result.is_err() {
+            // Release a regressed receive loop before failing the test.
+            sender.send_to(b"ok", address).unwrap();
+            done_rx
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .unwrap();
+        }
+        worker.join().unwrap();
+        assert!(matches!(result, Ok(Err(error)) if error.kind() == io::ErrorKind::WouldBlock));
+    }
+
+    #[test]
+    fn recv_single_skips_truncated_datagrams() {
+        let receiver = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        receiver.set_nonblocking(true).unwrap();
+        let sender = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let address = receiver.local_addr().unwrap();
+        sender.send_to(&[0; 16], address).unwrap();
+        sender.send_to(b"ok", address).unwrap();
+
+        let mut buffer = [0; 8];
+        let mut meta = [RecvMeta::default()];
+        assert_eq!(
+            recv_single(
+                SockRef::from(&receiver),
+                &mut [IoSliceMut::new(&mut buffer)],
+                &mut meta,
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(&buffer[..meta[0].len], b"ok");
+        assert_eq!(meta[0].addr, sender.local_addr().unwrap());
     }
 }

@@ -1,38 +1,20 @@
 # Maintained EasyTier dependency
 
-`dev` is the maintained custom integration branch. Its runtime source is based on
-`checkpoint/easytier-fe44e654`, commit
-`fe44e654b2b2d18dd2b502931945cbdff4a96af4`. The dependency checkpoint identifies
-runtime source independently of later maintenance documentation.
+This migration candidate starts from official `quinn-proto-0.11.19`
+(`8192ed399a26a6e8f0aba43d10ec8badaa5b905e`), with the matching Quinn 0.11.12
+wrapper and quinn-udp 0.5.16. The previous production checkpoint remains
+`checkpoint/easytier-fe44e654`; no deployment is implied by this branch.
 
-EasyTier's Cargo.toml and Cargo.lock select this exact revision for
-`quinn-proto` 0.11.12. Its `quinn` wrapper is registry version 0.11.8. Builds use
-the pinned Git dependency.
+The retained patch boundary is BBR application-limited startup correctness and
+an optional controller byte-rate pacing interface with bounded credit for
+Brutal. Hysteria profiles, the replacement sampler and per-packet GSO hooks,
+adaptive loss thresholds and extended receive history are retired. Upstream
+BBR and Cubic retain upstream window-based pacing.
 
-`main` tracks `origin/main`. Review API and consumer compatibility when selecting
-a newer official release.
+EasyTier selects an exact Git revision in Cargo.toml and Cargo.lock. Updating
+this branch alone does not update its consumer. Validate protocol and consumer
+paths before changing the pin or deploying.
 
-## Integrated patch boundary
-
-The checkpoint contains the custom controller pacing interface, Hysteria BBR
-profiles and sampler, stale-sample expiry, GSO per-packet feedback, extended
-receive history, optional learned loss thresholds and bounded explicit-rate
-pacing credit. Older pacing and BBR/sampler branch tips are ancestors of this
-checkpoint and need no additional merge.
-
-The adaptive BBR profile experiment below is distinct from the optional adaptive
-loss recovery already included in the checkpoint.
-
-## Retained experiments
-
-| Annotated tag | Boundary |
-| --- | --- |
-| `archive/ack-blocks-256-138c9191` | ACK range cap from 64 to 256; one additional experimental commit. |
-| `archive/adaptive-cap-128-a92bcf43` | Lower learned reorder thresholds to 128 packets / 1.25 RTT; one additional experimental commit. |
-| `archive/pacer-smoothing-fe34c5c8` | Wake pacing at 200 microseconds rather than 1 millisecond; one additional experimental commit. |
-| `archive/hy2-adaptive-f6581014` | Historical optional adaptive BBR profile based on the older sampler branch. |
-| `archive/easytier-pacing-42cb8962` | Historical ancestor of the maintained checkpoint. |
-| `archive/bbr-startup-loss-67611d64` | Historical ancestor of the maintained checkpoint. |
-
-Restore a scoped worktree from a tag, compare it with current `dev`, and validate
-protocol behavior and affected EasyTier paths before integration.
+Historical experiments remain under the existing `archive/*` tags. Restore them
+in a scoped worktree for comparison; archived patches are not integration
+instructions. `dev` is the integration branch; preserve `main` and its history.

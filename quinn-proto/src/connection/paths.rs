@@ -5,10 +5,12 @@ use tracing::trace;
 use super::{
     mtud::MtuDiscovery,
     pacing::Pacer,
-    reordering::LossReordering,
     spaces::{PacketSpace, SentPacket},
 };
 use crate::{Duration, Instant, TIMER_GRANULARITY, TransportConfig, congestion, packet::SpaceId};
+
+#[cfg(feature = "qlog")]
+use qlog::events::quic::MetricsUpdated;
 
 /// Description of a particular network path
 pub(super) struct PathData {
@@ -20,7 +22,6 @@ pub(super) struct PathData {
     pub(super) congestion: Box<dyn congestion::Controller>,
     /// Pacing state
     pub(super) pacing: Pacer,
-    pub(super) reordering: LossReordering,
     pub(super) challenge: Option<u64>,
     pub(super) challenge_pending: bool,
     /// Whether we're certain the peer can both send and receive on this address
@@ -44,6 +45,13 @@ pub(super) struct PathData {
     /// Used to determine whether a packet was sent on an earlier path. Insufficient to determine if
     /// a packet was sent on a later path.
     first_packet: Option<u64>,
+
+    /// Snapshot of the qlog recovery metrics
+    #[cfg(feature = "qlog")]
+    recovery_metrics: RecoveryMetrics,
+
+    /// Tag uniquely identifying a path in a connection
+    generation: u64,
 }
 
 impl PathData {
@@ -51,6 +59,7 @@ impl PathData {
         remote: SocketAddr,
         allow_mtud: bool,
         peer_max_udp_payload_size: Option<u16>,
+        generation: u64,
         now: Instant,
         config: &TransportConfig,
     ) -> Self {
@@ -92,11 +101,18 @@ impl PathData {
             first_packet_after_rtt_sample: None,
             in_flight: InFlight::new(),
             first_packet: None,
-            reordering: LossReordering::new(now),
+            #[cfg(feature = "qlog")]
+            recovery_metrics: RecoveryMetrics::default(),
+            generation,
         }
     }
 
-    pub(super) fn from_previous(remote: SocketAddr, prev: &Self, now: Instant) -> Self {
+    pub(super) fn from_previous(
+        remote: SocketAddr,
+        prev: &Self,
+        generation: u64,
+        now: Instant,
+    ) -> Self {
         let congestion = prev.congestion.clone_box();
         let smoothed_rtt = prev.rtt.get();
         Self {
@@ -114,21 +130,28 @@ impl PathData {
             first_packet_after_rtt_sample: prev.first_packet_after_rtt_sample,
             in_flight: InFlight::new(),
             first_packet: None,
-            reordering: LossReordering::new(now),
+            #[cfg(feature = "qlog")]
+            recovery_metrics: prev.recovery_metrics.clone(),
+            generation,
         }
     }
 
-    /// Resets RTT, congestion control and MTU states.
+    /// Resets RTT, congestion control, pacing and MTU states.
     ///
     /// This is useful when it is known the underlying path has changed.
     pub(super) fn reset(&mut self, now: Instant, config: &TransportConfig) {
         self.rtt = RttEstimator::new(config.initial_rtt);
-        self.reordering = LossReordering::new(now);
         self.congestion = config
             .congestion_controller_factory
             .clone()
             .build(now, config.get_initial_mtu());
         self.mtud.reset(config.get_initial_mtu(), config.min_mtu);
+        self.pacing = Pacer::new(
+            self.rtt.get(),
+            self.congestion.initial_window(),
+            self.current_mtu(),
+            now,
+        );
     }
 
     /// Indicates whether we're a server that hasn't validated the peer's address and hasn't
@@ -148,17 +171,118 @@ impl PathData {
         if self.first_packet.is_none() {
             self.first_packet = Some(pn);
         }
-        self.in_flight.bytes -= space.sent(pn, packet);
+        if let Some(forgotten) = space.sent(pn, packet) {
+            self.remove_in_flight(&forgotten);
+        }
     }
 
     /// Remove `packet` with number `pn` from this path's congestion control counters, or return
     /// `false` if `pn` was sent before this path was established.
-    pub(super) fn remove_in_flight(&mut self, pn: u64, packet: &SentPacket) -> bool {
-        if self.first_packet.map_or(true, |first| first > pn) {
+    pub(super) fn remove_in_flight(&mut self, packet: &SentPacket) -> bool {
+        if packet.path_generation != self.generation {
             return false;
         }
         self.in_flight.remove(packet);
         true
+    }
+
+    #[cfg(feature = "qlog")]
+    pub(super) fn qlog_recovery_metrics(&mut self, pto_count: u32) -> Option<MetricsUpdated> {
+        let controller_metrics = self.congestion.metrics();
+
+        let metrics = RecoveryMetrics {
+            min_rtt: Some(self.rtt.min),
+            smoothed_rtt: Some(self.rtt.get()),
+            latest_rtt: Some(self.rtt.latest),
+            rtt_variance: Some(self.rtt.var),
+            pto_count: Some(pto_count),
+            bytes_in_flight: Some(self.in_flight.bytes),
+            packets_in_flight: Some(self.in_flight.ack_eliciting),
+
+            congestion_window: Some(controller_metrics.congestion_window),
+            ssthresh: controller_metrics.ssthresh,
+            pacing_rate: controller_metrics.pacing_rate,
+        };
+
+        let event = metrics.to_qlog_event(&self.recovery_metrics);
+        self.recovery_metrics = metrics;
+        event
+    }
+
+    pub(super) fn generation(&self) -> u64 {
+        self.generation
+    }
+}
+
+/// Congestion metrics as described in [`recovery_metrics_updated`].
+///
+/// [`recovery_metrics_updated`]: https://datatracker.ietf.org/doc/html/draft-ietf-quic-qlog-quic-events.html#name-recovery_metrics_updated
+#[cfg(feature = "qlog")]
+#[derive(Default, Clone, PartialEq)]
+#[non_exhaustive]
+struct RecoveryMetrics {
+    pub min_rtt: Option<Duration>,
+    pub smoothed_rtt: Option<Duration>,
+    pub latest_rtt: Option<Duration>,
+    pub rtt_variance: Option<Duration>,
+    pub pto_count: Option<u32>,
+    pub bytes_in_flight: Option<u64>,
+    pub packets_in_flight: Option<u64>,
+    pub congestion_window: Option<u64>,
+    pub ssthresh: Option<u64>,
+    pub pacing_rate: Option<u64>,
+}
+
+#[cfg(feature = "qlog")]
+impl RecoveryMetrics {
+    /// Retain only values that have been updated since the last snapshot.
+    fn retain_updated(&self, previous: &Self) -> Self {
+        macro_rules! keep_if_changed {
+            ($name:ident) => {
+                if previous.$name == self.$name {
+                    None
+                } else {
+                    self.$name
+                }
+            };
+        }
+
+        Self {
+            min_rtt: keep_if_changed!(min_rtt),
+            smoothed_rtt: keep_if_changed!(smoothed_rtt),
+            latest_rtt: keep_if_changed!(latest_rtt),
+            rtt_variance: keep_if_changed!(rtt_variance),
+            pto_count: keep_if_changed!(pto_count),
+            bytes_in_flight: keep_if_changed!(bytes_in_flight),
+            packets_in_flight: keep_if_changed!(packets_in_flight),
+            congestion_window: keep_if_changed!(congestion_window),
+            ssthresh: keep_if_changed!(ssthresh),
+            pacing_rate: keep_if_changed!(pacing_rate),
+        }
+    }
+
+    /// Emit a `MetricsUpdated` event containing only updated values
+    fn to_qlog_event(&self, previous: &Self) -> Option<MetricsUpdated> {
+        let updated = self.retain_updated(previous);
+
+        if updated == Self::default() {
+            return None;
+        }
+
+        Some(MetricsUpdated {
+            min_rtt: updated.min_rtt.map(|rtt| rtt.as_secs_f32()),
+            smoothed_rtt: updated.smoothed_rtt.map(|rtt| rtt.as_secs_f32()),
+            latest_rtt: updated.latest_rtt.map(|rtt| rtt.as_secs_f32()),
+            rtt_variance: updated.rtt_variance.map(|rtt| rtt.as_secs_f32()),
+            pto_count: updated
+                .pto_count
+                .map(|count| count.try_into().unwrap_or(u16::MAX)),
+            bytes_in_flight: updated.bytes_in_flight,
+            packets_in_flight: updated.packets_in_flight,
+            congestion_window: updated.congestion_window,
+            ssthresh: updated.ssthresh,
+            pacing_rate: updated.pacing_rate,
+        })
     }
 }
 
@@ -219,11 +343,7 @@ impl RttEstimator {
             } else {
                 self.latest
             };
-            let var_sample = if smoothed > adjusted_rtt {
-                smoothed - adjusted_rtt
-            } else {
-                adjusted_rtt - smoothed
-            };
+            let var_sample = smoothed.abs_diff(adjusted_rtt);
             self.var = (3 * self.var + var_sample) / 4;
             self.smoothed = Some((7 * smoothed + adjusted_rtt) / 8);
         } else {
@@ -334,5 +454,49 @@ impl InFlight {
     fn remove(&mut self, packet: &SentPacket) {
         self.bytes -= u64::from(packet.size);
         self.ack_eliciting -= u64::from(packet.ack_eliciting);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reset_refreshes_pacer_budget() {
+        let now = Instant::now();
+        let config = TransportConfig::default();
+        let remote = "203.0.113.1:4433".parse().unwrap();
+        let mut path = PathData::new(remote, true, None, 0, now, &config);
+        let mtu = path.current_mtu();
+        let window = path.congestion.window();
+
+        for _ in 0..1000 {
+            if path
+                .pacing
+                .delay(path.rtt.get(), mtu.into(), mtu, window, now)
+                .is_some()
+            {
+                break;
+            }
+            path.pacing.on_transmit(mtu);
+        }
+        assert!(
+            path.pacing
+                .delay(path.rtt.get(), mtu.into(), mtu, window, now)
+                .is_some()
+        );
+
+        path.reset(now, &config);
+
+        assert_eq!(
+            path.pacing.delay(
+                path.rtt.get(),
+                path.current_mtu().into(),
+                path.current_mtu(),
+                path.congestion.window(),
+                now
+            ),
+            None
+        );
     }
 }

@@ -1,13 +1,12 @@
 use bytes::Bytes;
-use rand::Rng;
-use tracing::{trace, trace_span};
+use rand::RngExt;
+use tracing::{debug, trace, trace_span};
 
 use super::{Connection, SentFrames, spaces::SentPacket};
 use crate::{
     ConnectionId, Instant, TransportError, TransportErrorCode,
-    congestion::SentPacketInfo,
     connection::ConnectionSide,
-    frame::{self, Close},
+    frame::{self, Close, FrameStruct},
     packet::{FIXED_BIT, Header, InitialHeader, LongType, PacketNumber, PartialEncode, SpaceId},
 };
 
@@ -32,7 +31,7 @@ impl PacketBuilder {
     /// Write a new packet header to `buffer` and determine the packet's properties
     ///
     /// Marks the connection drained and returns `None` if the confidentiality limit would be
-    /// violated.
+    /// violated, or an Initial token leaves insufficient space for frames.
     pub(super) fn new(
         now: Instant,
         space_id: SpaceId,
@@ -48,6 +47,7 @@ impl PacketBuilder {
         let sent_with_keys = conn.spaces[space_id].sent_with_keys;
         if space_id == SpaceId::Data {
             if sent_with_keys >= conn.key_phase_size {
+                debug!("routine key update due to phase exhaustion");
                 conn.force_key_update();
             }
         } else {
@@ -152,7 +152,28 @@ impl PacketBuilder {
             buffer.len() + (sample_size + 4).saturating_sub(number.len() + tag_len),
             partial_encode.start + dst_cid.len() + 6,
         );
-        let max_size = buffer_capacity - tag_len;
+        let max_size = buffer_capacity.saturating_sub(tag_len);
+        // A peer-provided Initial token can consume the space needed after the header.
+        // Leave room for both a CONNECTION_CLOSE and a CRYPTO frame with data. The
+        // CRYPTO writer uses a strict `< max_size` check, hence the extra byte;
+        // CONNECTION_CLOSE can exactly fill the available space.
+        let required_frame_space = Ord::max(
+            frame::Crypto::SIZE_BOUND + 1,
+            frame::ConnectionClose::SIZE_BOUND,
+        );
+        if space_id == SpaceId::Initial
+            && (max_size < min_size || max_size.saturating_sub(buffer.len()) < required_frame_space)
+        {
+            buffer.truncate(partial_encode.start);
+            // Both Retry and cached address validation tokens originate from the peer.
+            conn.kill(
+                TransportError::PROTOCOL_VIOLATION(
+                    "Initial token leaves insufficient packet space",
+                )
+                .into(),
+            );
+            return None;
+        }
         debug_assert!(max_size >= min_size);
 
         Some(Self {
@@ -191,7 +212,7 @@ impl PacketBuilder {
         let ack_eliciting = self.ack_eliciting;
         let exact_number = self.exact_number;
         let space_id = self.space;
-        let (size, padded) = self.finish(conn, buffer);
+        let (size, padded) = self.finish(conn, now, buffer);
         let sent = match sent {
             Some(sent) => sent,
             None => return,
@@ -202,11 +223,8 @@ impl PacketBuilder {
             false => 0,
         };
 
-        let congestion_packet_number = conn.next_congestion_packet_number;
-        conn.next_congestion_packet_number = conn.next_congestion_packet_number.saturating_add(1);
-
         let packet = SentPacket {
-            congestion_packet_number,
+            path_generation: conn.path.generation(),
             largest_acked: sent.largest_acked,
             time_sent: now,
             size,
@@ -215,15 +233,6 @@ impl PacketBuilder {
             stream_frames: sent.stream_frames,
         };
 
-        if size != 0 && ack_eliciting {
-            conn.path.congestion.on_packet_sent(SentPacketInfo {
-                now,
-                packet_number: congestion_packet_number,
-                bytes: u64::from(size),
-                bytes_in_flight: conn.path.in_flight.bytes,
-                app_limited: conn.app_limited,
-            });
-        }
         conn.path
             .sent(exact_number, packet, &mut conn.spaces[space_id]);
         conn.stats.path.sent_packets += 1;
@@ -242,7 +251,12 @@ impl PacketBuilder {
     }
 
     /// Encrypt packet, returning the length of the packet and whether padding was added
-    pub(super) fn finish(self, conn: &mut Connection, buffer: &mut Vec<u8>) -> (usize, bool) {
+    pub(super) fn finish(
+        self,
+        conn: &mut Connection,
+        now: Instant,
+        buffer: &mut Vec<u8>,
+    ) -> (usize, bool) {
         let pad = buffer.len() < self.min_size;
         if pad {
             trace!("PADDING * {}", self.min_size - buffer.len());
@@ -274,6 +288,16 @@ impl PacketBuilder {
             Some((self.exact_number, packet_crypto)),
         );
 
-        (buffer.len() - encode_start, pad)
+        let len = buffer.len() - encode_start;
+        conn.config.qlog_sink.emit_packet_sent(
+            self.exact_number,
+            len,
+            self.space,
+            self.space == SpaceId::Data && conn.spaces[SpaceId::Data].crypto.is_none(),
+            now,
+            conn.orig_rem_cid,
+        );
+
+        (len, pad)
     }
 }

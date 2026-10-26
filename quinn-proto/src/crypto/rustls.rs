@@ -6,12 +6,16 @@ use bytes::BytesMut;
 #[cfg(feature = "ring")]
 use ring::aead;
 pub use rustls::Error;
+#[cfg(feature = "__rustls-post-quantum-test")]
+use rustls::NamedGroup;
 use rustls::{
     self, CipherSuite,
     client::danger::ServerCertVerifier,
     pki_types::{CertificateDer, PrivateKeyDer, ServerName},
     quic::{Connection, HeaderProtectionKey, KeyChange, PacketKey, Secrets, Suite, Version},
 };
+#[cfg(feature = "platform-verifier")]
+use rustls_platform_verifier::BuilderVerifierExt;
 
 use crate::{
     ConnectError, ConnectionId, Side, TransportError, TransportErrorCode,
@@ -63,6 +67,12 @@ impl crypto::Session for TlsSession {
                 Connection::Client(_) => None,
                 Connection::Server(ref session) => session.server_name().map(|x| x.into()),
             },
+            #[cfg(feature = "__rustls-post-quantum-test")]
+            negotiated_key_exchange_group: self
+                .inner
+                .negotiated_key_exchange_group()
+                .expect("key exchange group is negotiated")
+                .name(),
         }))
     }
 
@@ -255,6 +265,9 @@ pub struct HandshakeData {
     ///
     /// Always `None` for outgoing connections
     pub server_name: Option<String>,
+    /// The key exchange group negotiated with the peer
+    #[cfg(feature = "__rustls-post-quantum-test")]
+    pub negotiated_key_exchange_group: NamedGroup,
 }
 
 /// A QUIC-compatible TLS client configuration
@@ -281,6 +294,24 @@ pub struct QuicClientConfig {
 }
 
 impl QuicClientConfig {
+    #[cfg(feature = "platform-verifier")]
+    pub(crate) fn with_platform_verifier() -> Result<Self, Error> {
+        // Keep in sync with `inner()` below
+        let mut inner = rustls::ClientConfig::builder_with_provider(configured_provider())
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap() // The default providers support TLS 1.3
+            .with_platform_verifier()?
+            .with_no_client_auth();
+
+        inner.enable_early_data = true;
+        Ok(Self {
+            // We're confident that the *ring* default provider contains TLS13_AES_128_GCM_SHA256
+            initial: initial_suite_from_provider(inner.crypto_provider())
+                .expect("no initial cipher suite found"),
+            inner: Arc::new(inner),
+        })
+    }
+
     /// Initialize a sane QUIC-compatible TLS client configuration
     ///
     /// QUIC requires that TLS 1.3 be enabled. Advanced users can use any [`rustls::ClientConfig`] that
@@ -309,6 +340,7 @@ impl QuicClientConfig {
     }
 
     pub(crate) fn inner(verifier: Arc<dyn ServerCertVerifier>) -> rustls::ClientConfig {
+        // Keep in sync with `with_platform_verifier()` above
         let mut config = rustls::ClientConfig::builder_with_provider(configured_provider())
             .with_protocol_versions(&[&rustls::version::TLS13])
             .unwrap() // The default providers support TLS 1.3

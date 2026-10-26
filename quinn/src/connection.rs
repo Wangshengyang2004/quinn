@@ -5,7 +5,10 @@ use std::{
     io,
     net::{IpAddr, SocketAddr},
     pin::Pin,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
     task::{Context, Poll, Waker, ready},
 };
 
@@ -25,8 +28,8 @@ use crate::{
     udp_transmit,
 };
 use proto::{
-    ConnectionError, ConnectionHandle, ConnectionStats, Dir, EndpointEvent, StreamEvent, StreamId,
-    congestion::Controller,
+    ConnectionError, ConnectionHandle, ConnectionStats, Dir, EndpointEvent, Side, StreamEvent,
+    StreamId, congestion::Controller,
 };
 
 /// In-progress connection attempt future
@@ -59,7 +62,7 @@ impl Connecting {
             runtime.clone(),
         );
 
-        let driver = ConnectionDriver(conn.clone());
+        let driver = ConnectionDriver::new(conn.clone());
         runtime.spawn(Box::pin(
             async {
                 if let Err(e) = driver.await {
@@ -146,8 +149,11 @@ impl Connecting {
         // Taking &mut self allows us to use a single oneshot channel rather than dealing with
         // potentially many tasks waiting on the same event. It's a bit of a hack, but keeps things
         // simple.
-        if let Some(x) = self.handshake_data_ready.take() {
+        if let Some(x) = self.handshake_data_ready.as_mut() {
             let _ = x.await;
+            // Once the data is ready, apply state changes. This prevents a panic due to
+            // inconsistent state when retrying a call to `handshake_data`.
+            self.handshake_data_ready = None;
         }
         let conn = self.conn.as_ref().unwrap();
         let inner = conn.state.lock("handshake");
@@ -234,27 +240,45 @@ impl Future for ZeroRttAccepted {
 /// packets still in flight from the peer are handled gracefully.
 #[must_use = "connection drivers must be spawned for their connections to function"]
 #[derive(Debug)]
-struct ConnectionDriver(ConnectionRef);
+struct ConnectionDriver {
+    conn: ConnectionRef,
+    span: Span,
+}
+
+impl ConnectionDriver {
+    fn new(conn: ConnectionRef) -> Self {
+        let span = {
+            let conn = &mut conn.state.lock("poll");
+            debug_span!("drive", id = conn.handle.0)
+        };
+
+        Self { conn, span }
+    }
+}
 
 impl Future for ConnectionDriver {
     type Output = Result<(), io::Error>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
-        let conn = &mut *self.0.state.lock("poll");
+        let conn = &mut *self.conn.state.lock("poll");
+        let _guard = self.span.enter();
 
-        let span = debug_span!("drive", id = conn.handle.0);
-        let _guard = span.enter();
-
-        if let Err(e) = conn.process_conn_events(&self.0.shared, cx) {
-            conn.terminate(e, &self.0.shared);
+        if let Err(e) = conn.process_conn_events(&self.conn.shared, cx) {
+            conn.terminate(e, &self.conn.shared);
             return Poll::Ready(Ok(()));
         }
-        let mut keep_going = conn.drive_transmit(cx)?;
+        let mut keep_going = conn.drive_transmit(cx).inspect_err(|_| {
+            // Transmit failed, so close the connection and clean state before returning the error.
+            if !conn.inner.is_closed() {
+                conn.implicit_close(&self.conn.shared);
+            }
+        })?;
+
         // If a timer expires, there might be more to transmit. When we transmit something, we
         // might need to reset a timer. Hence, we must loop until neither happens.
         keep_going |= conn.drive_timer(cx);
         conn.forward_endpoint_events();
-        conn.forward_app_events(&self.0.shared);
+        conn.forward_app_events(&self.conn.shared);
 
         if !conn.inner.is_drained() {
             if keep_going {
@@ -427,6 +451,9 @@ impl Connection {
     /// Application datagrams are a low-level primitive. They may be lost or delivered out of order,
     /// and `data` must both fit inside a single QUIC packet and be smaller than the maximum
     /// dictated by the peer.
+    ///
+    /// Previously queued datagrams which are still unsent may be discarded to make space for this
+    /// datagram, in order of oldest to newest.
     pub fn send_datagram(&self, data: Bytes) -> Result<(), SendDatagramError> {
         let conn = &mut *self.0.state.lock("send_datagram");
         if let Some(ref x) = conn.error {
@@ -496,6 +523,11 @@ impl Connection {
             .send_buffer_space()
     }
 
+    /// The side of the connection (client or server)
+    pub fn side(&self) -> Side {
+        self.0.state.lock("side").inner.side()
+    }
+
     /// The peer's UDP address
     ///
     /// If `ServerConfig::migration` is `true`, clients may change addresses at will, e.g. when
@@ -520,6 +552,11 @@ impl Connection {
     /// Current best estimate of this connection's latency (round-trip-time)
     pub fn rtt(&self) -> Duration {
         self.0.state.lock("rtt").inner.rtt()
+    }
+
+    /// Minimum RTT seen on this path, ignoring ack delay
+    pub fn min_rtt(&self) -> Duration {
+        self.0.state.lock("min_rtt").inner.min_rtt()
     }
 
     /// Returns connection statistics
@@ -616,6 +653,13 @@ impl Connection {
         let mut conn = self.0.state.lock("set_max_concurrent_uni_streams");
         conn.inner.set_max_concurrent_streams(Dir::Uni, count);
         // May need to send MAX_STREAMS to make progress
+        conn.wake();
+    }
+
+    /// See [`proto::TransportConfig::send_window()`]
+    pub fn set_send_window(&self, send_window: u64) {
+        let mut conn = self.0.state.lock("set_send_window");
+        conn.inner.set_send_window(send_window);
         conn.wake();
     }
 
@@ -886,7 +930,6 @@ impl ConnectionRef {
                 blocked_readers: FxHashMap::default(),
                 stopped: FxHashMap::default(),
                 error: None,
-                ref_count: 0,
                 io_poller: socket.clone().create_io_poller(),
                 socket,
                 runtime,
@@ -904,23 +947,25 @@ impl ConnectionRef {
 
 impl Clone for ConnectionRef {
     fn clone(&self) -> Self {
-        self.state.lock("clone").ref_count += 1;
+        self.shared.ref_count.fetch_add(1, Ordering::Relaxed);
         Self(self.0.clone())
     }
 }
 
 impl Drop for ConnectionRef {
     fn drop(&mut self) {
+        if self.shared.ref_count.fetch_sub(1, Ordering::Relaxed) > 1 {
+            return;
+        }
+
         let conn = &mut *self.state.lock("drop");
-        if let Some(x) = conn.ref_count.checked_sub(1) {
-            conn.ref_count = x;
-            if x == 0 && !conn.inner.is_closed() {
-                // If the driver is alive, it's just it and us, so we'd better shut it down. If it's
-                // not, we can't do any harm. If there were any streams being opened, then either
-                // the connection will be closed for an unrelated reason or a fresh reference will
-                // be constructed for the newly opened stream.
-                conn.implicit_close(&self.shared);
-            }
+
+        if !conn.inner.is_closed() {
+            // If the driver is alive, it's just it and us, so we'd better shut it down. If it's
+            // not, we can't do any harm. If there were any streams being opened, then either
+            // the connection will be closed for an unrelated reason or a fresh reference will
+            // be constructed for the newly opened stream.
+            conn.implicit_close(&self.shared);
         }
     }
 }
@@ -948,6 +993,8 @@ pub(crate) struct Shared {
     datagram_received: Notify,
     datagrams_unblocked: Notify,
     closed: Notify,
+    /// Number of live handles that can used to initiate or handle I/O; excludes the driver
+    ref_count: AtomicUsize,
 }
 
 pub(crate) struct State {
@@ -963,11 +1010,9 @@ pub(crate) struct State {
     endpoint_events: mpsc::UnboundedSender<(ConnectionHandle, EndpointEvent)>,
     pub(crate) blocked_writers: FxHashMap<StreamId, Waker>,
     pub(crate) blocked_readers: FxHashMap<StreamId, Waker>,
-    pub(crate) stopped: FxHashMap<StreamId, Waker>,
+    pub(crate) stopped: FxHashMap<StreamId, Arc<Notify>>,
     /// Always set to Some before the connection becomes drained
     pub(crate) error: Option<ConnectionError>,
-    /// Number of live handles that can be used to initiate or handle I/O; excludes the driver
-    ref_count: usize,
     socket: Arc<dyn AsyncUdpSocket>,
     io_poller: Pin<Box<dyn UdpPoller>>,
     runtime: Arc<dyn Runtime>,
@@ -1000,7 +1045,7 @@ impl State {
                         Some(t) => {
                             transmits += match t.segment_size {
                                 None => 1,
-                                Some(s) => (t.size + s - 1) / s, // round up
+                                Some(s) => t.size.div_ceil(s), // round up
                             };
                             t
                         }
@@ -1105,7 +1150,7 @@ impl State {
                         // `ZeroRttRejected` errors.
                         wake_all(&mut self.blocked_writers);
                         wake_all(&mut self.blocked_readers);
-                        wake_all(&mut self.stopped);
+                        wake_all_notify(&mut self.stopped);
                     }
                 }
                 ConnectionLost { reason } => {
@@ -1129,46 +1174,42 @@ impl State {
                     // Might mean any number of streams are ready, so we wake up everyone
                     shared.stream_budget_available[dir as usize].notify_waiters();
                 }
-                Stream(StreamEvent::Finished { id }) => wake_stream(id, &mut self.stopped),
+                Stream(StreamEvent::Finished { id }) => wake_stream_notify(id, &mut self.stopped),
                 Stream(StreamEvent::Stopped { id, .. }) => {
-                    wake_stream(id, &mut self.stopped);
+                    wake_stream_notify(id, &mut self.stopped);
                     wake_stream(id, &mut self.blocked_writers);
                 }
             }
         }
     }
 
-    fn drive_timer(&mut self, cx: &mut Context) -> bool {
-        // Check whether we need to (re)set the timer. If so, we must poll again to ensure the
-        // timer is registered with the runtime (and check whether it's already
-        // expired).
-        match self.inner.poll_timeout() {
-            Some(deadline) => {
-                if let Some(delay) = &mut self.timer {
-                    // There is no need to reset the tokio timer if the deadline
-                    // did not change
-                    if self
-                        .timer_deadline
-                        .map(|current_deadline| current_deadline != deadline)
-                        .unwrap_or(true)
-                    {
-                        delay.as_mut().reset(deadline);
-                    }
-                } else {
-                    self.timer = Some(self.runtime.new_timer(deadline));
-                }
-                // Store the actual expiration time of the timer
-                self.timer_deadline = Some(deadline);
-            }
-            None => {
-                self.timer_deadline = None;
-                return false;
-            }
+    fn drive_timer(&mut self, cx: &mut Context<'_>) -> bool {
+        let Some(deadline) = self.inner.poll_timeout() else {
+            self.timer_deadline = None;
+            return false;
+        };
+
+        // Use the clock rather than the async timer to detect expiry: Sleep::poll
+        // respects Tokio's cooperative budget and can return Pending for elapsed
+        // deadlines.
+        let now = self.runtime.now();
+        if now >= deadline {
+            self.inner.handle_timeout(now);
+            self.timer_deadline = None;
+            return true;
         }
 
-        if self.timer_deadline.is_none() {
-            return false;
+        match &mut self.timer {
+            // Avoid resetting the timer when the deadline is unchanged.
+            Some(delay) if self.timer_deadline != Some(deadline) => {
+                delay.as_mut().reset(deadline);
+            }
+            None => {
+                self.timer = Some(self.runtime.new_timer(deadline));
+            }
+            _ => {}
         }
+        self.timer_deadline = Some(deadline);
 
         let delay = self
             .timer
@@ -1176,13 +1217,10 @@ impl State {
             .expect("timer must exist in this state")
             .as_mut();
         if delay.poll(cx).is_pending() {
-            // Since there wasn't a timeout event, there is nothing new
-            // for the connection to do
             return false;
         }
 
-        // A timer expired, so the caller needs to check for
-        // new transmits, which might cause new timers to be set.
+        // The deadline elapsed in the window between the clock check and poll.
         self.inner.handle_timeout(self.runtime.now());
         self.timer_deadline = None;
         true
@@ -1212,7 +1250,7 @@ impl State {
         if let Some(x) = self.on_connected.take() {
             let _ = x.send(false);
         }
-        wake_all(&mut self.stopped);
+        wake_all_notify(&mut self.stopped);
         shared.closed.notify_waiters();
     }
 
@@ -1264,6 +1302,18 @@ fn wake_stream(stream_id: StreamId, wakers: &mut FxHashMap<StreamId, Waker>) {
 
 fn wake_all(wakers: &mut FxHashMap<StreamId, Waker>) {
     wakers.drain().for_each(|(_, waker)| waker.wake())
+}
+
+fn wake_stream_notify(stream_id: StreamId, wakers: &mut FxHashMap<StreamId, Arc<Notify>>) {
+    if let Some(notify) = wakers.remove(&stream_id) {
+        notify.notify_waiters()
+    }
+}
+
+fn wake_all_notify(wakers: &mut FxHashMap<StreamId, Arc<Notify>>) {
+    wakers
+        .drain()
+        .for_each(|(_, notify)| notify.notify_waiters())
 }
 
 /// Errors that can arise when sending a datagram
