@@ -62,7 +62,9 @@ impl BandwidthEstimation {
         };
 
         let bandwidth = send_rate.min(ack_rate);
-        if !app_limited && self.max_filter.get() < bandwidth {
+        // Application-limited samples can raise the estimate. All valid full-rate
+        // samples must advance the filter so an old peak can expire.
+        if bandwidth > 0 && (!app_limited || bandwidth > self.max_filter.get()) {
             self.max_filter.update_max(round, bandwidth);
         }
     }
@@ -97,5 +99,41 @@ impl Display for BandwidthEstimation {
             "{:.3} MB/s",
             self.get_estimate() as f32 / (1024 * 1024) as f32
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn application_limited_samples_raise_but_do_not_lower_the_estimate() {
+        let mut estimator = BandwidthEstimation::default();
+        let start = Instant::now();
+        for round in 0..25 {
+            let now = start + Duration::from_millis(round * 10);
+            let bytes = if round < 2 { 10_000 } else { 1_000 };
+            estimator.on_sent(now, bytes);
+            estimator.on_ack(now + Duration::from_millis(50), now, bytes, round, true);
+            if round > 0 {
+                assert_eq!(estimator.get_estimate(), 1_000_000);
+            }
+        }
+    }
+
+    #[test]
+    fn full_rate_samples_expire_an_old_peak() {
+        let mut estimator = BandwidthEstimation::default();
+        let start = Instant::now();
+        for round in 0..25 {
+            let now = start + Duration::from_millis(round * 10);
+            let bytes = if round < 2 { 10_000 } else { 1_000 };
+            estimator.on_sent(now, bytes);
+            estimator.on_ack(now + Duration::from_millis(50), now, bytes, round, false);
+            if round == 1 {
+                assert_eq!(estimator.get_estimate(), 1_000_000);
+            }
+        }
+        assert_eq!(estimator.get_estimate(), 100_000);
     }
 }
