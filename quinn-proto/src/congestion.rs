@@ -92,6 +92,14 @@ pub trait Controller: Send + Sync {
     /// Number of ack-eliciting bytes that may be in flight
     fn window(&self) -> u64;
 
+    /// Whether another datagram may be started. `in_flight` includes bytes
+    /// already assembled in this transmission, and `bytes` is the prospective
+    /// datagram size. The default preserves Quinn's conservative window check.
+    /// Rate controllers may instead admit one datagram at their window boundary.
+    fn can_send(&self, in_flight: u64, bytes: u64) -> bool {
+        in_flight.saturating_add(bytes) < self.window()
+    }
+
     /// Explicit pacing rate in bytes per second.
     ///
     /// A positive rate opts into bounded-credit rate pacing. `None` (the default)

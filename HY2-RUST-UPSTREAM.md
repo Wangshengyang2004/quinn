@@ -13,7 +13,10 @@ Chrome shaping is opt-in. Ordinary connections retain minimum-MTU padding and
 window pacing. HY2 configures BBR's profiles, 32-packet initial window,
 20,000-packet maximum and MTU scaling; ordinary callers retain byte-window defaults.
 The controller API carries send/loss metadata, a per-event prior flight size and
-one fresh RTT callback per ACK frame. Actual controller implementations and
+one fresh RTT callback per ACK frame. Controllers can explicitly choose datagram
+admission at their congestion-window boundary. The default preserves Quinn's
+existing check; HY2 uses quic-go's current-flight check, including Brutal's
+inclusive one-MTU minimum window. Actual controller implementations and
 consumers must be compiled against the new API together.
 
 The optional `hy2-rustls` feature exposes authenticated ECH/ALPS metadata from
