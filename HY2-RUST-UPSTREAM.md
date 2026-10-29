@@ -31,6 +31,14 @@ existing check; HY2 uses quic-go's current-flight check, including Brutal's
 inclusive one-MTU minimum window. Actual controller implementations and
 consumers must be compiled against the new API together.
 
+BBR's recent RTT minimum follows the pinned Hysteria state machine: valid
+acknowledged packets supply the minimum sample per congestion event, new minima
+renew the ten-second expiry, and an expired minimum can increase with the path
+RTT. The first sample and idle resumption do not trigger a drain. ProbeRTT marks
+its traffic application-limited and remembers a completed round throughout its
+200 ms dwell. These corrections also apply to ordinary BBR consumers; ordinary
+QUIC regression tests are required alongside HY2 tests.
+
 The optional `hy2-rustls` feature exposes authenticated ECH/ALPS metadata from
 EasyTier's separately maintained rustls patch. Enabling it requires that explicit
 TLS dependency override. Ordinary Quinn builds continue to use official rustls.
