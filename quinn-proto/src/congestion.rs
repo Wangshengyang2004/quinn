@@ -15,9 +15,30 @@ pub use new_reno::{NewReno, NewRenoConfig};
 
 /// Common interface for different congestion controllers
 pub trait Controller: Send + Sync {
-    /// One or more packets were just sent
+    /// One packet was just sent. `bytes_in_flight_before` excludes this packet.
     #[allow(unused_variables)]
-    fn on_sent(&mut self, now: Instant, bytes: u64, last_packet_number: u64) {}
+    fn on_sent(
+        &mut self,
+        now: Instant,
+        bytes: u64,
+        packet_number: u64,
+        bytes_in_flight_before: u64,
+    ) {
+    }
+
+    /// An acknowledgement and/or loss event is about to be processed.
+    #[allow(unused_variables)]
+    fn on_begin_congestion_event(&mut self, prior_bytes_in_flight: u64) {}
+
+    /// One fresh RTT sample for this ACK frame, before individual ACK callbacks.
+    /// Controllers implementing delay-based slow-start exit can sample once per
+    /// frame, independently of the number of packets acknowledged by it.
+    #[allow(unused_variables)]
+    fn on_rtt_update(&mut self, rtt: &RttEstimator) {}
+
+    /// A tracked packet was declared lost and may be discarded from sampler state.
+    #[allow(unused_variables)]
+    fn on_packet_lost(&mut self, packet_number: u64, bytes: u64) {}
 
     /// Packet deliveries were confirmed
     ///
@@ -28,7 +49,9 @@ pub trait Controller: Send + Sync {
         &mut self,
         now: Instant,
         sent: Instant,
+        packet_number: u64,
         bytes: u64,
+        bytes_in_flight_at_send: u64,
         app_limited: bool,
         rtt: &RttEstimator,
     ) {
@@ -51,12 +74,16 @@ pub trait Controller: Send + Sync {
     /// congestion threshold period ending when the most recent packet in this batch was sent were
     /// lost.
     /// `lost_bytes` indicates how many bytes were lost. This value will be 0 for ECN triggers.
+    /// Packet metadata is absent for ECN triggers.
     fn on_congestion_event(
         &mut self,
         now: Instant,
         sent: Instant,
         is_persistent_congestion: bool,
         lost_bytes: u64,
+        lost_packets: u64,
+        last_packet_number: Option<u64>,
+        last_packet_bytes_in_flight_at_send: Option<u64>,
     );
 
     /// The known MTU for the current network path has been updated

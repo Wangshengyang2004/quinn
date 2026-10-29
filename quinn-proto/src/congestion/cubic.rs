@@ -95,7 +95,9 @@ impl Controller for Cubic {
         &mut self,
         now: Instant,
         sent: Instant,
+        _packet_number: u64,
         bytes: u64,
+        _bytes_in_flight_at_send: u64,
         app_limited: bool,
         rtt: &RttEstimator,
     ) {
@@ -170,6 +172,9 @@ impl Controller for Cubic {
         sent: Instant,
         is_persistent_congestion: bool,
         _lost_bytes: u64,
+        _lost_packets: u64,
+        _last_packet_number: Option<u64>,
+        _last_packet_bytes_in_flight_at_send: Option<u64>,
     ) {
         if self
             .recovery_start_time
@@ -289,7 +294,15 @@ mod tests {
         cubic.ssthresh = window;
         cubic.cubic_state.w_max = 12.0 * BASE_DATAGRAM_SIZE as f64;
 
-        cubic.on_congestion_event(now, now + Duration::from_millis(1), false, 0);
+        cubic.on_congestion_event(
+            now,
+            now + Duration::from_millis(1),
+            false,
+            0,
+            0,
+            None,
+            None,
+        );
 
         assert_eq!(
             cubic.cubic_state.w_max,
@@ -314,7 +327,7 @@ mod tests {
         // After ten days without a congestion event, w_cubic exceeds u64::MAX.
         // Before this fix, computing the window increment overflowed.
         let later = now + Duration::from_secs(10 * 24 * 60 * 60);
-        cubic.on_ack(later, later, BASE_DATAGRAM_SIZE, false, &rtt);
+        cubic.on_ack(later, later, 0, BASE_DATAGRAM_SIZE, window, false, &rtt);
 
         assert_eq!(cubic.window, window + BASE_DATAGRAM_SIZE);
     }

@@ -54,6 +54,8 @@ pub(super) struct PacketSpace {
     pub(super) crypto_stream: Assembler,
     /// Current offset of outgoing cryptographic handshake stream
     pub(super) crypto_offset: u64,
+    /// Outgoing CRYPTO bytes which have never been transmitted.
+    pub(super) fresh_crypto: ArrayRangeSet,
 
     /// The time the most recently sent retransmittable packet was sent.
     pub(super) time_of_last_ack_eliciting_packet: Option<Instant>,
@@ -90,6 +92,7 @@ impl PacketSpace {
 
             crypto_stream: Assembler::new(),
             crypto_offset: 0,
+            fresh_crypto: ArrayRangeSet::new(),
 
             time_of_last_ack_eliciting_packet: None,
             loss_time: None,
@@ -281,6 +284,8 @@ impl IndexMut<SpaceId> for [PacketSpace; 3] {
 /// Represents one or more packets subject to retransmission
 #[derive(Debug, Clone)]
 pub(super) struct SentPacket {
+    /// Path-wide monotonically increasing identifier used by congestion control across PN spaces.
+    pub(super) congestion_sequence: u64,
     /// [`PathData::generation`](super::PathData::generation) of the path on which this packet was sent
     pub(super) path_generation: u64,
     /// The time the packet was sent.
@@ -289,6 +294,8 @@ pub(super) struct SentPacket {
     /// framing overhead. Zero if this packet is not counted towards congestion control, i.e. not an
     /// "in flight" packet.
     pub(super) size: u16,
+    /// Number of congestion-controlled bytes in flight immediately after this packet was sent.
+    pub(super) bytes_in_flight_at_send: u64,
     /// Whether an acknowledgement is expected directly in response to this packet.
     pub(super) ack_eliciting: bool,
     /// The largest packet number acknowledged by this packet

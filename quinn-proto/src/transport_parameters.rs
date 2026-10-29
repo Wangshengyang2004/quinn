@@ -15,6 +15,8 @@ use bytes::{Buf, BufMut};
 use rand::{Rng, RngExt, seq::SliceRandom as _};
 use thiserror::Error;
 
+mod chrome;
+
 use crate::{
     LOC_CID_COUNT, MAX_CID_SIZE, MAX_STREAM_COUNT, RESET_TOKEN_SIZE, ResetToken, Side,
     TIMER_GRANULARITY, TransportError, VarInt,
@@ -169,11 +171,16 @@ impl TransportParameters {
             .into(),
             max_datagram_frame_size: config
                 .datagram_receive_buffer_size
-                .map(|x| (x.min(u16::MAX.into()) as u16).into()),
+                .filter(|_| !config.omit_max_datagram_frame_size)
+                .map(|x| {
+                    config
+                        .max_datagram_frame_size
+                        .unwrap_or_else(|| VarInt::from_u64(x.min(u16::MAX.into()) as u64).unwrap())
+                }),
             grease_quic_bit: endpoint_config.grease_quic_bit,
-            min_ack_delay: Some(
-                VarInt::from_u64(u64::try_from(TIMER_GRANULARITY.as_micros()).unwrap()).unwrap(),
-            ),
+            min_ack_delay: config.ack_frequency_supported.then(|| {
+                VarInt::from_u64(u64::try_from(TIMER_GRANULARITY.as_micros()).unwrap()).unwrap()
+            }),
             grease_transport_parameter: Some(ReservedTransportParameter::random(rng)),
             write_order: Some({
                 let mut order = std::array::from_fn(|i| i as u8);
@@ -731,6 +738,34 @@ mod test {
     use rand::TryRng;
 
     use super::*;
+
+    #[test]
+    fn omitted_datagram_parameter_preserves_receive_capability() {
+        let mut config = TransportConfig::default();
+        config.datagram_receive_buffer_size(Some(65536));
+        let endpoint = EndpointConfig::default();
+        let cid = crate::RandomConnectionIdGenerator::new(8);
+        let ordinary = TransportParameters::new(
+            &config,
+            &endpoint,
+            &cid,
+            ConnectionId::new(&[]),
+            None,
+            &mut rand::rng(),
+        );
+        assert!(ordinary.max_datagram_frame_size.is_some());
+        config.omit_max_datagram_frame_size(true);
+        let omitted = TransportParameters::new(
+            &config,
+            &endpoint,
+            &cid,
+            ConnectionId::new(&[]),
+            None,
+            &mut rand::rng(),
+        );
+        assert_eq!(omitted.max_datagram_frame_size, None);
+        assert_eq!(config.datagram_receive_buffer_size, Some(65536));
+    }
 
     #[test]
     fn coding() {

@@ -33,6 +33,9 @@ platform-verifier = ["dep:rustls-platform-verifier"]
 log = ["tracing/log"]
 # Enable rustls logging
 rustls-log = ["rustls?/logging"]
+# HY2's separately maintained rustls patch exposes authenticated ECH/ALPS metadata.
+# Consumers enabling this feature must select that patch explicitly.
+hy2-rustls = ["dep:rustls"]
 # Enable qlog support
 qlog = ["dep:qlog"]
 

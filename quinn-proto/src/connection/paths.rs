@@ -40,6 +40,7 @@ pub(super) struct PathData {
     /// Used in persistent congestion determination.
     pub(super) first_packet_after_rtt_sample: Option<(SpaceId, u64)>,
     pub(super) in_flight: InFlight,
+    next_congestion_sequence: u64,
     /// Number of the first packet sent on this path
     ///
     /// Used to determine whether a packet was sent on an earlier path. Insufficient to determine if
@@ -100,6 +101,7 @@ impl PathData {
                 ),
             first_packet_after_rtt_sample: None,
             in_flight: InFlight::new(),
+            next_congestion_sequence: 0,
             first_packet: None,
             #[cfg(feature = "qlog")]
             recovery_metrics: RecoveryMetrics::default(),
@@ -129,6 +131,7 @@ impl PathData {
             mtud: prev.mtud.clone(),
             first_packet_after_rtt_sample: prev.first_packet_after_rtt_sample,
             in_flight: InFlight::new(),
+            next_congestion_sequence: prev.next_congestion_sequence,
             first_packet: None,
             #[cfg(feature = "qlog")]
             recovery_metrics: prev.recovery_metrics.clone(),
@@ -166,7 +169,15 @@ impl PathData {
     }
 
     /// Account for transmission of `packet` with number `pn` in `space`
-    pub(super) fn sent(&mut self, pn: u64, packet: SentPacket, space: &mut PacketSpace) {
+    pub(super) fn sent(&mut self, pn: u64, mut packet: SentPacket, space: &mut PacketSpace) {
+        packet.congestion_sequence = self.next_congestion_sequence;
+        self.next_congestion_sequence = self.next_congestion_sequence.saturating_add(1);
+        self.congestion.on_sent(
+            packet.time_sent,
+            u64::from(packet.size),
+            packet.congestion_sequence,
+            self.in_flight.bytes,
+        );
         self.in_flight.insert(&packet);
         if self.first_packet.is_none() {
             self.first_packet = Some(pn);
@@ -312,6 +323,11 @@ impl RttEstimator {
     /// The current best RTT estimation.
     pub fn get(&self) -> Duration {
         self.smoothed.unwrap_or(self.latest)
+    }
+
+    /// Most recent RTT sample, ignoring the peer's reported ACK delay.
+    pub fn latest(&self) -> Duration {
+        self.latest
     }
 
     /// Conservative estimate of RTT

@@ -63,6 +63,10 @@ impl crypto::Session for TlsSession {
         }
         Some(Box::new(HandshakeData {
             protocol: self.inner.alpn_protocol().map(|x| x.into()),
+            #[cfg(feature = "hy2-rustls")]
+            peer_application_settings: self.inner.peer_application_settings().map(|x| x.into()),
+            #[cfg(feature = "hy2-rustls")]
+            ech_accepted: self.inner.ech_accepted(),
             server_name: match self.inner {
                 Connection::Client(_) => None,
                 Connection::Server(ref session) => session.server_name().map(|x| x.into()),
@@ -257,10 +261,21 @@ impl crypto::HeaderKey for Box<dyn HeaderProtectionKey> {
 
 /// Authentication data for (rustls) TLS session
 pub struct HandshakeData {
+    /// True after an authenticated handshake that accepted ECH.
+    #[cfg(feature = "hy2-rustls")]
+    pub ech_accepted: bool,
     /// The negotiated application protocol, if ALPN is in use
     ///
     /// Guaranteed to be set if a nonempty list of protocols was specified for this connection.
     pub protocol: Option<Vec<u8>>,
+    /// Authenticated peer ALPS settings for the negotiated application protocol.
+    ///
+    /// `None` before authentication completes or when ALPS was not negotiated.
+    /// An empty negotiated payload is represented by `Some(Vec::new())`.
+    /// Retrieve fresh handshake data after connection establishment: an earlier
+    /// snapshot is not updated when authentication finishes.
+    #[cfg(feature = "hy2-rustls")]
+    pub peer_application_settings: Option<Vec<u8>>,
     /// The server name specified by the client, if any
     ///
     /// Always `None` for outgoing connections
@@ -291,6 +306,7 @@ pub struct HandshakeData {
 pub struct QuicClientConfig {
     pub(crate) inner: Arc<rustls::ClientConfig>,
     initial: Suite,
+    chrome_transport_parameters: bool,
 }
 
 impl QuicClientConfig {
@@ -309,6 +325,7 @@ impl QuicClientConfig {
             initial: initial_suite_from_provider(inner.crypto_provider())
                 .expect("no initial cipher suite found"),
             inner: Arc::new(inner),
+            chrome_transport_parameters: false,
         })
     }
 
@@ -323,6 +340,7 @@ impl QuicClientConfig {
             initial: initial_suite_from_provider(inner.crypto_provider())
                 .expect("no initial cipher suite found"),
             inner: Arc::new(inner),
+            chrome_transport_parameters: false,
         }
     }
 
@@ -334,7 +352,11 @@ impl QuicClientConfig {
         initial: Suite,
     ) -> Result<Self, NoInitialCipherSuite> {
         match initial.suite.common.suite {
-            CipherSuite::TLS13_AES_128_GCM_SHA256 => Ok(Self { inner, initial }),
+            CipherSuite::TLS13_AES_128_GCM_SHA256 => Ok(Self {
+                inner,
+                initial,
+                chrome_transport_parameters: false,
+            }),
             _ => Err(NoInitialCipherSuite { specific: true }),
         }
     }
@@ -350,6 +372,15 @@ impl QuicClientConfig {
 
         config.enable_early_data = true;
         config
+    }
+
+    /// Select Chrome-shaped serialization for client QUIC transport parameters.
+    ///
+    /// This only changes the TLS transport-parameter extension. The endpoint and transport
+    /// configuration must separately use values compatible with the Chrome profile.
+    pub fn chrome_transport_parameters(&mut self, enabled: bool) -> &mut Self {
+        self.chrome_transport_parameters = enabled;
+        self
     }
 }
 
@@ -372,7 +403,7 @@ impl crypto::ClientConfig for QuicClientConfig {
                     ServerName::try_from(server_name)
                         .map_err(|_| ConnectError::InvalidServerName(server_name.into()))?
                         .to_owned(),
-                    to_vec(params),
+                    client_params_to_vec(params, self.chrome_transport_parameters)?,
                 )
                 .unwrap(),
             ),
@@ -397,6 +428,7 @@ impl TryFrom<Arc<rustls::ClientConfig>> for QuicClientConfig {
             initial: initial_suite_from_provider(inner.crypto_provider())
                 .ok_or(NoInitialCipherSuite { specific: false })?,
             inner,
+            chrome_transport_parameters: false,
         })
     }
 }
@@ -591,6 +623,21 @@ fn to_vec(params: &TransportParameters) -> Vec<u8> {
     let mut bytes = Vec::new();
     params.write(&mut bytes);
     bytes
+}
+
+fn client_params_to_vec(
+    params: &TransportParameters,
+    chrome: bool,
+) -> Result<Vec<u8>, ConnectError> {
+    if !chrome {
+        return Ok(to_vec(params));
+    }
+
+    let mut bytes = Vec::new();
+    params
+        .write_chrome(&mut bytes, &mut rand::rng())
+        .map_err(|error| ConnectError::InvalidTransportParameters(error.to_string()))?;
+    Ok(bytes)
 }
 
 pub(crate) fn initial_keys(

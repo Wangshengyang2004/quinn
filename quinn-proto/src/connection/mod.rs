@@ -10,7 +10,7 @@ use std::{
 use bytes::{Bytes, BytesMut};
 use frame::StreamMetaVec;
 
-use rand::{RngExt, SeedableRng, rngs::StdRng};
+use rand::{RngExt, SeedableRng, rngs::StdRng, seq::SliceRandom as _};
 use thiserror::Error;
 use tracing::{debug, error, trace, trace_span, warn};
 
@@ -204,6 +204,9 @@ pub struct Connection {
     error: Option<ConnectionError>,
     /// Identifies Data-space packet numbers to skip. Not used in earlier spaces.
     packet_number_filter: PacketNumberFilter,
+    /// Pre-chaos padding budget of the last Chrome Initial datagram. Chromium temporarily uses
+    /// this as the packet-size unit when choosing the following packet-number width.
+    chrome_last_datagram_padding: u64,
 
     //
     // Queued non-retransmittable 1-RTT data
@@ -268,10 +271,13 @@ impl Connection {
         let path_validated = side_args.path_validated();
         let connection_side = ConnectionSide::from(side_args);
         let side = connection_side.side();
-        let initial_space = PacketSpace {
+        let mut initial_space = PacketSpace {
             crypto: Some(crypto.initial_keys(&init_cid, side)),
             ..PacketSpace::new(now)
         };
+        if side.is_client() && config.chrome_packet_numbers {
+            initial_space.next_packet_number = 1;
+        }
         let state = State::Handshake(state::Handshake {
             rem_cid_set: side.is_server(),
             expected_token: Bytes::new(),
@@ -334,6 +340,7 @@ impl Connection {
             },
             #[cfg(not(test))]
             packet_number_filter: PacketNumberFilter::new(&mut rng),
+            chrome_last_datagram_padding: 0,
 
             path_responses: PathResponses::default(),
             close: false,
@@ -526,6 +533,13 @@ impl Connection {
         let mut pad_datagram = false;
         let mut pad_datagram_to_mtu = false;
         let mut congestion_blocked = false;
+        let no_coalescing = self.side.is_client() && self.config.chrome_no_coalescing;
+        let minimum_initial_size =
+            if self.side.is_client() && self.config.chrome_initial_crypto_split {
+                self.config.initial_mtu
+            } else {
+                min_mtu
+            };
 
         // Iterate over all spaces and find data to send
         let mut space_idx = 0;
@@ -644,7 +658,7 @@ impl Connection {
                 // Finish current packet
                 if let Some(mut builder) = builder_storage.take() {
                     if pad_datagram {
-                        builder.pad_to(min_mtu);
+                        builder.pad_to(minimum_initial_size);
                     }
 
                     if num_datagrams > 1 || pad_datagram_to_mtu {
@@ -682,6 +696,10 @@ impl Connection {
                     }
 
                     builder.finish_and_track(now, self, sent_frames.take(), buf);
+
+                    if no_coalescing {
+                        break;
+                    }
 
                     if num_datagrams == 1 {
                         // Set the segment size for this GSO batch to the size of the first UDP
@@ -786,7 +804,7 @@ impl Connection {
                 ack_eliciting,
                 self,
             )?);
-            coalesce = coalesce && !builder.short_header;
+            coalesce = coalesce && !builder.short_header && !no_coalescing;
 
             // https://tools.ietf.org/html/draft-ietf-quic-transport-34#section-14.1
             pad_datagram |=
@@ -887,6 +905,17 @@ impl Connection {
             let sent =
                 self.populate_packet(now, space_id, buf, builder.max_size, builder.exact_number);
 
+            if self.side.is_client()
+                && self.config.chrome_packet_numbers
+                && space_id == SpaceId::Initial
+            {
+                let packet_len_unpadded = buf.len() - builder.datagram_start + builder.tag_len;
+                self.chrome_last_datagram_padding =
+                    sent.chrome_initial_padding.unwrap_or_else(|| {
+                        usize::from(minimum_initial_size).saturating_sub(packet_len_unpadded)
+                    }) as u64;
+            }
+
             // ACK-only packets should only be sent when explicitly allowed. If we write them due to
             // any other reason, there is a bug which leads to one component announcing write
             // readiness while not writing any data. This degrades performance. The condition is
@@ -919,7 +948,7 @@ impl Connection {
         // Finish the last packet
         if let Some(mut builder) = builder_storage {
             if pad_datagram {
-                builder.pad_to(min_mtu);
+                builder.pad_to(minimum_initial_size);
             }
 
             // If this datagram is a loss probe and `segment_size` is larger than `min_mtu`,
@@ -931,11 +960,7 @@ impl Connection {
                 builder.pad_to(segment_size as u16);
             }
 
-            let last_packet_number = builder.exact_number;
             builder.finish_and_track(now, self, sent_frames, buf);
-            self.path
-                .congestion
-                .on_sent(now, buf.len() as u64, last_packet_number);
 
             self.config.qlog_sink.emit_recovery_metrics(
                 self.pto_count,
@@ -1501,7 +1526,34 @@ impl Connection {
             return Ok(());
         }
 
-        let mut ack_eliciting_acked = false;
+        self.path
+            .congestion
+            .on_begin_congestion_event(self.path.in_flight.bytes);
+        let updated_rtt = if new_largest
+            && newly_acked.elts().any(|pn| {
+                self.spaces[space]
+                    .sent_packets
+                    .get(&pn)
+                    .is_some_and(|info| info.ack_eliciting)
+            }) {
+            let ack_delay = if space != SpaceId::Data {
+                Duration::from_micros(0)
+            } else {
+                cmp::min(
+                    self.ack_frequency.peer_max_ack_delay,
+                    Duration::from_micros(ack.delay << self.peer_params.ack_delay_exponent.0),
+                )
+            };
+            let rtt = now.saturating_duration_since(self.spaces[space].largest_acked_packet_sent);
+            let mut updated = self.path.rtt;
+            updated.update(ack_delay, rtt);
+            self.path.congestion.on_rtt_update(&updated);
+            Some(updated)
+        } else {
+            None
+        };
+
+        let mut largest_congestion_sequence_acked = None;
         for packet in newly_acked.elts() {
             if let Some(info) = self.spaces[space].take(packet) {
                 if let Some(acked) = info.largest_acked {
@@ -1512,7 +1564,14 @@ impl Connection {
                     // https://www.rfc-editor.org/rfc/rfc9000.html#name-limiting-ranges-by-tracking
                     self.spaces[space].pending_acks.subtract_below(acked);
                 }
-                ack_eliciting_acked |= info.ack_eliciting;
+                if info.size != 0 {
+                    largest_congestion_sequence_acked = Some(
+                        largest_congestion_sequence_acked
+                            .map_or(info.congestion_sequence, |largest: u64| {
+                                largest.max(info.congestion_sequence)
+                            }),
+                    );
+                }
 
                 // Notify MTU discovery that a packet was acked, because it might be an MTU probe
                 let mtu_updated = self.path.mtud.on_acked(space, packet, info.size);
@@ -1529,24 +1588,8 @@ impl Connection {
             }
         }
 
-        self.path.congestion.on_end_acks(
-            now,
-            self.path.in_flight.bytes,
-            self.app_limited,
-            self.spaces[space].largest_acked_packet,
-        );
-
-        if new_largest && ack_eliciting_acked {
-            let ack_delay = if space != SpaceId::Data {
-                Duration::from_micros(0)
-            } else {
-                cmp::min(
-                    self.ack_frequency.peer_max_ack_delay,
-                    Duration::from_micros(ack.delay << self.peer_params.ack_delay_exponent.0),
-                )
-            };
-            let rtt = now.saturating_duration_since(self.spaces[space].largest_acked_packet_sent);
-            self.path.rtt.update(ack_delay, rtt);
+        if let Some(updated) = updated_rtt {
+            self.path.rtt = updated;
             if self.path.first_packet_after_rtt_sample.is_none() {
                 self.path.first_packet_after_rtt_sample =
                     Some((space, self.spaces[space].next_packet_number));
@@ -1555,6 +1598,15 @@ impl Connection {
 
         // Must be called before crypto/pto_count are clobbered
         self.detect_lost_packets(now, space, true);
+
+        // BBR treats acknowledgements and the losses inferred from them as one congestion event.
+        // Finish the acknowledgement batch only after loss detection has notified the controller.
+        self.path.congestion.on_end_acks(
+            now,
+            self.path.in_flight.bytes,
+            self.app_limited,
+            largest_congestion_sequence_acked,
+        );
 
         if self.peer_completed_address_validation() {
             self.pto_count = 0;
@@ -1602,9 +1654,15 @@ impl Connection {
             Ok(false) => {}
             Ok(true) => {
                 self.stats.path.congestion_events += 1;
-                self.path
-                    .congestion
-                    .on_congestion_event(now, largest_sent_time, false, 0);
+                self.path.congestion.on_congestion_event(
+                    now,
+                    largest_sent_time,
+                    false,
+                    0,
+                    0,
+                    None,
+                    None,
+                );
             }
         }
     }
@@ -1619,7 +1677,9 @@ impl Connection {
             self.path.congestion.on_ack(
                 now,
                 info.time_sent,
+                info.congestion_sequence,
                 info.size.into(),
+                info.bytes_in_flight_at_send,
                 self.app_limited,
                 &self.path.rtt,
             );
@@ -1700,6 +1760,7 @@ impl Connection {
         let largest_acked_packet = self.spaces[pn_space].largest_acked_packet.unwrap();
         let packet_threshold = self.config.packet_threshold as u64;
         let mut size_of_lost_packets = 0u64;
+        let mut congestion_controlled_lost_packets = 0u64;
 
         // InPersistentCongestion: Determine if all packets in the time period before the newest
         // lost packet, including the edges, are marked lost. PTO computation must always
@@ -1731,6 +1792,7 @@ impl Connection {
                 } else {
                     lost_packets.push(packet);
                     size_of_lost_packets += info.size as u64;
+                    congestion_controlled_lost_packets += u64::from(info.size != 0);
                     if info.ack_eliciting && due_to_ack {
                         match persistent_congestion_start {
                             // Two ACK-eliciting packets lost more than congestion_period apart, with no
@@ -1766,7 +1828,10 @@ impl Connection {
         // OnPacketsLost
         if let Some(largest_lost) = lost_packets.last().cloned() {
             let old_bytes_in_flight = self.path.in_flight.bytes;
-            let largest_lost_sent = self.spaces[pn_space].sent_packets[&largest_lost].time_sent;
+            let largest_lost_info = &self.spaces[pn_space].sent_packets[&largest_lost];
+            let largest_lost_sent = largest_lost_info.time_sent;
+            let largest_lost_congestion_sequence = largest_lost_info.congestion_sequence;
+            let largest_lost_bytes_in_flight_at_send = largest_lost_info.bytes_in_flight_at_send;
             self.stats.path.lost_packets += lost_packets.len() as u64;
             self.stats.path.lost_bytes += size_of_lost_packets;
             trace!(
@@ -1776,6 +1841,9 @@ impl Connection {
 
             for &packet in &lost_packets {
                 let info = self.spaces[pn_space].take(packet).unwrap(); // safe: lost_packets is populated just above
+                self.path
+                    .congestion
+                    .on_packet_lost(info.congestion_sequence, u64::from(info.size));
                 self.config.qlog_sink.emit_packet_lost(
                     packet,
                     &info,
@@ -1804,19 +1872,38 @@ impl Connection {
             let lost_ack_eliciting = old_bytes_in_flight != self.path.in_flight.bytes;
 
             if lost_ack_eliciting {
+                if !due_to_ack {
+                    self.path
+                        .congestion
+                        .on_begin_congestion_event(old_bytes_in_flight);
+                }
                 self.stats.path.congestion_events += 1;
                 self.path.congestion.on_congestion_event(
                     now,
                     largest_lost_sent,
                     in_persistent_congestion,
                     size_of_lost_packets,
+                    congestion_controlled_lost_packets,
+                    Some(largest_lost_congestion_sequence),
+                    Some(largest_lost_bytes_in_flight_at_send),
                 );
+                if !due_to_ack {
+                    self.path.congestion.on_end_acks(
+                        now,
+                        self.path.in_flight.bytes,
+                        self.app_limited,
+                        None,
+                    );
+                }
             }
         }
 
         // Handle a lost MTU probe
         if let Some(packet) = lost_mtu_probe {
             let info = self.spaces[SpaceId::Data].take(packet).unwrap(); // safe: lost_mtu_probe is omitted from lost_packets, and therefore must not have been removed yet
+            self.path
+                .congestion
+                .on_packet_lost(info.congestion_sequence, u64::from(info.size));
             self.remove_in_flight(&info);
             self.path.mtud.on_probe_lost();
             self.stats.path.lost_plpmtud_probes += 1;
@@ -2175,6 +2262,14 @@ impl Connection {
                 }
             }
             self.spaces[space].crypto_offset += outgoing.len() as u64;
+            if self.side.is_client()
+                && space == SpaceId::Initial
+                && self.config.chrome_initial_payload_chaos
+            {
+                self.spaces[space]
+                    .fresh_crypto
+                    .insert(offset..offset + outgoing.len() as u64);
+            }
             trace!("wrote {} {:?} CRYPTO bytes", outgoing.len(), space);
             self.spaces[space].pending.crypto.push_back(frame::Crypto {
                 offset,
@@ -2200,6 +2295,11 @@ impl Connection {
         }
 
         self.spaces[space].crypto = Some(crypto);
+        if self.side.is_client() && self.config.chrome_packet_numbers {
+            // Chromium resumes sizing packet numbers against the whole datagram when read keys
+            // advance to a new encryption level.
+            self.chrome_last_datagram_padding = 0;
+        }
         debug_assert!(space as usize > self.highest_space as usize);
         self.highest_space = space;
         if space == SpaceId::Data && self.side.is_client() {
@@ -2223,6 +2323,9 @@ impl Connection {
         space.loss_time = None;
         let sent_packets = mem::take(&mut space.sent_packets);
         for packet in sent_packets.into_values() {
+            self.path
+                .congestion
+                .on_packet_lost(packet.congestion_sequence, u64::from(packet.size));
             self.remove_in_flight(&packet);
         }
         self.set_loss_detection_timer(now)
@@ -2506,9 +2609,11 @@ impl Connection {
                 self.rem_handshake_cid = rem_cid;
 
                 let space = &mut self.spaces[SpaceId::Initial];
-                if let Some(info) = space.take(0) {
-                    self.on_packet_acked(now, info);
-                };
+                if let Some(first_packet) = space.sent_packets.keys().next().copied() {
+                    if let Some(info) = space.take(first_packet) {
+                        self.on_packet_acked(now, info);
+                    }
+                }
 
                 self.discard_space(now, SpaceId::Initial); // Make sure we clean up after any retransmitted Initials
                 self.spaces[SpaceId::Initial] = PacketSpace {
@@ -2524,6 +2629,12 @@ impl Connection {
                         offset: 0,
                         data: client_hello,
                     });
+                if self.config.chrome_initial_payload_chaos {
+                    let crypto_offset = self.spaces[SpaceId::Initial].crypto_offset;
+                    self.spaces[SpaceId::Initial]
+                        .fresh_crypto
+                        .insert(0..crypto_offset);
+                }
 
                 // Retransmit all 0-RTT data
                 let zero_rtt = mem::take(&mut self.spaces[SpaceId::Data].sent_packets);
@@ -2740,6 +2851,21 @@ impl Connection {
         }
 
         self.write_crypto();
+        // Reject bytes buffered beyond a gap as soon as TLS leaves their level.
+        // Checking only newly arriving old-level frames misses data buffered
+        // before the transition (RFC 9000, section 7.5).
+        for space in [SpaceId::Initial, SpaceId::Handshake] {
+            let finished = match space {
+                SpaceId::Initial => self.highest_space > SpaceId::Initial,
+                SpaceId::Handshake => !self.crypto.is_handshaking(),
+                SpaceId::Data => unreachable!(),
+            };
+            if finished && self.spaces[space].crypto_stream.has_unread_data() {
+                return Err(TransportError::PROTOCOL_VIOLATION(
+                    "unconsumed crypto data at previous encryption level",
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -3160,6 +3286,10 @@ impl Connection {
         pn: u64,
     ) -> SentFrames {
         let mut sent = SentFrames::default();
+        let chrome_crypto_head_len = (self.side.is_client()
+            && space_id == SpaceId::Initial
+            && self.config.chrome_initial_crypto_split)
+            .then(|| 55 + self.rng.random_range(0..32));
         let space = &mut self.spaces[space_id];
         let is_0rtt = space_id == SpaceId::Data && space.crypto.is_none();
         space.pending_acks.maybe_ack_non_eliciting();
@@ -3261,8 +3391,27 @@ impl Connection {
             }
         }
 
-        // CRYPTO
-        while buf.len() + frame::Crypto::SIZE_BOUND < max_size && !is_0rtt {
+        // Chrome sends the beginning and end of its ClientHello in the first Initial, leaving the
+        // middle for the following packet. The queue still contains ordinary offset-addressed
+        // CRYPTO frames, so loss detection and retransmission need no special handling.
+        let crypto_frame_limit = chrome_crypto_head_len.and_then(|head_len| {
+            shape_chrome_initial_crypto(
+                &mut space.pending.crypto,
+                max_size.saturating_sub(buf.len()),
+                head_len,
+            )
+            .then_some(2)
+        });
+
+        // Select CRYPTO before encoding it so fresh Chrome Initial data can be fragmented and
+        // shuffled without changing the packet's final size. Retransmitted ranges aren't present
+        // in `fresh_crypto`, and therefore always take the ordinary encoding path.
+        let mut selected_crypto = Vec::new();
+        let mut selected_crypto_size = 0;
+        while buf.len() + selected_crypto_size + frame::Crypto::SIZE_BOUND < max_size && !is_0rtt {
+            if crypto_frame_limit.is_some_and(|limit| selected_crypto.len() >= limit) {
+                break;
+            }
             let mut frame = match space.pending.crypto.pop_front() {
                 Some(x) => x,
                 None => break,
@@ -3274,6 +3423,7 @@ impl Connection {
             // which is more than what fits into normally sized QUIC frames.
             let max_crypto_data_size = max_size
                 - buf.len()
+                - selected_crypto_size
                 - 1 // Frame Type
                 - VarInt::size(unsafe { VarInt::from_u64_unchecked(frame.offset) })
                 - 2; // Maximum encoded length for frame size, given we send less than 2^14 bytes
@@ -3294,12 +3444,52 @@ impl Connection {
                 truncated.offset,
                 truncated.data.len()
             );
-            truncated.encode(buf);
-            self.stats.frame_tx.crypto += 1;
-            sent.retransmits.get_or_create().crypto.push_back(truncated);
+            selected_crypto_size += crypto_frame_header_len(truncated.offset, truncated.data.len())
+                + truncated.data.len();
+            selected_crypto.push(truncated);
             if !frame.data.is_empty() {
                 frame.offset += len as u64;
                 space.pending.crypto.push_front(frame);
+            }
+        }
+
+        let chaos_protected = self.side.is_client()
+            && space_id == SpaceId::Initial
+            && self.config.chrome_initial_payload_chaos
+            && !selected_crypto.is_empty()
+            && buf.len() + selected_crypto_size < max_size
+            && selected_crypto
+                .iter()
+                .all(|frame| crypto_range_is_fresh(&space.fresh_crypto, frame));
+        for frame in &selected_crypto {
+            space
+                .fresh_crypto
+                .remove(frame.offset..frame.offset + frame.data.len() as u64);
+        }
+
+        if chaos_protected {
+            let padding_budget = max_size - buf.len() - selected_crypto_size;
+            sent.chrome_initial_padding = Some(padding_budget);
+            let result =
+                encode_chrome_initial_payload(selected_crypto, padding_budget, &mut self.rng, buf);
+            trace!(
+                crypto_frames = result.crypto.len(),
+                pings = result.pings,
+                padding_runs = result.padding_runs,
+                "Chrome Initial payload"
+            );
+            self.stats.frame_tx.crypto += result.crypto.len() as u64;
+            self.stats.frame_tx.ping += result.pings as u64;
+            sent.non_retransmits |= result.pings != 0;
+            sent.retransmits
+                .get_or_create()
+                .crypto
+                .extend(result.crypto);
+        } else {
+            for frame in selected_crypto {
+                frame.encode(buf);
+                self.stats.frame_tx.crypto += 1;
+                sent.retransmits.get_or_create().crypto.push_back(frame);
             }
         }
 
@@ -3664,6 +3854,37 @@ impl Connection {
             .saturating_sub(self.path.in_flight.bytes)
     }
 
+    #[cfg(test)]
+    pub(crate) fn queue_test_crypto(&mut self, space: SpaceId, offset: u64, data: Bytes) {
+        self.spaces[space]
+            .pending
+            .crypto
+            .push_front(frame::Crypto { offset, data });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn next_packet_number(&self, space: SpaceId) -> u64 {
+        self.spaces[space].next_packet_number
+    }
+
+    #[cfg(test)]
+    pub(crate) fn sent_crypto_frames(&self, space: SpaceId) -> Vec<(u64, Vec<(u64, usize)>)> {
+        self.spaces[space]
+            .sent_packets
+            .iter()
+            .filter_map(|(&packet_number, packet)| {
+                let frames = packet
+                    .retransmits
+                    .get()?
+                    .crypto
+                    .iter()
+                    .map(|frame| (frame.offset, frame.data.len()))
+                    .collect::<Vec<_>>();
+                (!frames.is_empty()).then_some((packet_number, frames))
+            })
+            .collect()
+    }
+
     /// Whether no timers but keepalive, idle, rtt, pushnewcid, and key discard are running
     #[cfg(test)]
     pub(crate) fn is_idle(&self) -> bool {
@@ -3799,6 +4020,207 @@ impl Connection {
             new_tokens.push(self.path.remote);
         }
     }
+}
+
+fn crypto_frame_header_len(offset: u64, data_len: usize) -> usize {
+    1 + VarInt::from_u64(offset).unwrap().size() + VarInt::from_u64(data_len as u64).unwrap().size()
+}
+
+fn crypto_range_is_fresh(fresh: &ArrayRangeSet, frame: &frame::Crypto) -> bool {
+    let end = frame.offset + frame.data.len() as u64;
+    fresh
+        .iter()
+        .any(|range| range.start <= frame.offset && range.end >= end)
+}
+
+enum ChromeChaosItem {
+    Crypto(frame::Crypto),
+    Ping,
+    Padding(usize),
+}
+
+struct ChromeChaosResult {
+    crypto: Vec<frame::Crypto>,
+    pings: usize,
+    padding_runs: usize,
+}
+
+/// Encodes fresh Initial CRYPTO using Chromium's bounded fragmentation and frame mixing pattern.
+///
+/// `padding_budget` includes every byte available after the original CRYPTO encoding. Extra frame
+/// headers and PINGs consume that budget, and the rest is emitted as independently shuffled
+/// padding runs, preserving the exact final payload size.
+fn encode_chrome_initial_payload(
+    mut crypto: Vec<frame::Crypto>,
+    mut padding_budget: usize,
+    rng: &mut StdRng,
+    out: &mut Vec<u8>,
+) -> ChromeChaosResult {
+    let original_crypto_size = crypto
+        .iter()
+        .map(|frame| crypto_frame_header_len(frame.offset, frame.data.len()) + frame.data.len())
+        .sum::<usize>();
+    let expected_size = original_crypto_size + padding_budget;
+
+    let low_offset = crypto.iter().map(|frame| frame.offset).min().unwrap_or(0);
+    let high_offset = crypto
+        .iter()
+        .map(|frame| frame.offset + frame.data.len() as u64)
+        .max()
+        .unwrap_or(low_offset);
+    let maximum_split_overhead =
+        crypto_frame_header_len(high_offset, (high_offset - low_offset) as usize);
+    let attempts = rng.random_range(2..=10);
+    for _ in 0..attempts {
+        if padding_budget < maximum_split_overhead || crypto.is_empty() {
+            break;
+        }
+        let index = rng.random_range(0..crypto.len());
+        let original = &crypto[index];
+        if original.data.len() <= 1 {
+            continue;
+        }
+        let cut = rng.random_range(1..original.data.len());
+        let first = frame::Crypto {
+            offset: original.offset,
+            data: original.data.slice(..cut),
+        };
+        let second = frame::Crypto {
+            offset: original.offset + cut as u64,
+            data: original.data.slice(cut..),
+        };
+        let old_header = crypto_frame_header_len(original.offset, original.data.len());
+        let new_headers = crypto_frame_header_len(first.offset, first.data.len())
+            + crypto_frame_header_len(second.offset, second.data.len());
+        let added_overhead = new_headers - old_header;
+        if added_overhead > padding_budget {
+            break;
+        }
+        padding_budget -= added_overhead;
+        crypto[index] = first;
+        crypto.push(second);
+    }
+
+    let pings = rng.random_range(2..=10).min(padding_budget);
+    padding_budget -= pings;
+
+    let mut items = Vec::with_capacity(crypto.len() + pings + crypto.len() + pings + 1);
+    items.extend(crypto.iter().cloned().map(ChromeChaosItem::Crypto));
+    items.extend((0..pings).map(|_| ChromeChaosItem::Ping));
+
+    let positions = items.len();
+    let mut padding_runs = 0;
+    for _ in 0..positions {
+        if padding_budget == 0 {
+            break;
+        }
+        let length = rng.random_range(0..=padding_budget);
+        if length == 0 {
+            continue;
+        }
+        items.push(ChromeChaosItem::Padding(length));
+        padding_runs += 1;
+        padding_budget -= length;
+    }
+    if padding_budget != 0 {
+        items.push(ChromeChaosItem::Padding(padding_budget));
+        padding_runs += 1;
+    }
+
+    items.shuffle(rng);
+    let start = out.len();
+    for item in items {
+        match item {
+            ChromeChaosItem::Crypto(frame) => frame.encode(out),
+            ChromeChaosItem::Ping => out.write(frame::FrameType::PING),
+            ChromeChaosItem::Padding(length) => out.resize(out.len() + length, 0),
+        }
+    }
+    debug_assert_eq!(out.len() - start, expected_size);
+
+    ChromeChaosResult {
+        crypto,
+        pings,
+        padding_runs,
+    }
+}
+
+/// Reorders the first pending ClientHello into Chrome's head/tail/middle layout.
+///
+/// Returns `true` when the queue was changed. `available` is the remaining payload capacity in the
+/// packet, including the two CRYPTO frame headers.
+fn shape_chrome_initial_crypto(
+    pending: &mut VecDeque<frame::Crypto>,
+    available: usize,
+    head_len: usize,
+) -> bool {
+    let Some(frame) = pending.front() else {
+        return false;
+    };
+    if frame.offset != 0 {
+        return false;
+    }
+
+    let pending_len = frame.data.len();
+    if pending_len <= head_len {
+        return false;
+    }
+
+    let last_offset = pending_len.saturating_sub(1) as u64;
+    let minimum_frame_header = crypto_frame_header_len(last_offset, pending_len);
+    let Some(max_first_packet_data) = available.checked_sub(2 * minimum_frame_header) else {
+        return false;
+    };
+    let Some(max_other_packet_data) = available.checked_sub(minimum_frame_header) else {
+        return false;
+    };
+    if pending_len <= max_first_packet_data || max_other_packet_data == 0 {
+        return false;
+    }
+
+    let occupied = max_other_packet_data - max_first_packet_data;
+    let packet_count = (pending_len + occupied).div_ceil(max_other_packet_data);
+    let other_packet_data = (pending_len + occupied).div_ceil(packet_count);
+    if other_packet_data < occupied {
+        return false;
+    }
+    let first_packet_data = other_packet_data - occupied;
+    if first_packet_data <= head_len {
+        return false;
+    }
+    let tail_len = first_packet_data - head_len;
+    let middle_len = pending_len - first_packet_data;
+    if middle_len == 0 {
+        return false;
+    }
+
+    let tail_offset = (head_len + middle_len) as u64;
+    let encoded_len = crypto_frame_header_len(0, head_len)
+        + head_len
+        + crypto_frame_header_len(tail_offset, tail_len)
+        + tail_len;
+    if encoded_len > available {
+        return false;
+    }
+
+    let mut original = pending.pop_front().unwrap();
+    let head = original.data.split_to(head_len);
+    let middle = original.data.split_to(middle_len);
+    let tail = original.data;
+
+    pending.push_front(frame::Crypto {
+        offset: head_len as u64,
+        data: middle,
+    });
+    pending.push_front(frame::Crypto {
+        offset: tail_offset,
+        data: tail,
+    });
+    pending.push_front(frame::Crypto {
+        offset: 0,
+        data: head,
+    });
+    true
 }
 
 impl fmt::Debug for Connection {
@@ -4083,6 +4505,7 @@ struct SentFrames {
     /// Whether the packet contains non-retransmittable frames (like datagrams)
     non_retransmits: bool,
     requires_padding: bool,
+    chrome_initial_padding: Option<usize>,
 }
 
 impl SentFrames {
@@ -4199,6 +4622,96 @@ mod tests {
             );
             assert!(frames.next().is_none());
         }
+    }
+
+    #[test]
+    fn chrome_initial_crypto_keeps_offsets_retransmittable() {
+        let source: Vec<u8> = (0..2_000).map(|i| (i % 251) as u8).collect();
+        let mut pending = VecDeque::from([frame::Crypto {
+            offset: 0,
+            data: Bytes::copy_from_slice(&source),
+        }]);
+
+        assert!(shape_chrome_initial_crypto(&mut pending, 1_100, 70));
+        assert_eq!(pending.len(), 3);
+
+        let head = &pending[0];
+        let tail = &pending[1];
+        let middle = &pending[2];
+        assert_eq!((head.offset, head.data.len()), (0, 70));
+        assert_eq!(middle.offset, head.data.len() as u64);
+        assert_eq!(tail.offset, (head.data.len() + middle.data.len()) as u64);
+        assert!(
+            crypto_frame_header_len(head.offset, head.data.len())
+                + head.data.len()
+                + crypto_frame_header_len(tail.offset, tail.data.len())
+                + tail.data.len()
+                <= 1_100
+        );
+
+        let mut by_offset: Vec<_> = pending.into_iter().collect();
+        by_offset.sort_by_key(|frame| frame.offset);
+        let reassembled: Vec<u8> = by_offset.into_iter().flat_map(|frame| frame.data).collect();
+        assert_eq!(reassembled, source);
+    }
+
+    #[test]
+    fn chrome_initial_crypto_leaves_short_messages_alone() {
+        let original = frame::Crypto {
+            offset: 0,
+            data: Bytes::from_static(&[42; 64]),
+        };
+        let mut pending = VecDeque::from([original.clone()]);
+
+        assert!(!shape_chrome_initial_crypto(&mut pending, 1_100, 70));
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].offset, original.offset);
+        assert_eq!(pending[0].data, original.data);
+    }
+
+    #[test]
+    fn chrome_initial_chaos_preserves_size_and_crypto_bytes() {
+        let source: Vec<u8> = (0..600).map(|i| (i % 251) as u8).collect();
+        let original = frame::Crypto {
+            offset: 20,
+            data: Bytes::copy_from_slice(&source),
+        };
+        let original_size =
+            crypto_frame_header_len(original.offset, original.data.len()) + original.data.len();
+        let mut encoded = vec![0xaa];
+        let result = encode_chrome_initial_payload(
+            vec![original],
+            400,
+            &mut StdRng::seed_from_u64(9),
+            &mut encoded,
+        );
+
+        assert_eq!(encoded.len(), 1 + original_size + 400);
+        assert!(result.crypto.len() >= 2);
+        assert!((2..=10).contains(&result.pings));
+        assert!(result.padding_runs >= 1);
+
+        let mut by_offset = result.crypto;
+        by_offset.sort_by_key(|frame| frame.offset);
+        let reassembled: Vec<u8> = by_offset.into_iter().flat_map(|frame| frame.data).collect();
+        assert_eq!(reassembled, source);
+    }
+
+    #[test]
+    fn chrome_initial_chaos_distinguishes_fresh_ranges_from_retransmissions() {
+        let mut fresh = ArrayRangeSet::new();
+        fresh.insert(40..100);
+        let retransmission = frame::Crypto {
+            offset: 0,
+            data: Bytes::from_static(&[1; 40]),
+        };
+        let new_data = frame::Crypto {
+            offset: 40,
+            data: Bytes::from_static(&[2; 60]),
+        };
+
+        assert!(!crypto_range_is_fresh(&fresh, &retransmission));
+        assert!(crypto_range_is_fresh(&fresh, &new_data));
     }
 
     #[test]

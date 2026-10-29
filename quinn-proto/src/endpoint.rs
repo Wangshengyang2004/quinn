@@ -281,6 +281,13 @@ impl Endpoint {
         buf: &mut Vec<u8>,
     ) -> Option<Transmit> {
         if self
+            .server_config
+            .as_ref()
+            .is_some_and(|config| !config.send_stateless_reset)
+        {
+            return None;
+        }
+        if self
             .last_stateless_reset
             .is_some_and(|last| last + self.config.min_reset_interval > now)
         {
@@ -1276,6 +1283,9 @@ pub enum ConnectError {
     /// The given server name was malformed
     #[error("invalid server name: {0}")]
     InvalidServerName(String),
+    /// The configured transport parameters cannot be encoded for this client profile
+    #[error("invalid transport parameters: {0}")]
+    InvalidTransportParameters(String),
     /// The remote [`SocketAddr`] supplied was malformed
     ///
     /// Examples include attempting to connect to port 0, or using an inappropriate address family.
