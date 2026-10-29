@@ -700,7 +700,13 @@ impl Connection {
 
                     builder.finish_and_track(now, self, sent_frames.take(), buf);
 
-                    if no_coalescing {
+                    // Chrome separates QUIC encryption levels into individual
+                    // UDP datagrams. After confirmation, those datagrams can
+                    // still share a GSO batch, as in quic-go's sendPackets.
+                    if no_coalescing
+                        && (self.highest_space != SpaceId::Data
+                            || self.spaces[SpaceId::Handshake].crypto.is_some())
+                    {
                         break;
                     }
 

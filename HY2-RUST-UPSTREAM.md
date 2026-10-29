@@ -9,7 +9,10 @@ and BBR profile controls are rebased from `crapthings/hysteria-rust`
 Hysteria 2.13.0 and quic-go `a10df75c260c` are the compatibility oracle.
 The reference's license is retained in `LICENSE-HYSTERIA-RUST-PATCHES`.
 
-Chrome shaping is opt-in. Ordinary connections retain minimum-MTU padding and
+Chrome shaping is opt-in. QUIC packets remain separate within each UDP datagram;
+GSO batching resumes after handshake confirmation, matching quic-go. The original
+reference patch also disabled GSO, which was an unnecessary runtime cost.
+Ordinary connections retain minimum-MTU padding and
 window pacing. HY2 configures BBR's profiles, 32-packet initial window,
 20,000-packet maximum and MTU scaling; ordinary callers retain byte-window defaults.
 The controller API carries send/loss metadata, a per-event prior flight size and

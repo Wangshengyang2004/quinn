@@ -4179,23 +4179,30 @@ fn endpoint_and_connection_impl_send_sync() {
 #[test]
 fn stream_gso() {
     let _guard = subscribe();
-    let mut pair = Pair::default();
-    let (client_ch, _) = pair.connect();
+    for chrome in [false, true] {
+        let mut pair = Pair::default();
+        let mut config = client_config();
+        Arc::get_mut(&mut config.transport)
+            .unwrap()
+            .chrome_no_coalescing(chrome);
+        let (client_ch, _) = pair.connect_with(config);
 
-    let s = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
+        let s = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
 
-    let initial_ios = pair.client_conn_mut(client_ch).stats().udp_tx.ios;
+        let initial_ios = pair.client_conn_mut(client_ch).stats().udp_tx.ios;
 
-    // Send 20KiB of stream data, which comfortably fits inside two `tests::util::MAX_DATAGRAMS`
-    // datagram batches
-    info!("sending");
-    for _ in 0..20 {
-        pair.client_send(client_ch, s).write(&[0; 1024]).unwrap();
+        // Chrome separates encryption levels into individual datagrams. Like
+        // quic-go, it still batches those datagrams after handshake confirmation.
+        // 20 KiB fits inside two `tests::util::MAX_DATAGRAMS` batches.
+        info!("sending");
+        for _ in 0..20 {
+            pair.client_send(client_ch, s).write(&[0; 1024]).unwrap();
+        }
+        pair.client_send(client_ch, s).finish().unwrap();
+        pair.drive();
+        let final_ios = pair.client_conn_mut(client_ch).stats().udp_tx.ios;
+        assert_eq!(final_ios - initial_ios, 2, "Chrome profile: {chrome}");
     }
-    pair.client_send(client_ch, s).finish().unwrap();
-    pair.drive();
-    let final_ios = pair.client_conn_mut(client_ch).stats().udp_tx.ios;
-    assert_eq!(final_ios - initial_ios, 2);
 }
 
 #[test]
