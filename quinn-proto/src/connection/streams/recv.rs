@@ -4,6 +4,7 @@ use std::mem;
 use thiserror::Error;
 use tracing::debug;
 
+use super::autotune::AutoTune;
 use super::state::get_or_insert_recv;
 use super::{ClosedStream, Retransmits, ShouldTransmit, StreamId, StreamsState};
 use crate::connection::assembler::{Assembler, Chunk, IllegalOrderedRead};
@@ -18,6 +19,7 @@ pub(super) struct Recv {
     sent_max_stream_data: u64,
     pub(super) end: u64,
     pub(super) stopped: bool,
+    pub(super) autotune: Option<AutoTune>,
 }
 
 impl Recv {
@@ -28,6 +30,7 @@ impl Recv {
             sent_max_stream_data: initial_max_data,
             end: 0,
             stopped: false,
+            autotune: None,
         })
     }
 
@@ -38,6 +41,7 @@ impl Recv {
         self.sent_max_stream_data = initial_max_data;
         self.end = 0;
         self.stopped = false;
+        self.autotune = None;
     }
 
     /// Process a STREAM frame
@@ -110,6 +114,10 @@ impl Recv {
     /// `false` the new window should only be transmitted if a previous transmission
     /// had failed.
     pub(super) fn max_stream_data(&mut self, stream_receive_window: u64) -> (u64, ShouldTransmit) {
+        let (stream_receive_window, divisor) = match &self.autotune {
+            Some(tune) => (tune.window, 4),
+            None => (stream_receive_window, 8),
+        };
         let max_stream_data = self.assembler.bytes_read() + stream_receive_window;
 
         // Only announce a window update if it's significant enough
@@ -120,7 +128,7 @@ impl Recv {
         // smaller than `stream_receive_window` in order to make sure the stream
         // does not get stuck.
         let diff = max_stream_data - self.sent_max_stream_data;
-        let transmit = self.can_send_flow_control() && diff >= (stream_receive_window / 8);
+        let transmit = self.can_send_flow_control() && diff >= (stream_receive_window / divisor);
         (max_stream_data, ShouldTransmit(transmit))
     }
 

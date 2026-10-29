@@ -4206,6 +4206,33 @@ fn stream_gso() {
 }
 
 #[test]
+fn fixed_header_bits_survive_peer_grease_and_gso() {
+    let mut pair = Pair::default();
+    let mut config = client_config();
+    Arc::get_mut(&mut config.transport)
+        .unwrap()
+        .fixed_header_bits(true)
+        .chrome_packet_numbers(true)
+        .chrome_no_coalescing(true);
+    let (client, _) = pair.connect_with(config);
+    assert!(pair.server.endpoint.config().grease_quic_bit);
+    let stream = pair.client_streams(client).open(Dir::Uni).unwrap();
+    let mut datagrams = 0;
+    for _ in 0..32 {
+        pair.client_send(client, stream).write(&[0; 4096]).unwrap();
+        pair.client.drive_outgoing(pair.time);
+        for (_, bytes) in &pair.client.outbound {
+            assert_eq!(bytes[0] & packet::LONG_HEADER_FORM, 0);
+            assert_ne!(bytes[0] & packet::FIXED_BIT, 0);
+            assert_eq!(bytes[0] & packet::SPIN_BIT, 0);
+            datagrams += 1;
+        }
+        pair.drive();
+    }
+    assert!(datagrams >= 64, "exercise many protected short headers");
+}
+
+#[test]
 fn datagram_gso() {
     let _guard = subscribe();
     let mut pair = Pair::default();

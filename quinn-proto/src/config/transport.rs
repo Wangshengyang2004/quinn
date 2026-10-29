@@ -30,6 +30,7 @@ pub struct TransportConfig {
     pub(crate) max_idle_timeout: Option<VarInt>,
     pub(crate) stream_receive_window: VarInt,
     pub(crate) receive_window: VarInt,
+    pub(crate) receive_window_autotune: Option<(VarInt, VarInt)>,
     pub(crate) send_window: u64,
     pub(crate) send_fairness: bool,
 
@@ -51,6 +52,7 @@ pub struct TransportConfig {
     pub(crate) keep_alive_interval: Option<Duration>,
     pub(crate) crypto_buffer_size: usize,
     pub(crate) allow_spin: bool,
+    pub(crate) fixed_header_bits: bool,
     pub(crate) datagram_receive_buffer_size: Option<usize>,
     pub(crate) max_datagram_frame_size: Option<VarInt>,
     pub(crate) omit_max_datagram_frame_size: bool,
@@ -132,6 +134,25 @@ impl TransportConfig {
     /// stream while another is blocked.
     pub fn receive_window(&mut self, value: VarInt) -> &mut Self {
         self.receive_window = value;
+        self
+    }
+
+    /// Enable quic-go-compatible receive-window auto tuning, with per-stream
+    /// and connection caps. Initial windows remain those configured by
+    /// `stream_receive_window` and `receive_window`; caps below them are clamped.
+    /// Credit updates occur after a quarter-window is consumed. Fast readers
+    /// grow their windows according to measured RTT, up to these caps.
+    /// Disabled by default; ordinary Quinn windows remain fixed.
+    pub fn receive_window_autotune(&mut self, stream: VarInt, connection: VarInt) -> &mut Self {
+        self.receive_window_autotune = Some((stream, connection));
+        self
+    }
+
+    /// Always send the fixed bit as one and the spin bit as zero, as quic-go
+    /// does. This overrides `allow_spin` and peer fixed-bit GREASE negotiation.
+    /// Disabled by default, preserving Quinn's spin and GREASE behavior.
+    pub fn fixed_header_bits(&mut self, enabled: bool) -> &mut Self {
+        self.fixed_header_bits = enabled;
         self
     }
 
@@ -452,6 +473,7 @@ impl Default for TransportConfig {
             max_idle_timeout: Some(VarInt(30_000)),
             stream_receive_window: STREAM_RWND.into(),
             receive_window: VarInt::MAX,
+            receive_window_autotune: None,
             send_window: (8 * STREAM_RWND).into(),
             send_fairness: true,
 
@@ -473,6 +495,7 @@ impl Default for TransportConfig {
             keep_alive_interval: None,
             crypto_buffer_size: 16 * 1024,
             allow_spin: true,
+            fixed_header_bits: false,
             datagram_receive_buffer_size: Some(STREAM_RWND as usize),
             max_datagram_frame_size: None,
             omit_max_datagram_frame_size: false,
@@ -498,6 +521,7 @@ impl fmt::Debug for TransportConfig {
             max_idle_timeout,
             stream_receive_window,
             receive_window,
+            receive_window_autotune,
             send_window,
             send_fairness,
             packet_threshold,
@@ -517,6 +541,7 @@ impl fmt::Debug for TransportConfig {
             keep_alive_interval,
             crypto_buffer_size,
             allow_spin,
+            fixed_header_bits,
             datagram_receive_buffer_size,
             max_datagram_frame_size,
             omit_max_datagram_frame_size,
@@ -535,6 +560,7 @@ impl fmt::Debug for TransportConfig {
             .field("max_idle_timeout", max_idle_timeout)
             .field("stream_receive_window", stream_receive_window)
             .field("receive_window", receive_window)
+            .field("receive_window_autotune", receive_window_autotune)
             .field("send_window", send_window)
             .field("send_fairness", send_fairness)
             .field("packet_threshold", packet_threshold)
@@ -549,10 +575,7 @@ impl fmt::Debug for TransportConfig {
             .field("chrome_packet_numbers", chrome_packet_numbers)
             .field("chrome_no_coalescing", chrome_no_coalescing)
             .field("chrome_initial_crypto_split", chrome_initial_crypto_split)
-            .field(
-                "chrome_initial_payload_chaos",
-                chrome_initial_payload_chaos,
-            )
+            .field("chrome_initial_payload_chaos", chrome_initial_payload_chaos)
             .field(
                 "persistent_congestion_threshold",
                 persistent_congestion_threshold,
@@ -560,6 +583,7 @@ impl fmt::Debug for TransportConfig {
             .field("keep_alive_interval", keep_alive_interval)
             .field("crypto_buffer_size", crypto_buffer_size)
             .field("allow_spin", allow_spin)
+            .field("fixed_header_bits", fixed_header_bits)
             .field("datagram_receive_buffer_size", datagram_receive_buffer_size)
             .field("max_datagram_frame_size", max_datagram_frame_size)
             .field("omit_max_datagram_frame_size", omit_max_datagram_frame_size)

@@ -81,9 +81,7 @@ impl PacketBuilder {
         let chrome_packet_numbers = conn.side.is_client() && conn.config.chrome_packet_numbers;
         let cwnd_packets = if chrome_packet_numbers {
             const MIN_DATAGRAM_ROOM_FOR_SIZING: u64 = 40;
-            let sizing_unit = if conn.chrome_last_datagram_padding
-                >= MIN_DATAGRAM_ROOM_FOR_SIZING
-            {
+            let sizing_unit = if conn.chrome_last_datagram_padding >= MIN_DATAGRAM_ROOM_FOR_SIZING {
                 conn.chrome_last_datagram_padding
             } else {
                 u64::from(conn.path.current_mtu())
@@ -109,7 +107,9 @@ impl PacketBuilder {
             SpaceId::Data if space.crypto.is_some() => Header::Short {
                 dst_cid,
                 number,
-                spin: if conn.spin_enabled {
+                spin: if conn.config.fixed_header_bits {
+                    false
+                } else if conn.spin_enabled {
                     conn.spin
                 } else {
                     conn.rng.random()
@@ -142,7 +142,7 @@ impl PacketBuilder {
             }),
         };
         let partial_encode = header.encode(buffer);
-        if conn.peer_params.grease_quic_bit && conn.rng.random() {
+        if !conn.config.fixed_header_bits && conn.peer_params.grease_quic_bit && conn.rng.random() {
             buffer[partial_encode.start] ^= FIXED_BIT;
         }
 

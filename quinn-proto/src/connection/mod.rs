@@ -363,7 +363,8 @@ impl Connection {
                 config.send_window,
                 config.receive_window,
                 config.stream_receive_window,
-            ),
+            )
+            .with_receive_window_autotune(config.receive_window_autotune),
             datagrams: DatagramState::default(),
             config,
             rem_cids: CidQueue::new(rem_cid),
@@ -2943,7 +2944,11 @@ impl Connection {
                     self.read_crypto(SpaceId::Data, &frame, payload_len)?;
                 }
                 Frame::Stream(frame) => {
-                    if self.streams.received(frame, payload_len)?.should_transmit() {
+                    if self
+                        .streams
+                        .received(frame, payload_len, now)?
+                        .should_transmit()
+                    {
                         self.spaces[SpaceId::Data].pending.max_data = true;
                     }
                 }
@@ -3509,6 +3514,8 @@ impl Connection {
                 &mut sent.retransmits,
                 &mut self.stats.frame_tx,
                 max_size,
+                now,
+                self.path.rtt.smoothed(),
             );
         }
 

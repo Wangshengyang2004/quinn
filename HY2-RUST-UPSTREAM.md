@@ -12,6 +12,15 @@ The reference's license is retained in `LICENSE-HYSTERIA-RUST-PATCHES`.
 Chrome shaping is opt-in. QUIC packets remain separate within each UDP datagram;
 GSO batching resumes after handshake confirmation, matching quic-go. The original
 reference patch also disabled GSO, which was an unnecessary runtime cost.
+HY2 explicitly pins short-header spin/fixed bits to zero/one, including when a
+peer advertises fixed-bit GREASE. A post-handshake bulk-wire regression checks
+this independently of the Initial-flight oracle.
+Receive-window auto tuning is opt-in and ported from the pinned quic-go flow
+controllers under `LICENSE-QUIC-GO`: quarter-window credit updates, growth only
+after consuming more than half a window within the RTT-derived interval,
+doubling capped per stream/connection, and a 1.5x connection minimum when a
+stream grows. Epochs start on received data; unread or slow streams do not grow.
+The EasyTier adapter uses Chrome's initial 6/15 MiB and Hysteria's 8/20 MiB caps.
 Ordinary connections retain minimum-MTU padding and
 window pacing. HY2 configures BBR's profiles, 32-packet initial window,
 20,000-packet maximum and MTU scaling; ordinary callers retain byte-window defaults.

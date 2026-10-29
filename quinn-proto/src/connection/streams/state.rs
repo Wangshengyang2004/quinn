@@ -8,12 +8,13 @@ use bytes::BufMut;
 use rustc_hash::FxHashMap;
 use tracing::{debug, error, trace};
 
+use super::autotune::AutoTune;
 use super::{
     PendingStreamsQueue, Recv, Retransmits, Send, SendState, ShouldTransmit, StreamEvent,
     StreamHalf, ThinRetransmits,
 };
 use crate::{
-    Dir, MAX_STREAM_COUNT, Side, StreamId, TransportError, VarInt,
+    Dir, Duration, Instant, MAX_STREAM_COUNT, Side, StreamId, TransportError, VarInt,
     coding::BufMutExt,
     connection::stats::FrameStats,
     frame::{self, FrameStruct, StreamMetaVec},
@@ -112,6 +113,9 @@ pub struct StreamsState {
     pub(super) max_data: u64,
     /// The initial receive window
     receive_window: u64,
+    receive_autotune: Option<AutoTune>,
+    stream_receive_maximum: Option<u64>,
+    data_read: u64,
     /// Limit on incoming data, which is transmitted through `MAX_DATA` frames
     local_max_data: u64,
     /// The last value of `MAX_DATA` which had been queued for transmission in
@@ -174,6 +178,9 @@ impl StreamsState {
             connection_blocked: Vec::new(),
             max_data: 0,
             receive_window: receive_window.into(),
+            receive_autotune: None,
+            stream_receive_maximum: None,
+            data_read: 0,
             local_max_data: receive_window.into(),
             sent_max_data: receive_window,
             data_sent: 0,
@@ -195,6 +202,14 @@ impl StreamsState {
         }
 
         this
+    }
+
+    pub(crate) fn with_receive_window_autotune(mut self, limits: Option<(VarInt, VarInt)>) -> Self {
+        if let Some((stream, connection)) = limits {
+            self.receive_autotune = Some(AutoTune::new(self.receive_window, connection.into()));
+            self.stream_receive_maximum = Some(stream.into());
+        }
+        self
     }
 
     pub(crate) fn set_params(&mut self, params: &TransportParameters) {
@@ -261,6 +276,7 @@ impl StreamsState {
         &mut self,
         frame: frame::Stream,
         payload_len: usize,
+        now: Instant,
     ) -> Result<ShouldTransmit, TransportError> {
         let id = frame.id;
         self.validate_receive_id(id).inspect_err(|_e| {
@@ -286,6 +302,15 @@ impl StreamsState {
 
         let (new_bytes, closed) =
             rs.ingest(frame, payload_len, self.data_recvd, self.local_max_data)?;
+        if let Some(maximum) = self.stream_receive_maximum {
+            let tune = rs
+                .autotune
+                .get_or_insert_with(|| AutoTune::new(self.stream_receive_window, maximum));
+            if new_bytes != 0 {
+                tune.start(now);
+                self.receive_autotune.as_mut().unwrap().start(now);
+            }
+        }
         self.data_recvd = self.data_recvd.saturating_add(new_bytes);
 
         if !rs.stopped {
@@ -441,6 +466,8 @@ impl StreamsState {
         retransmits: &mut ThinRetransmits,
         stats: &mut FrameStats,
         max_size: usize,
+        now: Instant,
+        rtt: Option<Duration>,
     ) {
         // RESET_STREAM
         while buf.len() + frame::ResetStream::SIZE_BOUND < max_size {
@@ -489,6 +516,15 @@ impl StreamsState {
         if pending.max_data && buf.len() + 9 < max_size {
             pending.max_data = false;
 
+            if let Some(tune) = &mut self.receive_autotune {
+                if self.local_max_data - self.sent_max_data.into_inner() >= self.receive_window / 4
+                    && tune.grow(self.data_read, now, rtt)
+                {
+                    let window = tune.window;
+                    self.set_receive_window(VarInt::try_from(window).unwrap());
+                }
+            }
+
             // `local_max_data` can grow bigger than `VarInt`.
             // For transmission inside QUIC frames we need to clamp it to the
             // maximum allowed `VarInt` size.
@@ -529,6 +565,15 @@ impl StreamsState {
             }
             retransmits.get_or_create().max_stream_data.insert(id);
 
+            let grew = if rs.max_stream_data(self.stream_receive_window).1.0 {
+                let read = rs.assembler.bytes_read();
+                rs.autotune
+                    .as_mut()
+                    .and_then(|tune| tune.grow(read, now, rtt).then_some(tune.window))
+            } else {
+                None
+            };
+
             let (max, _) = rs.max_stream_data(self.stream_receive_window);
             rs.record_sent_max_stream_data(max);
 
@@ -537,6 +582,14 @@ impl StreamsState {
             buf.write(id);
             buf.write_var(max);
             stats.max_stream_data += 1;
+
+            if let (Some(window), Some(tune)) = (grew, &mut self.receive_autotune) {
+                if tune.ensure_minimum(window + window / 2, self.data_read, now) {
+                    let window = tune.window;
+                    self.set_receive_window(VarInt::try_from(window).unwrap());
+                    pending.max_data = true;
+                }
+            }
         }
 
         // MAX_STREAMS
@@ -938,6 +991,9 @@ impl StreamsState {
     /// expanded or shrunk: true if expanded, false if shrunk.
     pub(crate) fn set_receive_window(&mut self, receive_window: VarInt) -> bool {
         let receive_window = receive_window.into();
+        if let Some(tune) = &mut self.receive_autotune {
+            tune.set_window(receive_window, self.data_read);
+        }
         let mut expanded = false;
         if receive_window > self.receive_window {
             self.local_max_data = self
@@ -974,6 +1030,7 @@ impl StreamsState {
     /// suppress sending further updates until the window increases significantly
     /// again.
     pub(super) fn add_read_credits(&mut self, credits: u64) -> ShouldTransmit {
+        self.data_read = self.data_read.saturating_add(credits);
         if credits > self.receive_window_shrink_debt {
             let net_credits = credits - self.receive_window_shrink_debt;
             self.local_max_data = self.local_max_data.saturating_add(net_credits);
@@ -992,7 +1049,12 @@ impl StreamsState {
         // the decision, to accommodate for connection using bigger windows requiring
         // less updates.
         let diff = self.local_max_data - self.sent_max_data.into_inner();
-        ShouldTransmit(diff >= (self.receive_window / 8))
+        let divisor = if self.receive_autotune.is_some() {
+            4
+        } else {
+            8
+        };
+        ShouldTransmit(diff >= (self.receive_window / divisor))
     }
 
     /// Update counters for removal of a stream
@@ -1070,6 +1132,92 @@ mod tests {
             (1024 * 1024u32).into(),
             (1024 * 1024u32).into(),
         )
+    }
+
+    #[test]
+    fn autotune_credit_updates_follow_read_rate_and_preserve_stream_reuse() {
+        for (elapsed_ms, stream_cap, consumed, expected_stream, expected_connection) in [
+            (100, 800, 450, 800, 1200), // Stream growth raises the connection minimum.
+            (400, 800, 450, 600, 1000), // Slow reader keeps both initial windows.
+            (100, 600, 600, 600, 2000), // Connection growth independently reaches its cap.
+        ] {
+            let now = Instant::now();
+            let mut state = StreamsState::new(
+                Side::Server,
+                1u32.into(),
+                0u32.into(),
+                10000,
+                1000u32.into(),
+                600u32.into(),
+            )
+            .with_receive_window_autotune(Some((VarInt::from_u32(stream_cap), 2000u32.into())));
+            let id = StreamId::new(Side::Client, Dir::Uni, 0);
+            let received = state
+                .received(
+                    frame::Stream {
+                        id,
+                        offset: 0,
+                        fin: false,
+                        data: Bytes::from(vec![0; consumed]),
+                    },
+                    consumed,
+                    now,
+                )
+                .unwrap();
+            assert!(!received.should_transmit());
+            let mut pending = Retransmits::default();
+            {
+                let mut recv = RecvStream {
+                    id,
+                    state: &mut state,
+                    pending: &mut pending,
+                };
+                let mut chunks = recv.read(true).unwrap();
+                assert_eq!(
+                    chunks.next(consumed).unwrap().unwrap().bytes.len(),
+                    consumed
+                );
+                assert!(chunks.finalize().0);
+            }
+            assert!(pending.max_stream_data.contains(&id));
+            assert!(pending.max_data);
+            let mut wire = Vec::new();
+            state.write_control_frames(
+                &mut wire,
+                &mut pending,
+                &mut ThinRetransmits::default(),
+                &mut FrameStats::default(),
+                1200,
+                now + Duration::from_millis(elapsed_ms),
+                Some(Duration::from_millis(100)),
+            );
+            assert_eq!(state.receive_window, expected_connection);
+            let rs = state
+                .recv
+                .get_mut(&id)
+                .unwrap()
+                .as_mut()
+                .unwrap()
+                .as_open_recv_mut()
+                .unwrap();
+            assert_eq!(rs.autotune.as_ref().unwrap().window, expected_stream);
+            assert_eq!(rs.max_stream_data(600).0, consumed as u64 + expected_stream);
+            assert!(
+                !rs.max_stream_data(600).1.0,
+                "announced credit is not immediately requeued"
+            );
+            let recv = state.recv.remove(&id).flatten().unwrap();
+            state.stream_recv_freed(id, recv);
+            let next = StreamId::new(Side::Client, Dir::Uni, 1);
+            let reused = state.recv.get(&next).unwrap().as_ref().unwrap();
+            let StreamRecv::Free(reused) = reused else {
+                panic!("stream was not recycled")
+            };
+            assert!(
+                reused.autotune.is_none(),
+                "a new stream starts at its initial window"
+            );
+        }
     }
 
     #[test]
@@ -1228,7 +1376,8 @@ mod tests {
                         fin: true,
                         data: Bytes::from_static(&[0; MESSAGE_SIZE]),
                     },
-                    2048
+                    2048,
+                    crate::Instant::now(),
                 )
                 .unwrap(),
             ShouldTransmit(false)
@@ -1269,7 +1418,8 @@ mod tests {
                         fin: false,
                         data: Bytes::from_static(&[0; 2048]),
                     },
-                    2048
+                    2048,
+                    crate::Instant::now(),
                 )
                 .unwrap(),
             ShouldTransmit(false)
@@ -1332,7 +1482,8 @@ mod tests {
                         fin: false,
                         data: Bytes::from_static(&[0; 0]),
                     },
-                    0
+                    0,
+                    crate::Instant::now(),
                 )
                 .unwrap(),
             ShouldTransmit(false)
@@ -1395,7 +1546,8 @@ mod tests {
                         fin: false,
                         data: Bytes::from_static(&[0; 32]),
                     },
-                    32
+                    32,
+                    crate::Instant::now(),
                 )
                 .unwrap(),
             ShouldTransmit(false)
@@ -1427,7 +1579,8 @@ mod tests {
                         fin: true,
                         data: Bytes::from_static(&[0; 16]),
                     },
-                    16
+                    16,
+                    crate::Instant::now(),
                 )
                 .unwrap(),
             ShouldTransmit(false)
@@ -1452,7 +1605,8 @@ mod tests {
                             fin: false,
                             data: Bytes::from_static(&[0; 32])
                         },
-                        32
+                        32,
+                        crate::Instant::now(),
                     )
                     .unwrap(),
                 ShouldTransmit(false)
@@ -1896,6 +2050,7 @@ mod tests {
                     data: Bytes::from_static(&[0; 32]),
                 },
                 32,
+                crate::Instant::now(),
             )
             .unwrap();
         let mut pending = Retransmits::default();
@@ -1950,7 +2105,8 @@ mod tests {
                     fin: true,
                     data: Bytes::from_static(&[]),
                 },
-                0
+                0,
+                crate::Instant::now(),
             ),
             Ok(ShouldTransmit(false))
         );
@@ -1964,7 +2120,8 @@ mod tests {
                         fin: true,
                         data: Bytes::from_static(&[]),
                     },
-                    0
+                    0,
+                    crate::Instant::now(),
                 )
                 .unwrap_err()
                 .code,
@@ -1989,7 +2146,8 @@ mod tests {
                     fin: true,
                     data: Bytes::from_static(&[]),
                 },
-                0
+                0,
+                crate::Instant::now(),
             ),
             Ok(ShouldTransmit(false))
         );
@@ -2007,7 +2165,8 @@ mod tests {
                     fin: true,
                     data: Bytes::from_static(&[]),
                 },
-                0
+                0,
+                crate::Instant::now(),
             ),
             Ok(ShouldTransmit(false))
         );
@@ -2021,7 +2180,8 @@ mod tests {
                         fin: true,
                         data: Bytes::from_static(&[]),
                     },
-                    0
+                    0,
+                    crate::Instant::now(),
                 )
                 .unwrap_err()
                 .code,
@@ -2040,7 +2200,8 @@ mod tests {
                     fin: true,
                     data: Bytes::from_static(&[]),
                 },
-                0
+                0,
+                crate::Instant::now(),
             ),
             Ok(ShouldTransmit(false))
         );
@@ -2058,7 +2219,8 @@ mod tests {
                     fin: true,
                     data: Bytes::from_static(&[]),
                 },
-                0
+                0,
+                crate::Instant::now(),
             ),
             Ok(ShouldTransmit(false))
         );
@@ -2085,7 +2247,8 @@ mod tests {
                         fin: true,
                         data: Bytes::from_static(&[]),
                     },
-                    0
+                    0,
+                    crate::Instant::now(),
                 )
                 .unwrap_err()
                 .code,
@@ -2118,7 +2281,8 @@ mod tests {
                     fin: true,
                     data: Bytes::from_static(&[]),
                 },
-                0
+                0,
+                crate::Instant::now(),
             ),
             Ok(ShouldTransmit(false))
         );

@@ -14,6 +14,7 @@ use crate::{
     frame,
 };
 
+mod autotune;
 mod recv;
 use recv::Recv;
 pub use recv::{Chunks, ReadError, ReadableError};

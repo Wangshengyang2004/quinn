@@ -325,6 +325,10 @@ impl RttEstimator {
         self.smoothed.unwrap_or(self.latest)
     }
 
+    pub(super) fn smoothed(&self) -> Option<Duration> {
+        self.smoothed
+    }
+
     /// Most recent RTT sample, ignoring the peer's reported ACK delay.
     pub fn latest(&self) -> Duration {
         self.latest
