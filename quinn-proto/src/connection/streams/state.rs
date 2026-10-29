@@ -335,6 +335,7 @@ impl StreamsState {
     pub fn received_reset(
         &mut self,
         frame: frame::ResetStream,
+        now: Instant,
     ) -> Result<ShouldTransmit, TransportError> {
         let frame::ResetStream {
             id,
@@ -381,6 +382,9 @@ impl StreamsState {
 
         // Update connection-level flow control
         Ok(if credited != final_offset.into_inner() {
+            if let Some(tune) = &mut self.receive_autotune {
+                tune.start(now);
+            }
             // credited is always <= end, so this won't underflow.
             self.data_recvd = self
                 .data_recvd
@@ -1221,6 +1225,45 @@ mod tests {
     }
 
     #[test]
+    fn autotune_epoch_includes_data_abandoned_by_first_reset() {
+        for (elapsed_ms, expected) in [(100, 2000), (300, 1000)] {
+            let now = Instant::now();
+            let mut state = StreamsState::new(
+                Side::Server,
+                1u32.into(),
+                0u32.into(),
+                10000,
+                1000u32.into(),
+                1000u32.into(),
+            )
+            .with_receive_window_autotune(Some((2000u32.into(), 2000u32.into())));
+            let credit = state
+                .received_reset(
+                    frame::ResetStream {
+                        id: StreamId::new(Side::Client, Dir::Uni, 0),
+                        error_code: 0u32.into(),
+                        final_offset: 600u32.into(),
+                    },
+                    now,
+                )
+                .unwrap();
+            assert!(credit.should_transmit());
+            let mut pending = Retransmits::default();
+            pending.max_data = true;
+            state.write_control_frames(
+                &mut Vec::new(),
+                &mut pending,
+                &mut ThinRetransmits::default(),
+                &mut FrameStats::default(),
+                1200,
+                now + Duration::from_millis(elapsed_ms),
+                Some(Duration::from_millis(100)),
+            );
+            assert_eq!(state.receive_window, expected);
+        }
+    }
+
+    #[test]
     fn send_window_retains_selectively_acked_data() {
         let mut server = make(Side::Server);
         server.send_window = 24;
@@ -1440,11 +1483,14 @@ mod tests {
         assert_eq!(client.local_max_data - initial_max, 1024);
         assert_eq!(
             client
-                .received_reset(frame::ResetStream {
-                    id,
-                    error_code: 0u32.into(),
-                    final_offset: 4096u32.into(),
-                })
+                .received_reset(
+                    frame::ResetStream {
+                        id,
+                        error_code: 0u32.into(),
+                        final_offset: 4096u32.into(),
+                    },
+                    crate::Instant::now(),
+                )
                 .unwrap(),
             ShouldTransmit(false)
         );
@@ -1492,11 +1538,14 @@ mod tests {
         assert_eq!(client.local_max_data - initial_max, 0);
         assert_eq!(
             client
-                .received_reset(frame::ResetStream {
-                    id,
-                    error_code: 0u32.into(),
-                    final_offset: 4096u32.into(),
-                })
+                .received_reset(
+                    frame::ResetStream {
+                        id,
+                        error_code: 0u32.into(),
+                        final_offset: 4096u32.into(),
+                    },
+                    crate::Instant::now(),
+                )
                 .unwrap(),
             ShouldTransmit(false)
         );
@@ -1510,22 +1559,28 @@ mod tests {
         let id = StreamId::new(Side::Server, Dir::Uni, 0);
         assert_eq!(
             client
-                .received_reset(frame::ResetStream {
-                    id,
-                    error_code: 0u32.into(),
-                    final_offset: 4096u32.into(),
-                })
+                .received_reset(
+                    frame::ResetStream {
+                        id,
+                        error_code: 0u32.into(),
+                        final_offset: 4096u32.into(),
+                    },
+                    crate::Instant::now(),
+                )
                 .unwrap(),
             ShouldTransmit(false)
         );
         assert_eq!(client.data_recvd, 4096);
         assert_eq!(
             client
-                .received_reset(frame::ResetStream {
-                    id,
-                    error_code: 0u32.into(),
-                    final_offset: 4096u32.into(),
-                })
+                .received_reset(
+                    frame::ResetStream {
+                        id,
+                        error_code: 0u32.into(),
+                        final_offset: 4096u32.into(),
+                    },
+                    crate::Instant::now(),
+                )
                 .unwrap(),
             ShouldTransmit(false)
         );
@@ -1628,11 +1683,14 @@ mod tests {
             let prev_max = client.max_remote[Dir::Uni as usize];
             assert_eq!(
                 client
-                    .received_reset(frame::ResetStream {
-                        id,
-                        error_code: 0u32.into(),
-                        final_offset: final_offset.into(),
-                    })
+                    .received_reset(
+                        frame::ResetStream {
+                            id,
+                            error_code: 0u32.into(),
+                            final_offset: final_offset.into(),
+                        },
+                        crate::Instant::now(),
+                    )
                     .unwrap(),
                 ShouldTransmit(false)
             );
@@ -1696,11 +1754,14 @@ mod tests {
         let mut client = make(Side::Client);
         assert_eq!(
             client
-                .received_reset(frame::ResetStream {
-                    id: StreamId::new(Side::Server, Dir::Uni, 0),
-                    error_code: 0u32.into(),
-                    final_offset: VarInt::MAX,
-                })
+                .received_reset(
+                    frame::ResetStream {
+                        id: StreamId::new(Side::Server, Dir::Uni, 0),
+                        error_code: 0u32.into(),
+                        final_offset: VarInt::MAX,
+                    },
+                    crate::Instant::now(),
+                )
                 .unwrap_err()
                 .code,
             TransportErrorCode::FLOW_CONTROL_ERROR
@@ -2257,11 +2318,14 @@ mod tests {
 
         // Free stream 126
         assert_eq!(
-            client.received_reset(frame::ResetStream {
-                id: StreamId::new(Side::Server, Dir::Uni, 126),
-                error_code: 0u32.into(),
-                final_offset: 0u32.into(),
-            }),
+            client.received_reset(
+                frame::ResetStream {
+                    id: StreamId::new(Side::Server, Dir::Uni, 126),
+                    error_code: 0u32.into(),
+                    final_offset: 0u32.into(),
+                },
+                crate::Instant::now(),
+            ),
             Ok(ShouldTransmit(false))
         );
         let mut pending = Retransmits::default();

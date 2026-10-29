@@ -2994,7 +2994,7 @@ impl Connection {
                     self.streams.received_max_streams(dir, count)?;
                 }
                 Frame::ResetStream(frame) => {
-                    if self.streams.received_reset(frame)?.should_transmit() {
+                    if self.streams.received_reset(frame, now)?.should_transmit() {
                         self.spaces[SpaceId::Data].pending.max_data = true;
                     }
                 }

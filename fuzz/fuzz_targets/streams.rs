@@ -60,7 +60,7 @@ fuzz_target!(|input: (StreamParams, Vec<Operation>)| {
             Operation::ReceivedReset(rs) => {
                 let _ = Streams::new(&mut state, &conn_state)
                     .state()
-                    .received_reset(rs);
+                    .received_reset(rs, std::time::Instant::now());
             }
             Operation::Reset(id) => {
                 let _ =
