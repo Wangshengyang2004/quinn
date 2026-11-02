@@ -534,7 +534,10 @@ impl Connection {
         let mut pad_datagram = false;
         let mut pad_datagram_to_mtu = false;
         let mut congestion_blocked = false;
-        let no_coalescing = self.side.is_client() && self.config.chrome_no_coalescing;
+        // A close flight must cover all available encryption levels. Splitting
+        // it here would restart at the lowest level on every poll, never reach
+        // the highest space, and never clear `self.close`.
+        let no_coalescing = !close && self.side.is_client() && self.config.chrome_no_coalescing;
         let minimum_initial_size =
             if self.side.is_client() && self.config.chrome_initial_crypto_split {
                 self.config.initial_mtu

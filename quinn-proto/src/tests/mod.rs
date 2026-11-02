@@ -166,22 +166,47 @@ fn close_before_handshake_confirmation(chrome: bool, max_datagrams: usize) {
     // client has 1-RTT keys while Handshake keys remain unconfirmed.
     pair.client.drive_outgoing(pair.time);
     assert!(!pair.client_conn_mut(client).is_handshaking());
+    pair.client_conn_mut(client).ping();
+    pair.drive_client();
+    pair.drive_server();
+    let server = pair.server.assert_accept();
+    // Withhold the server's HANDSHAKE_DONE from the client. The server has
+    // discarded Handshake keys, so it must receive the 1-RTT close as well.
     let now = pair.time;
     let conn = pair.client_conn_mut(client);
     conn.close(now, VarInt::from_u32(42), Bytes::from_static(b"closing"));
     let mut buf = Vec::new();
     let mut transmits = 0;
+    let mut idle = false;
+    let mut flight = Vec::new();
     // A driver normally polls until None. Keep this regression bounded even
     // when a broken close flight repeatedly emits the same encryption level.
     for _ in 0..8 {
         buf.clear();
         if conn.poll_transmit(now, max_datagrams, &mut buf).is_none() {
             assert!(transmits > 0, "close must emit a close flight");
-            return;
+            idle = true;
+            break;
         }
+        flight.push(BytesMut::from(&buf[..]));
         transmits += 1;
     }
-    panic!("close flight never becomes idle (chrome={chrome}, max_datagrams={max_datagrams})");
+    assert!(
+        idle,
+        "close flight never becomes idle (chrome={chrome}, max_datagrams={max_datagrams})"
+    );
+    for bytes in flight {
+        pair.server.inbound.push_back((now, None, bytes));
+    }
+    pair.drive_server();
+    let mut received = false;
+    while let Some(event) = pair.server_conn_mut(server).poll() {
+        if let Event::ConnectionLost { reason } = event {
+            assert_matches!(reason, ConnectionError::ApplicationClosed(close) if close.error_code == VarInt::from_u32(42));
+            received = true;
+        }
+    }
+    assert!(received, "peer must receive the application close");
 }
 
 #[test]
