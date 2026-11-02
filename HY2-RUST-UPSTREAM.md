@@ -9,9 +9,13 @@ and BBR profile controls are rebased from `crapthings/hysteria-rust`
 Hysteria 2.13.0 and quic-go `a10df75c260c` are the compatibility oracle.
 The reference's license is retained in `LICENSE-HYSTERIA-RUST-PATCHES`.
 
-Chrome shaping is opt-in. QUIC packets remain separate within each UDP datagram;
+Chrome shaping is opt-in. Normal QUIC packets remain separate within each UDP datagram;
 GSO batching resumes after handshake confirmation, matching quic-go. The original
 reference patch also disabled GSO, which was an unnecessary runtime cost.
+Closing flights coalesce the available encryption levels, as quic-go's dedicated
+close packer does. This lets a client awaiting handshake confirmation send its
+1-RTT close even after its peer has discarded Handshake keys. Bounded regressions
+cover both GSO and single-datagram polling and verify peer application-close delivery.
 HY2 explicitly pins short-header spin/fixed bits to zero/one, including when a
 peer advertises fixed-bit GREASE. A post-handshake bulk-wire regression checks
 this independently of the Initial-flight oracle.
