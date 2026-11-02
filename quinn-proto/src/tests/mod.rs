@@ -152,6 +152,53 @@ fn chrome_client_sends_client_hello_head_and_tail_before_middle() {
     );
 }
 
+fn close_before_handshake_confirmation(chrome: bool, max_datagrams: usize) {
+    let mut pair = Pair::default();
+    let mut config = client_config();
+    Arc::get_mut(&mut config.transport)
+        .unwrap()
+        .chrome_no_coalescing(chrome);
+    let client = pair.begin_connect(config);
+    pair.drive_client();
+    pair.drive_server();
+    pair.client.drive_incoming(pair.time, pair.server.addr);
+    // Send the client's final flight, but withhold it from the server. The
+    // client has 1-RTT keys while Handshake keys remain unconfirmed.
+    pair.client.drive_outgoing(pair.time);
+    assert!(!pair.client_conn_mut(client).is_handshaking());
+    let now = pair.time;
+    let conn = pair.client_conn_mut(client);
+    conn.close(now, VarInt::from_u32(42), Bytes::from_static(b"closing"));
+    let mut buf = Vec::new();
+    let mut transmits = 0;
+    // A driver normally polls until None. Keep this regression bounded even
+    // when a broken close flight repeatedly emits the same encryption level.
+    for _ in 0..8 {
+        buf.clear();
+        if conn.poll_transmit(now, max_datagrams, &mut buf).is_none() {
+            assert!(transmits > 0, "close must emit a close flight");
+            return;
+        }
+        transmits += 1;
+    }
+    panic!("close flight never becomes idle (chrome={chrome}, max_datagrams={max_datagrams})");
+}
+
+#[test]
+fn ordinary_close_before_handshake_confirmation_is_bounded() {
+    close_before_handshake_confirmation(false, 10);
+}
+
+#[test]
+fn chrome_close_before_handshake_confirmation_is_bounded() {
+    close_before_handshake_confirmation(true, 10);
+}
+
+#[test]
+fn chrome_close_before_handshake_confirmation_without_gso_is_bounded() {
+    close_before_handshake_confirmation(true, 1);
+}
+
 #[derive(Debug)]
 struct ChromeInitialWireShape {
     packet_number: u64,
