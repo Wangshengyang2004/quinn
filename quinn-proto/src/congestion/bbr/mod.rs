@@ -592,7 +592,11 @@ impl Controller for Bbr {
             }
         }
 
-        self.update_recovery_state(is_round_start);
+        // Match quic-go: only newly acknowledged congestion-controlled packets
+        // advance recovery. A loss-only event still updates the existing window below.
+        if largest_packet_num_acked.is_some() {
+            self.update_recovery_state(is_round_start);
+        }
 
         if self.mode == Mode::ProbeBw {
             self.update_gain_cycle_phase(now, in_flight);
@@ -1489,6 +1493,79 @@ mod profile_tests {
         bbr.is_at_full_bandwidth = true;
         bbr.update_recovery_state(false);
         assert_eq!(bbr.recovery_state, RecoveryState::Conservation);
+    }
+
+    #[test]
+    fn loss_only_event_does_not_enter_recovery() {
+        let now = Instant::now();
+        let mut bbr = Bbr::new(Arc::new(BbrConfig::default()), 1200);
+        bbr.is_at_full_bandwidth = true;
+        bbr.mode = Mode::ProbeBw;
+        bbr.min_rtt = Duration::from_millis(100);
+        bbr.min_rtt_timestamp = Some(now);
+        bbr.on_sent(now, 1200, 10, 1200);
+        bbr.on_packet_lost(10, 1200);
+        bbr.on_congestion_event(now, now, false, 1200, 1, Some(10), Some(2400));
+
+        bbr.on_end_acks(now, 1200, false, None);
+
+        assert_eq!(bbr.recovery_state, RecoveryState::NotInRecovery);
+        assert_eq!(bbr.end_recovery_at_packet_number, 0);
+        assert_eq!(bbr.recovery_window, 0);
+        assert_eq!(bbr.loss_state.lost_bytes, 0);
+    }
+
+    #[test]
+    fn loss_only_event_keeps_recovery_boundary_and_accounts_lost_bytes() {
+        let now = Instant::now();
+        let mut bbr = Bbr::new(Arc::new(BbrConfig::default()), 1200);
+        bbr.is_at_full_bandwidth = true;
+        bbr.mode = Mode::ProbeBw;
+        bbr.min_rtt = Duration::from_millis(100);
+        bbr.min_rtt_timestamp = Some(now);
+        bbr.recovery_state = RecoveryState::Growth;
+        bbr.end_recovery_at_packet_number = 5;
+        bbr.recovery_window = 24_000;
+        bbr.on_sent(now, 1200, 10, 1200);
+        bbr.on_packet_lost(10, 1200);
+        bbr.on_congestion_event(now, now, false, 1200, 1, Some(10), Some(2400));
+
+        bbr.on_end_acks(now, 1200, false, None);
+
+        assert_eq!(bbr.recovery_state, RecoveryState::Growth);
+        assert_eq!(bbr.end_recovery_at_packet_number, 5);
+        assert_eq!(bbr.recovery_window, 22_800);
+        assert_eq!(bbr.loss_state.lost_bytes, 0);
+    }
+
+    #[test]
+    fn ack_and_loss_event_still_enters_recovery() {
+        let now = Instant::now();
+        let ack_at = now + Duration::from_millis(100);
+        let mut bbr = Bbr::new(Arc::new(BbrConfig::default()), 1200);
+        bbr.is_at_full_bandwidth = true;
+        bbr.mode = Mode::ProbeBw;
+        bbr.min_rtt = Duration::from_millis(100);
+        bbr.min_rtt_timestamp = Some(now);
+        bbr.on_sent(now, 1200, 10, 1200);
+        bbr.on_sent(now, 1200, 11, 2400);
+        bbr.on_ack(
+            ack_at,
+            now,
+            10,
+            1200,
+            1200,
+            false,
+            &RttEstimator::new(Duration::from_millis(100)),
+        );
+        bbr.on_packet_lost(11, 1200);
+        bbr.on_congestion_event(ack_at, now, false, 1200, 1, Some(11), Some(3600));
+
+        bbr.on_end_acks(ack_at, 1200, false, Some(10));
+
+        assert_eq!(bbr.recovery_state, RecoveryState::Conservation);
+        assert_eq!(bbr.end_recovery_at_packet_number, 11);
+        assert_eq!(bbr.recovery_window, bbr.min_cwnd);
     }
 
     #[test]

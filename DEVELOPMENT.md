@@ -29,6 +29,13 @@ These are protocol grouping fields, with no application peer-ID guarantee.
 Retry can change the Initial CID observed by the accepting endpoint. No payload or keys are
 included in these additional events.
 
+BBR advances recovery state and its recovery boundary only when an event
+acknowledges a new congestion-controlled packet, matching Hysteria 2.13.0's
+`OnCongestionEventEx`. Loss-only events still update an existing recovery window
+and account for lost bytes. Regressions cover a loss-only event outside recovery,
+a loss-only event during growth, and an ACK/loss batch that enters recovery.
+This behavior alignment does not establish a throughput improvement.
+
 EasyTier selects an exact Git revision in Cargo.toml and Cargo.lock. Updating
 this branch alone does not update its consumer. Validate both protocol and
 consumer paths before changing the pin or deploying. Historical experiments
