@@ -17,6 +17,18 @@ serialized-event regression covers the threshold boundary and all three packet
 number spaces. This corrects diagnostic labels; loss detection, congestion
 control, and retransmission behavior are unchanged.
 
+Packet diagnostics at TRACE carry their connection grouping ID and packet-number
+space as event fields. Sent / authenticated received packets include the packet
+number, ACK events retain ranges and delay, and declared-loss events include the
+congestion-accounted size and elapsed / threshold timing. This remains usable by
+an event-only subscriber that drops tracing spans. Capture is opt-in through the
+host logger; enabled TRACE can be expensive and is not a capacity benchmark.
+The connection field uses the original Initial destination CID, which remains
+stable within the local connection; the side field separates both directions.
+These are protocol grouping fields, with no application peer-ID guarantee.
+Retry can change the Initial CID observed by the accepting endpoint. No payload or keys are
+included in these additional events.
+
 EasyTier selects an exact Git revision in Cargo.toml and Cargo.lock. Updating
 this branch alone does not update its consumer. Validate both protocol and
 consumer paths before changing the pin or deploying. Historical experiments

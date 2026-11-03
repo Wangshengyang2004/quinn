@@ -309,6 +309,14 @@ impl PacketBuilder {
         );
 
         let len = buffer.len() - encode_start;
+        trace!(
+            connection = %conn.initial_dst_cid,
+            side = ?conn.side.side(),
+            space = ?self.space,
+            packet_number = self.exact_number,
+            packet_length = len,
+            "packet sent"
+        );
         conn.config.qlog_sink.emit_packet_sent(
             self.exact_number,
             len,

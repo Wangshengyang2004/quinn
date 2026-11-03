@@ -1510,6 +1510,13 @@ impl Connection {
         if ack.largest >= self.spaces[space].next_packet_number {
             return Err(TransportError::PROTOCOL_VIOLATION("unsent packet acked"));
         }
+        trace!(
+            connection = %self.initial_dst_cid,
+            side = ?self.side.side(),
+            space = ?space,
+            ack = ?ack,
+            "ack received"
+        );
         let new_largest = {
             let space = &mut self.spaces[space];
             if space.largest_acked_packet.is_none_or(|pn| ack.largest > pn) {
@@ -1848,8 +1855,12 @@ impl Connection {
             self.stats.path.lost_packets += lost_packets.len() as u64;
             self.stats.path.lost_bytes += size_of_lost_packets;
             trace!(
-                "packets lost: {:?}, bytes lost: {}",
-                lost_packets, size_of_lost_packets
+                connection = %self.initial_dst_cid,
+                side = ?self.side.side(),
+                space = ?pn_space,
+                lost_packets = ?lost_packets,
+                lost_bytes = size_of_lost_packets,
+                "packets lost"
             );
 
             for &packet in &lost_packets {
@@ -1857,6 +1868,17 @@ impl Connection {
                 self.path
                     .congestion
                     .on_packet_lost(info.congestion_sequence, u64::from(info.size));
+                trace!(
+                    connection = %self.initial_dst_cid,
+                    side = ?self.side.side(),
+                    space = ?pn_space,
+                    packet_number = packet,
+                    congestion_bytes = info.size,
+                    elapsed_us = ?now.saturating_duration_since(info.time_sent).as_micros(),
+                    loss_delay_us = ?loss_delay.as_micros(),
+                    time_threshold = now.saturating_duration_since(info.time_sent) >= loss_delay,
+                    "packet declared lost"
+                );
                 self.config.qlog_sink.emit_packet_lost(
                     packet,
                     &info,
@@ -2071,6 +2093,13 @@ impl Connection {
             self.spin = self.side.is_client() ^ spin;
         }
 
+        trace!(
+            connection = %self.initial_dst_cid,
+            side = ?self.side.side(),
+            space = ?space_id,
+            packet_number = packet,
+            "packet received"
+        );
         self.config.qlog_sink.emit_packet_received(
             packet,
             space_id,
