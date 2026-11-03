@@ -74,6 +74,7 @@ web-time = { workspace = true }
 assert_matches = { workspace = true }
 hex-literal = { workspace = true  }
 rcgen = { workspace = true }
+serde_json = { workspace = true }
 tracing-subscriber = { workspace = true }
 lazy_static = "1"
 wasm-bindgen-test = { workspace = true }

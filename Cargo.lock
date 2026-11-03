@@ -2128,6 +2128,7 @@ dependencies = [
  "rustls",
  "rustls-pki-types",
  "rustls-platform-verifier",
+ "serde_json",
  "slab",
  "thiserror 2.0.20",
  "tinyvec",

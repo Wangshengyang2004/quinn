@@ -11,6 +11,12 @@ builds and default settings retain their existing contracts. The `hy2-rustls`
 feature requires EasyTier's TLS patch; default builds use official rustls.
 Adaptive loss thresholds and extended receive-history experiments remain archived.
 
+With qlog enabled, packet-loss events classify the time threshold using the
+elapsed time since transmission, matching the existing loss detector. The
+serialized-event regression covers the threshold boundary and all three packet
+number spaces. This corrects diagnostic labels; loss detection, congestion
+control, and retransmission behavior are unchanged.
+
 EasyTier selects an exact Git revision in Cargo.toml and Cargo.lock. Updating
 this branch alone does not update its consumer. Validate both protocol and
 consumer paths before changing the pin or deploying. Historical experiments

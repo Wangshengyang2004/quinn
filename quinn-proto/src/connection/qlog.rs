@@ -107,7 +107,7 @@ impl QlogSink {
                 }),
                 frames: None,
                 trigger: Some(
-                    match info.time_sent.saturating_duration_since(now) >= loss_delay {
+                    match now.saturating_duration_since(info.time_sent) >= loss_delay {
                         true => PacketLostTrigger::TimeThreshold,
                         false => PacketLostTrigger::ReorderingThreshold,
                     },
@@ -189,5 +189,88 @@ fn packet_type(space: SpaceId, is_0rtt: bool) -> PacketType {
         SpaceId::Handshake => PacketType::Handshake,
         SpaceId::Data if is_0rtt => PacketType::ZeroRtt,
         SpaceId::Data => PacketType::OneRtt,
+    }
+}
+
+#[cfg(all(test, feature = "qlog"))]
+mod tests {
+    use std::io::{self, Write};
+
+    use super::*;
+    use crate::QlogConfig;
+
+    #[derive(Clone, Default)]
+    struct Capture(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for Capture {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn packet_loss_trigger_matches_elapsed_send_time() {
+        let start = Instant::now();
+        let now = start + Duration::from_secs(1);
+        let loss_delay = Duration::from_millis(100);
+        let cases = [
+            (now, "reordering_threshold"),
+            (now - Duration::from_millis(99), "reordering_threshold"),
+            (now - loss_delay, "time_threshold"),
+            (now - Duration::from_millis(101), "time_threshold"),
+            (now + Duration::from_millis(101), "reordering_threshold"),
+        ];
+        let mut observed = Vec::new();
+        let mut expected = Vec::new();
+        for (space, packet_type) in [
+            (SpaceId::Initial, "initial"),
+            (SpaceId::Handshake, "handshake"),
+            (SpaceId::Data, "1RTT"),
+        ] {
+            for (time_sent, trigger) in cases {
+                let capture = Capture::default();
+                let mut config = QlogConfig::default();
+                config.writer(Box::new(capture.clone())).start_time(start);
+                let stream = config.into_stream().unwrap();
+                let sink = QlogSink::from(Some(stream));
+                let packet = SentPacket {
+                    congestion_sequence: 0,
+                    path_generation: 0,
+                    time_sent,
+                    size: 1234,
+                    bytes_in_flight_at_send: 1234,
+                    ack_eliciting: true,
+                    largest_acked: None,
+                    retransmits: Default::default(),
+                    stream_frames: Default::default(),
+                };
+                sink.emit_packet_lost(42, &packet, loss_delay, space, now, ConnectionId::new(&[1]));
+                drop(sink);
+                let bytes = capture.0.lock().unwrap();
+                let records: Vec<serde_json::Value> = bytes
+                    .split(|byte| *byte == 0x1e)
+                    .filter(|record| !record.is_empty())
+                    .map(|record| serde_json::from_slice(record).unwrap())
+                    .collect();
+                let events: Vec<_> = records
+                    .iter()
+                    .filter(|record| record["name"] == "recovery:packet_lost")
+                    .collect();
+                assert_eq!(events.len(), 1, "unexpected qlog records: {records:?}");
+                let event = events[0];
+                assert_eq!(event["data"]["header"]["packet_number"], 42);
+                assert_eq!(event["data"]["header"]["length"], 1234);
+                assert_eq!(event["data"]["header"]["packet_type"], packet_type);
+                assert_eq!(event["group_id"], "01");
+                observed.push(event["data"]["trigger"].as_str().unwrap().to_owned());
+                expected.push(trigger);
+            }
+        }
+        assert_eq!(observed, expected);
     }
 }
