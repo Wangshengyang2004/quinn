@@ -41,3 +41,20 @@ this branch alone does not update its consumer. Validate both protocol and
 consumer paths before changing the pin or deploying. Historical experiments
 remain under `archive/*` tags; restoring one does not authorize its integration.
 `dev` is the integration branch; preserve `main` and its history.
+
+An opt-in local send-credit policy reserves connection flow-control and send-buffer
+space for high-priority control streams and bounded initial exchanges on new
+streams. Bulk writes preserve both reserves at admission, before data enters QUIC
+buffers; priority scheduling alone cannot recover consumed MAX_DATA. Reserves
+are bounded by the peer's initial credit and current local send window. Blocked
+writers wake when their own class has credit, avoiding a busy loop.
+
+`low_credit_updates(true)` promptly returns consumed receive credit when at most
+one quarter of the advertised receive window remains. Both mechanisms are needed
+for sustained isolation: an older receiver still batches small reads, and an older
+sender still admits bulk data without a reserve. These options add no wire fields,
+change no advertised memory limits, and are disabled by default. EasyTier enables
+them only for its explicitly negotiated native TCP extension. Ordinary QUIC and
+standard HY2 keep their existing defaults. The bounded initial allowance does not
+guarantee completion of arbitrary-sized new responses or defeat backpressure on
+the control stream itself.

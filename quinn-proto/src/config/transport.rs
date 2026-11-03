@@ -12,6 +12,15 @@ use crate::{
     connection::qlog::QlogSink,
 };
 
+/// Local write-admission policy; never advertised to the peer.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SendCreditReserve {
+    pub(crate) priority: i32,
+    pub(crate) control: u64,
+    pub(crate) opening: u64,
+    pub(crate) opening_bytes: u64,
+}
+
 /// Parameters governing the core QUIC state machine
 ///
 /// Default values should be suitable for most internet applications. Applications protocols which
@@ -33,6 +42,8 @@ pub struct TransportConfig {
     pub(crate) receive_window_autotune: Option<(VarInt, VarInt)>,
     pub(crate) send_window: u64,
     pub(crate) send_fairness: bool,
+    pub(crate) send_credit_reserve: Option<SendCreditReserve>,
+    pub(crate) low_credit_updates: bool,
 
     pub(crate) packet_threshold: u32,
     pub(crate) time_threshold: f32,
@@ -69,6 +80,43 @@ pub struct TransportConfig {
 }
 
 impl TransportConfig {
+    /// Reserve connection flow-control credit and local send-buffer space at write admission.
+    ///
+    /// Streams with priority at least `priority` may use all available credit. Other streams
+    /// preserve `control` bytes; after their first `opening_bytes` bytes, they also preserve
+    /// `opening` bytes for the initial exchange on new streams. Each reserve is clamped to
+    /// one eighth of both the peer's initial connection credit and the local send window.
+    /// These are local budgets, with no new frames or transport parameters. Disabled by default.
+    ///
+    /// A receiver which batches credit updates can eventually exhaust even the reserved credit.
+    /// Protocols using this policy should enable timely updates on both endpoints with
+    /// [`Self::low_credit_updates`]. Older receivers retain their existing batching behavior.
+    pub fn send_credit_reserve(
+        &mut self,
+        priority: i32,
+        control: VarInt,
+        opening: VarInt,
+        opening_bytes: VarInt,
+    ) -> &mut Self {
+        self.send_credit_reserve = Some(SendCreditReserve {
+            priority,
+            control: control.into(),
+            opening: opening.into(),
+            opening_bytes: opening_bytes.into(),
+        });
+        self
+    }
+
+    /// Return consumed credit promptly when at most one quarter of the advertised receive
+    /// window remains, including small reads below the usual update batching threshold.
+    ///
+    /// This prevents control-stream credit starvation when other streams stop being read.
+    /// The memory bound and wire format are unchanged. Disabled by default.
+    pub fn low_credit_updates(&mut self, enabled: bool) -> &mut Self {
+        self.low_credit_updates = enabled;
+        self
+    }
+
     /// Maximum number of incoming bidirectional streams that may be open concurrently
     ///
     /// Must be nonzero for the peer to open any bidirectional streams.
@@ -476,6 +524,8 @@ impl Default for TransportConfig {
             receive_window_autotune: None,
             send_window: (8 * STREAM_RWND).into(),
             send_fairness: true,
+            send_credit_reserve: None,
+            low_credit_updates: false,
 
             packet_threshold: 3,
             time_threshold: 9.0 / 8.0,
@@ -524,6 +574,8 @@ impl fmt::Debug for TransportConfig {
             receive_window_autotune,
             send_window,
             send_fairness,
+            send_credit_reserve,
+            low_credit_updates,
             packet_threshold,
             time_threshold,
             initial_rtt,
@@ -563,6 +615,8 @@ impl fmt::Debug for TransportConfig {
             .field("receive_window_autotune", receive_window_autotune)
             .field("send_window", send_window)
             .field("send_fairness", send_fairness)
+            .field("send_credit_reserve", send_credit_reserve)
+            .field("low_credit_updates", low_credit_updates)
             .field("packet_threshold", packet_threshold)
             .field("time_threshold", time_threshold)
             .field("initial_rtt", initial_rtt)

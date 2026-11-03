@@ -364,7 +364,8 @@ impl Connection {
                 config.receive_window,
                 config.stream_receive_window,
             )
-            .with_receive_window_autotune(config.receive_window_autotune),
+            .with_receive_window_autotune(config.receive_window_autotune)
+            .with_send_credit_reserve(config.send_credit_reserve, config.low_credit_updates),
             datagrams: DatagramState::default(),
             config,
             rem_cids: CidQueue::new(rem_cid),

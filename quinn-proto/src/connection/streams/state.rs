@@ -111,6 +111,9 @@ pub struct StreamsState {
     pub(super) connection_blocked: Vec<StreamId>,
     /// Connection-level flow control budget dictated by the peer
     pub(super) max_data: u64,
+    initial_send_credit: u64,
+    send_credit_reserve: Option<crate::config::SendCreditReserve>,
+    low_credit_updates: bool,
     /// The initial receive window
     receive_window: u64,
     receive_autotune: Option<AutoTune>,
@@ -177,6 +180,9 @@ impl StreamsState {
             events: VecDeque::new(),
             connection_blocked: Vec::new(),
             max_data: 0,
+            initial_send_credit: 0,
+            send_credit_reserve: None,
+            low_credit_updates: false,
             receive_window: receive_window.into(),
             receive_autotune: None,
             stream_receive_maximum: None,
@@ -212,7 +218,18 @@ impl StreamsState {
         self
     }
 
+    pub(crate) fn with_send_credit_reserve(
+        mut self,
+        reserve: Option<crate::config::SendCreditReserve>,
+        low_credit_updates: bool,
+    ) -> Self {
+        self.send_credit_reserve = reserve;
+        self.low_credit_updates = low_credit_updates;
+        self
+    }
+
     pub(crate) fn set_params(&mut self, params: &TransportParameters) {
+        self.initial_send_credit = params.initial_max_data.into();
         self.initial_max_stream_data_uni = params.initial_max_stream_data_uni;
         self.initial_max_stream_data_bidi_local = params.initial_max_stream_data_bidi_local;
         self.initial_max_stream_data_bidi_remote = params.initial_max_stream_data_bidi_remote;
@@ -845,6 +862,10 @@ impl StreamsState {
 
     /// Handle increase to connection-level flow control limit
     pub(crate) fn received_max_data(&mut self, n: VarInt) {
+        // A peer may initially advertise no credit and grant its first window later.
+        if self.initial_send_credit == 0 {
+            self.initial_send_credit = n.into();
+        }
         self.max_data = self.max_data.max(n.into());
     }
 
@@ -866,7 +887,7 @@ impl StreamsState {
             })?;
         }
 
-        let write_limit = self.write_limit();
+        let write_limit = self.stream_write_limit(id);
         let max_send_data = self.max_send_data(id);
         if let Some(ss) = self
             .send
@@ -902,6 +923,29 @@ impl StreamsState {
             .min(self.send_window.saturating_sub(self.buffered_data))
     }
 
+    /// Write admission must preserve credit before data enters send buffers. Packet scheduling
+    /// priority alone cannot recover MAX_DATA already consumed by an unread bulk stream.
+    pub(super) fn stream_write_limit(&self, id: StreamId) -> u64 {
+        let available = self.write_limit();
+        let Some(policy) = self.send_credit_reserve else {
+            return available;
+        };
+        let stream = self.send.get(&id).and_then(|stream| stream.as_ref());
+        if stream.is_some_and(|stream| stream.priority >= policy.priority) {
+            return available;
+        }
+        let cap = self.initial_send_credit.min(self.send_window) / 8;
+        let control = policy.control.min(cap);
+        let offset = stream.map_or(0, |stream| stream.offset());
+        let opening_left = policy.opening_bytes.saturating_sub(offset);
+        if opening_left > 0 {
+            // A single large write must not carry its opening allowance into the bulk class.
+            available.saturating_sub(control).min(opening_left)
+        } else {
+            available.saturating_sub(control + policy.opening.min(cap))
+        }
+    }
+
     /// Yield stream events
     pub(crate) fn poll(&mut self) -> Option<StreamEvent> {
         if let Some(dir) = Dir::iter().find(|&i| mem::replace(&mut self.opened[i as usize], false))
@@ -909,21 +953,24 @@ impl StreamsState {
             return Some(StreamEvent::Opened { dir });
         }
 
-        if self.write_limit() > 0 {
-            while let Some(id) = self.connection_blocked.pop() {
-                let stream = match self.send.get_mut(&id).and_then(|s| s.as_mut()) {
-                    None => continue,
-                    Some(s) => s,
-                };
-
-                debug_assert!(stream.connection_blocked);
-                stream.connection_blocked = false;
-
-                // If it's no longer sensible to write to a stream (even to detect an error) then don't
-                // report it.
-                if stream.is_writable() && stream.max_data > stream.offset() {
-                    return Some(StreamEvent::Writable { id });
-                }
+        for index in (0..self.connection_blocked.len()).rev() {
+            let id = self.connection_blocked[index];
+            // Keep streams whose reserve still blocks them asleep. Waking them merely because
+            // the critical reserve is nonzero creates a write/poll busy loop.
+            let limit = self.stream_write_limit(id);
+            let Some(stream) = self.send.get_mut(&id).and_then(|s| s.as_mut()) else {
+                self.connection_blocked.swap_remove(index);
+                continue;
+            };
+            debug_assert!(stream.connection_blocked);
+            let writable = stream.is_writable() && stream.max_data > stream.offset();
+            if writable && limit == 0 {
+                continue;
+            }
+            stream.connection_blocked = false;
+            self.connection_blocked.swap_remove(index);
+            if writable {
+                return Some(StreamEvent::Writable { id });
             }
         }
 
@@ -1058,7 +1105,13 @@ impl StreamsState {
         } else {
             8
         };
-        ShouldTransmit(diff >= (self.receive_window / divisor))
+        let near_exhaustion = self.low_credit_updates
+            && self
+                .sent_max_data
+                .into_inner()
+                .saturating_sub(self.data_recvd)
+                <= self.receive_window / 4;
+        ShouldTransmit(diff >= (self.receive_window / divisor) || (near_exhaustion && diff > 0))
     }
 
     /// Update counters for removal of a stream
@@ -2428,6 +2481,159 @@ mod tests {
         assert_eq!(server.receive_window_shrink_debt, 0);
         assert_eq!(server.local_max_data, expected_local_max_data);
         assert!(should_transmit.should_transmit());
+    }
+
+    fn credit_reserve_state(peer_window: u32, send_window: u64) -> StreamsState {
+        let mut state = make(Side::Server).with_send_credit_reserve(
+            Some(crate::config::SendCreditReserve {
+                priority: 100,
+                control: 64,
+                opening: 128,
+                opening_bytes: 16,
+            }),
+            true,
+        );
+        state.send_window = send_window;
+        state.set_params(&TransportParameters {
+            initial_max_data: peer_window.into(),
+            initial_max_stream_data_uni: VarInt::MAX,
+            initial_max_streams_uni: 100u32.into(),
+            ..TransportParameters::default()
+        });
+        state
+    }
+
+    fn reserve_write(
+        state: &mut StreamsState,
+        id: StreamId,
+        len: usize,
+    ) -> Result<usize, WriteError> {
+        SendStream {
+            id,
+            state,
+            pending: &mut Retransmits::default(),
+            conn_state: &ConnState::Established,
+        }
+        .write(&vec![1; len])
+    }
+
+    fn reserve_open(state: &mut StreamsState) -> StreamId {
+        Streams {
+            state,
+            conn_state: &ConnState::Established,
+        }
+        .open(Dir::Uni)
+        .unwrap()
+    }
+
+    #[test]
+    fn credit_reserve_admits_opening_control_and_bulk_in_separate_budgets() {
+        let mut state = credit_reserve_state(2048, 8192);
+        let bulk = reserve_open(&mut state);
+        assert_eq!(reserve_write(&mut state, bulk, 4096), Ok(16));
+        assert_eq!(
+            reserve_write(&mut state, bulk, 4096),
+            Ok(2048 - 64 - 128 - 16)
+        );
+        assert_eq!(reserve_write(&mut state, bulk, 1), Err(WriteError::Blocked));
+        // Reserved bytes must not repeatedly wake the bulk writer.
+        assert_eq!(state.poll(), None);
+        assert_eq!(state.poll(), None);
+        let opening = reserve_open(&mut state);
+        assert_eq!(reserve_write(&mut state, opening, 32), Ok(16));
+        assert_eq!(
+            reserve_write(&mut state, opening, 1),
+            Err(WriteError::Blocked)
+        );
+        let control = reserve_open(&mut state);
+        SendStream {
+            id: control,
+            state: &mut state,
+            pending: &mut Retransmits::default(),
+            conn_state: &ConnState::Established,
+        }
+        .set_priority(100)
+        .unwrap();
+        assert_eq!(reserve_write(&mut state, control, 1024), Ok(176));
+        assert_eq!(
+            reserve_write(&mut state, control, 1),
+            Err(WriteError::Blocked)
+        );
+        assert_eq!(state.data_sent, 2048);
+        state.received_max_data(4096u32.into());
+        let mut writable = Vec::new();
+        while let Some(StreamEvent::Writable { id }) = state.poll() {
+            writable.push(id);
+        }
+        assert_eq!(writable.len(), 3);
+        for id in [bulk, opening, control] {
+            assert!(writable.contains(&id));
+        }
+        assert_eq!(reserve_write(&mut state, bulk, 4096), Ok(1856));
+    }
+
+    #[test]
+    fn credit_reserve_local_send_window_unblocks_on_ack_without_spurious_events() {
+        let mut state = credit_reserve_state(8192, 2048);
+        let bulk = reserve_open(&mut state);
+        assert_eq!(reserve_write(&mut state, bulk, 4096), Ok(16));
+        assert_eq!(reserve_write(&mut state, bulk, 4096), Ok(1840));
+        assert_eq!(reserve_write(&mut state, bulk, 1), Err(WriteError::Blocked));
+        assert_eq!(state.poll(), None);
+        state.received_ack_of(frame::StreamMeta {
+            id: bulk,
+            offsets: 0..1856,
+            fin: false,
+        });
+        assert_eq!(state.poll(), Some(StreamEvent::Writable { id: bulk }));
+        assert_eq!(reserve_write(&mut state, bulk, 4096), Ok(1856));
+        assert_eq!(reserve_write(&mut state, bulk, 1), Err(WriteError::Blocked));
+        assert_eq!(state.poll(), None);
+    }
+
+    #[test]
+    fn credit_reserve_clamps_small_windows_and_handles_initial_zero_credit() {
+        for (peer_window, send_window) in [(80, 8192), (8192, 80)] {
+            let mut state = credit_reserve_state(peer_window, send_window);
+            let bulk = reserve_open(&mut state);
+            assert_eq!(reserve_write(&mut state, bulk, 4096), Ok(16));
+            assert_eq!(reserve_write(&mut state, bulk, 4096), Ok(44));
+            assert_eq!(reserve_write(&mut state, bulk, 1), Err(WriteError::Blocked));
+        }
+        let mut state = credit_reserve_state(0, 2048);
+        let id = reserve_open(&mut state);
+        assert_eq!(reserve_write(&mut state, id, 16), Err(WriteError::Blocked));
+        state.received_max_data(2048u32.into());
+        assert_eq!(state.poll(), Some(StreamEvent::Writable { id }));
+        assert_eq!(reserve_write(&mut state, id, 4096), Ok(16));
+        assert_eq!(reserve_write(&mut state, id, 4096), Ok(1840));
+    }
+
+    #[test]
+    fn credit_reserve_disabled_preserves_unrestricted_default_admission() {
+        let mut state = credit_reserve_state(2048, 2048);
+        state.send_credit_reserve = None;
+        let id = reserve_open(&mut state);
+        assert_eq!(reserve_write(&mut state, id, 4096), Ok(2048));
+        assert_eq!(reserve_write(&mut state, id, 1), Err(WriteError::Blocked));
+    }
+
+    #[test]
+    fn credit_reserve_receive_updates_return_tiny_reads_when_near_exhaustion() {
+        let mut state = credit_reserve_state(2048, 2048);
+        state.receive_window = 2048;
+        state.local_max_data = 2048;
+        state.sent_max_data = 2048u32.into();
+        state.data_recvd = 2048 - 193;
+        assert!(!state.add_read_credits(0).should_transmit());
+        assert!(state.add_read_credits(1).should_transmit());
+        // The default batching behavior remains unchanged, including old peers.
+        state.low_credit_updates = false;
+        assert!(!state.add_read_credits(1).should_transmit());
+        state.low_credit_updates = true;
+        state.sent_max_data = 4096u32.into();
+        state.local_max_data = 4096;
+        assert!(!state.add_read_credits(1).should_transmit());
     }
 
     #[test]
