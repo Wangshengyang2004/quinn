@@ -573,11 +573,10 @@ impl Connection {
             let mut ack_eliciting = !self.spaces[space_id].pending.is_empty(&self.streams)
                 || self.spaces[space_id].ping_pending
                 || self.spaces[space_id].immediate_ack_pending;
+            let mut ack_only = false;
             if space_id == SpaceId::Data {
                 ack_eliciting |= self.can_send_1rtt(frame_space_1rtt);
             }
-
-            pad_datagram_to_mtu |= space_id == SpaceId::Data && self.config.pad_to_mtu;
 
             // Can we append more data into the current buffer?
             // It is not safe to assume that `buf.len()` is the end of the data,
@@ -636,31 +635,56 @@ impl Connection {
                         self.path.in_flight.bytes + untracked_bytes,
                         segment_size as u64,
                     ) {
-                        space_idx += 1;
                         congestion_blocked = true;
                         // We continue instead of breaking here in order to avoid
                         // blocking loss probes queued for higher spaces.
                         trace!("blocked by congestion control");
-                        continue;
+                        // Congestion must not prevent feedback about received packets.
+                        // Client Initials require padding and are not ACK-only datagrams.
+                        if can_send.acks && !(space_id == SpaceId::Initial && self.side.is_client())
+                        {
+                            ack_only = true;
+                            ack_eliciting = false;
+                        } else {
+                            space_idx += 1;
+                            continue;
+                        }
                     }
 
                     // Check whether the next datagram is blocked by pacing
                     let smoothed_rtt = self.path.rtt.get();
-                    if let Some(delay) = self.path.pacing.delay_with_rate(
-                        smoothed_rtt,
-                        bytes_to_send,
-                        self.path.current_mtu(),
-                        self.path.congestion.window(),
-                        self.path.congestion.pacing_rate(),
-                        now,
-                    ) {
+                    let pacing_delay = if ack_only {
+                        None
+                    } else {
+                        self.path.pacing.delay_with_rate(
+                            smoothed_rtt,
+                            bytes_to_send,
+                            self.path.current_mtu(),
+                            self.path.congestion.window(),
+                            self.path.congestion.pacing_rate(),
+                            now,
+                        )
+                    };
+                    if let Some(delay) = pacing_delay {
                         self.timers.set(Timer::Pacing, delay);
                         congestion_blocked = true;
                         // Loss probes should be subject to pacing, even though
                         // they are not congestion controlled.
                         trace!("blocked by pacing");
-                        break;
+                        if can_send.acks && !(space_id == SpaceId::Initial && self.side.is_client())
+                        {
+                            ack_only = true;
+                            ack_eliciting = false;
+                        } else {
+                            break;
+                        }
                     }
+                }
+
+                // Emit feedback separately: GSO or optional MTU padding would make
+                // an ACK-only packet congestion controlled again.
+                if ack_only && num_datagrams != 0 {
+                    break;
                 }
 
                 // Finish current packet
@@ -786,6 +810,7 @@ impl Connection {
             }
 
             debug_assert!(buf_capacity - buf.len() >= MIN_PACKET_SPACE);
+            pad_datagram_to_mtu |= space_id == SpaceId::Data && self.config.pad_to_mtu && !ack_only;
 
             //
             // From here on, we've determined that a packet will definitely be sent.
@@ -886,7 +911,7 @@ impl Connection {
 
             // Send an off-path PATH_RESPONSE. Prioritized over on-path data to ensure that path
             // validation can occur while the link is saturated.
-            if space_id == SpaceId::Data && num_datagrams == 1 {
+            if space_id == SpaceId::Data && num_datagrams == 1 && !ack_only {
                 if let Some((token, remote)) = self.path_responses.pop_off_path(self.path.remote) {
                     // `unwrap` guaranteed to succeed because `builder_storage` was populated just
                     // above.
@@ -916,8 +941,21 @@ impl Connection {
                 }
             }
 
-            let sent =
-                self.populate_packet(now, space_id, buf, builder.max_size, builder.exact_number);
+            let sent = if ack_only {
+                let mut sent = SentFrames::default();
+                Self::try_populate_acks(
+                    now,
+                    self.receiving_ecn,
+                    &mut sent,
+                    &mut self.spaces[space_id],
+                    buf,
+                    &mut self.stats,
+                    builder.max_size,
+                );
+                sent
+            } else {
+                self.populate_packet(now, space_id, buf, builder.max_size, builder.exact_number)
+            };
 
             if self.side.is_client()
                 && self.config.chrome_packet_numbers

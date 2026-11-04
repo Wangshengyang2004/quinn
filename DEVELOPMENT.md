@@ -11,6 +11,14 @@ builds and default settings retain their existing contracts. The `hy2-rustls`
 feature requires EasyTier's TLS patch; default builds use official rustls.
 Adaptive loss thresholds and extended receive-history experiments remain archived.
 
+Due ACKs remain sendable when queued application data is blocked by the congestion
+window or pacer. Such feedback is emitted on its own, without optional MTU or GSO
+padding, and leaves application and path-validation frames queued. Mandatory
+client Initial padding and anti-amplification limits retain their existing rules.
+This corrects feedback admission; it does not change PTO, congestion algorithms,
+or their parameters. Product recovery and real-path throughput require separate
+consumer verification.
+
 With qlog enabled, packet-loss events classify the time threshold using the
 elapsed time since transmission, matching the existing loss detector. The
 serialized-event regression covers the threshold boundary and all three packet
