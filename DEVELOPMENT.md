@@ -53,6 +53,9 @@ order cannot replace a larger packet's state. Unknown or non-congestion-controll
 packets have no sampler state and cannot overwrite it. This prevents an event
 whose newest valid send state is application-limited from falsely counting a
 startup bandwidth plateau; real-path throughput requires separate verification.
+The history used by startup overshoot detection advances from that same completed
+event state. An older full-rate ACK in an application-limited event cannot prove
+overshoot; a full-rate loss-only event does contribute to the history.
 
 EasyTier selects an exact Git revision in Cargo.toml and Cargo.lock. Updating
 this branch alone does not update its consumer. Validate both protocol and

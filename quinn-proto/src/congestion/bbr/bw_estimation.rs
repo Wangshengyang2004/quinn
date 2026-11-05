@@ -151,7 +151,6 @@ impl BandwidthEstimation {
         if bandwidth > 0 && (!sent.app_limited || bandwidth > self.max_filter.get()) {
             self.max_filter.update_max(round, bandwidth);
         }
-        self.has_non_app_limited_sample |= !sent.app_limited;
         Some(sent.app_limited)
     }
 
@@ -200,6 +199,11 @@ impl BandwidthEstimation {
     ) {
         self.acked_at_last_window = self.total_acked;
         self.estimate_at_last_window = self.get_estimate();
+        // Overshoot history uses the same completed event send state as startup.
+        // A full-rate ACK can be older than an application-limited lost packet.
+        self.has_non_app_limited_sample |= self
+            .last_event_packet_app_limited
+            .is_some_and(|(_, limited)| !limited);
         self.last_event_packet_app_limited = None;
         if self.overestimate_avoidance && new_aggregation_epoch {
             if let Some(point) = self.recent_ack_points[0].or(self.recent_ack_points[1]) {
@@ -404,6 +408,7 @@ mod tests {
             estimation.on_ack(start + Duration::from_millis(50), 3, 0),
             Some(false)
         );
+        estimation.end_acks(0, false, false);
         assert!(estimation.has_non_app_limited_sample());
     }
 
