@@ -66,3 +66,11 @@ them only for its explicitly negotiated native TCP extension. Ordinary QUIC and
 standard HY2 keep their existing defaults. The bounded initial allowance does not
 guarantee completion of arbitrary-sized new responses or defeat backpressure on
 the control stream itself.
+
+Replacement paths call `ControllerFactory::build_for_path` with the same
+connection's previous controller. Its default delegates to `build`, preserving
+ordinary QUIC's fresh congestion state. An application may carry authenticated
+session decisions into a fresh controller; initial connections always call
+`build` independently. Both true-IP migration and explicit path reset use the
+hook. Same-IPv4 port rebinding keeps the existing cloned-state behavior. RTT,
+pacer, MTU and congestion history retain their normal path reset contracts.

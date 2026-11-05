@@ -144,6 +144,21 @@ pub struct ControllerMetrics {
 pub trait ControllerFactory {
     /// Construct a fresh `Controller`
     fn build(self: Arc<Self>, now: Instant, current_mtu: u16) -> Box<dyn Controller>;
+
+    /// Construct a controller for a replacement path of the same connection.
+    ///
+    /// The default starts fresh, just like `build`. Implementations may retain
+    /// connection-level application decisions from `previous`, but must reset
+    /// path-dependent congestion, RTT and delivery-sampling state. This hook is
+    /// not used to create a new connection, whose state must remain independent.
+    fn build_for_path(
+        self: Arc<Self>,
+        now: Instant,
+        current_mtu: u16,
+        _previous: &dyn Controller,
+    ) -> Box<dyn Controller> {
+        self.build(now, current_mtu)
+    }
 }
 
 const BASE_DATAGRAM_SIZE: u64 = 1200;

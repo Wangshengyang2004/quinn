@@ -295,7 +295,7 @@ impl Connection {
                 now,
                 if pref_addr_cid.is_some() { 2 } else { 1 },
             ),
-            path: PathData::new(remote, allow_mtud, None, 0, now, &config),
+            path: PathData::new(remote, allow_mtud, None, 0, now, &config, None),
             path_counter: 0,
             allow_mtud,
             local_ip,
@@ -3291,6 +3291,7 @@ impl Connection {
                 self.path_counter,
                 now,
                 &self.config,
+                Some(&self.path),
             )
         };
         new_path.challenge = Some(self.rng.random());

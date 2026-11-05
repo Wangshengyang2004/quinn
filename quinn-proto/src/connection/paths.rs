@@ -63,11 +63,15 @@ impl PathData {
         generation: u64,
         now: Instant,
         config: &TransportConfig,
+        previous: Option<&Self>,
     ) -> Self {
-        let congestion = config
-            .congestion_controller_factory
-            .clone()
-            .build(now, config.get_initial_mtu());
+        let factory = config.congestion_controller_factory.clone();
+        let congestion = match previous {
+            Some(previous) => {
+                factory.build_for_path(now, config.get_initial_mtu(), previous.congestion.as_ref())
+            }
+            None => factory.build(now, config.get_initial_mtu()),
+        };
         Self {
             remote,
             rtt: RttEstimator::new(config.initial_rtt),
@@ -144,10 +148,11 @@ impl PathData {
     /// This is useful when it is known the underlying path has changed.
     pub(super) fn reset(&mut self, now: Instant, config: &TransportConfig) {
         self.rtt = RttEstimator::new(config.initial_rtt);
-        self.congestion = config
-            .congestion_controller_factory
-            .clone()
-            .build(now, config.get_initial_mtu());
+        self.congestion = config.congestion_controller_factory.clone().build_for_path(
+            now,
+            config.get_initial_mtu(),
+            self.congestion.as_ref(),
+        );
         self.mtud.reset(config.get_initial_mtu(), config.min_mtu);
         self.pacing = Pacer::new(
             self.rtt.get(),
@@ -482,11 +487,79 @@ mod tests {
     use super::*;
 
     #[test]
+    fn replacement_path_passes_previous_controller_and_resets_network_state() {
+        use crate::congestion::{Controller, ControllerFactory, NewRenoConfig};
+        use std::sync::{Arc, Mutex};
+
+        struct RecordingFactory(Arc<Mutex<Vec<u64>>>);
+        impl ControllerFactory for RecordingFactory {
+            fn build(self: Arc<Self>, now: Instant, mtu: u16) -> Box<dyn Controller> {
+                Arc::new(NewRenoConfig::default()).build(now, mtu)
+            }
+            fn build_for_path(
+                self: Arc<Self>,
+                now: Instant,
+                mtu: u16,
+                previous: &dyn Controller,
+            ) -> Box<dyn Controller> {
+                self.0.lock().unwrap().push(previous.window());
+                self.build(now, mtu)
+            }
+        }
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut config = TransportConfig::default();
+        config.congestion_controller_factory(Arc::new(RecordingFactory(calls.clone())));
+        let now = Instant::now();
+        let mut old = PathData::new(
+            "203.0.113.1:4433".parse().unwrap(),
+            true,
+            None,
+            0,
+            now,
+            &config,
+            None,
+        );
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "new connections do not inherit state"
+        );
+        old.rtt.update(Duration::ZERO, Duration::from_millis(42));
+        old.congestion.on_mtu_update(1400);
+        let acknowledged = now + Duration::from_millis(1);
+        old.congestion
+            .on_ack(acknowledged, acknowledged, 1, 2400, 2400, false, &old.rtt);
+        let now = now + Duration::from_millis(2);
+        let old_window = old.congestion.window();
+        let mut new = PathData::new(
+            "203.0.113.2:4433".parse().unwrap(),
+            true,
+            None,
+            1,
+            now,
+            &config,
+            Some(&old),
+        );
+        assert_eq!(*calls.lock().unwrap(), vec![old_window]);
+        assert_eq!(new.rtt.get(), config.initial_rtt);
+        assert_eq!(new.current_mtu(), config.get_initial_mtu());
+        assert_eq!(new.congestion.window(), new.congestion.initial_window());
+        assert_ne!(new.congestion.window(), old_window);
+        new.rtt.update(Duration::ZERO, Duration::from_millis(90));
+        new.congestion.on_mtu_update(1450);
+        let before_reset = new.congestion.window();
+        new.reset(now, &config);
+        assert_eq!(*calls.lock().unwrap(), vec![old_window, before_reset]);
+        assert_eq!(new.rtt.get(), config.initial_rtt);
+        assert_eq!(new.current_mtu(), config.get_initial_mtu());
+        assert_eq!(new.congestion.window(), new.congestion.initial_window());
+    }
+
+    #[test]
     fn reset_refreshes_pacer_budget() {
         let now = Instant::now();
         let config = TransportConfig::default();
         let remote = "203.0.113.1:4433".parse().unwrap();
-        let mut path = PathData::new(remote, true, None, 0, now, &config);
+        let mut path = PathData::new(remote, true, None, 0, now, &config, None);
         let mtu = path.current_mtu();
         let window = path.congestion.window();
 
