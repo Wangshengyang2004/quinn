@@ -1733,4 +1733,78 @@ mod profile_tests {
         filter.recalculate(8000);
         assert_eq!(filter.get(), 200);
     }
+
+    #[test]
+    fn newer_app_limited_loss_does_not_end_startup_after_mixed_event() {
+        let mut bbr = Bbr::new(Arc::new(BbrConfig::default()), 1200);
+        let sent = Instant::now();
+        bbr.on_sent(sent, 1200, 1, 0);
+        bbr.max_bandwidth.on_app_limited(1);
+        bbr.on_sent(sent + Duration::from_millis(10), 1200, 2, 1200);
+        bbr.round_wo_bw_gain = 2;
+        bbr.bw_at_last_round = 1_000_000_000;
+
+        let now = sent + Duration::from_millis(100);
+        bbr.on_begin_congestion_event(2400);
+        bbr.on_ack(
+            now,
+            sent,
+            1,
+            1200,
+            1200,
+            false,
+            &RttEstimator::new(Duration::from_millis(100)),
+        );
+        bbr.on_packet_lost(2, 1200);
+        bbr.on_congestion_event(now, sent, false, 1200, 1, Some(2), Some(2400));
+        bbr.on_end_acks(now, 0, false, Some(1));
+
+        assert!(
+            !bbr.is_at_full_bandwidth,
+            "the newest valid send state is app-limited, so this event cannot count a plateau round"
+        );
+        assert!(bbr.last_sample_is_app_limited);
+    }
+
+    #[test]
+    fn loss_only_event_updates_last_send_application_limited_state() {
+        let mut bbr = Bbr::new(Arc::new(BbrConfig::default()), 1200);
+        let sent = Instant::now();
+        bbr.max_bandwidth.on_app_limited(0);
+        bbr.on_sent(sent, 1200, 1, 0);
+        let now = sent + Duration::from_millis(100);
+        bbr.on_begin_congestion_event(1200);
+        bbr.on_packet_lost(1, 1200);
+        bbr.on_congestion_event(now, sent, false, 1200, 1, Some(1), Some(1200));
+        bbr.on_end_acks(now, 0, false, None);
+        assert!(bbr.last_sample_is_app_limited);
+    }
+
+    #[test]
+    fn newer_ack_send_state_wins_over_older_app_limited_loss_control() {
+        let mut bbr = Bbr::new(Arc::new(BbrConfig::default()), 1200);
+        let sent = Instant::now();
+        bbr.max_bandwidth.on_app_limited(0);
+        bbr.on_sent(sent, 1200, 1, 0);
+        bbr.on_sent(sent + Duration::from_millis(10), 1200, 2, 1200);
+        bbr.max_bandwidth
+            .on_ack(sent + Duration::from_millis(50), 2, 0);
+        bbr.max_bandwidth.end_acks(0, false, false);
+        bbr.on_sent(sent + Duration::from_millis(60), 1200, 3, 1200);
+        let now = sent + Duration::from_millis(160);
+        bbr.on_begin_congestion_event(2400);
+        bbr.on_ack(
+            now,
+            sent + Duration::from_millis(60),
+            3,
+            1200,
+            2400,
+            false,
+            &RttEstimator::new(Duration::from_millis(100)),
+        );
+        bbr.on_packet_lost(1, 1200);
+        bbr.on_congestion_event(now, sent, false, 1200, 1, Some(1), Some(1200));
+        bbr.on_end_acks(now, 0, false, Some(3));
+        assert!(!bbr.last_sample_is_app_limited);
+    }
 }
