@@ -1807,4 +1807,53 @@ mod profile_tests {
         bbr.on_end_acks(now, 0, false, Some(3));
         assert!(!bbr.last_sample_is_app_limited);
     }
+
+    #[test]
+    fn mixed_app_limited_event_does_not_prove_startup_overshoot() {
+        let mut bbr = Bbr::new(Arc::new(BbrConfig::default()), 1200);
+        let sent = Instant::now();
+        bbr.on_sent(sent, 1200, 1, 0);
+        bbr.max_bandwidth.on_app_limited(1);
+        bbr.on_sent(sent + Duration::from_millis(10), 1200, 2, 1200);
+        bbr.detect_overshooting = true;
+        bbr.pacing_rate = 10_000_000;
+
+        let now = sent + Duration::from_millis(100);
+        bbr.on_begin_congestion_event(2400);
+        bbr.on_ack(
+            now,
+            sent,
+            1,
+            1200,
+            1200,
+            false,
+            &RttEstimator::new(Duration::from_millis(100)),
+        );
+        bbr.on_packet_lost(2, 1200);
+        bbr.on_congestion_event(now, sent, false, 1200, 1, Some(2), Some(2400));
+        bbr.on_end_acks(now, 0, false, Some(1));
+
+        assert!(bbr.last_sample_is_app_limited);
+        assert!(
+            bbr.detect_overshooting,
+            "an older full-rate ACK is not the event's send state"
+        );
+        assert_eq!(bbr.pacing_rate, 10_000_000);
+        assert!(!bbr.max_bandwidth.has_non_app_limited_sample());
+    }
+
+    #[test]
+    fn loss_only_full_rate_send_state_counts_for_overshoot_history() {
+        let mut bbr = Bbr::new(Arc::new(BbrConfig::default()), 1200);
+        let sent = Instant::now();
+        bbr.on_sent(sent, 1200, 1, 0);
+        let now = sent + Duration::from_millis(100);
+        bbr.on_begin_congestion_event(1200);
+        bbr.on_packet_lost(1, 1200);
+        bbr.on_congestion_event(now, sent, false, 1200, 1, Some(1), Some(1200));
+        bbr.on_end_acks(now, 0, false, None);
+
+        assert!(!bbr.last_sample_is_app_limited);
+        assert!(bbr.max_bandwidth.has_non_app_limited_sample());
+    }
 }
