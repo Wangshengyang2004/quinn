@@ -74,3 +74,13 @@ session decisions into a fresh controller; initial connections always call
 `build` independently. Both true-IP migration and explicit path reset use the
 hook. Same-IPv4 port rebinding keeps the existing cloned-state behavior. RTT,
 pacer, MTU and congestion history retain their normal path reset contracts.
+
+`TransportConfig::local_udp_payload_limit` is an opt-in, destination-specific
+host budget queried before packetization. It clamps ordinary sends and PMTU
+probes on an existing path, including when encapsulation changes at runtime.
+Changing a budget cancels the old search so a late probe ACK cannot restore an
+oversized MTU. Releasing it leaves growth to normal PMTU discovery. The provider
+is disabled by default and changes no advertised transport parameter, congestion
+algorithm, timer or ordinary socket behavior. Host and consumer integration
+must be validated separately; already queued/in-flight packets retain normal
+loss recovery.
