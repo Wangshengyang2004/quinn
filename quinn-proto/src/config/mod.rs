@@ -29,7 +29,9 @@ mod transport;
 #[cfg(feature = "qlog")]
 pub use transport::QlogConfig;
 pub(crate) use transport::SendCreditReserve;
-pub use transport::{AckFrequencyConfig, IdleTimeout, MtuDiscoveryConfig, TransportConfig};
+pub use transport::{
+    AckFrequencyConfig, IdleTimeout, LocalUdpPayloadLimit, MtuDiscoveryConfig, TransportConfig,
+};
 
 /// Global configuration for the endpoint, affecting all connections
 ///

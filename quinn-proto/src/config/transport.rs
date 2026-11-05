@@ -1,4 +1,4 @@
-use std::{fmt, sync::Arc};
+use std::{fmt, net::SocketAddr, sync::Arc};
 #[cfg(feature = "qlog")]
 use std::{io, sync::Mutex, time::Instant};
 
@@ -19,6 +19,16 @@ pub(crate) struct SendCreditReserve {
     pub(crate) control: u64,
     pub(crate) opening: u64,
     pub(crate) opening_bytes: u64,
+}
+
+/// A destination-specific local UDP payload budget, applied before packetization.
+///
+/// Implementations must return promptly without blocking. `None` leaves the network
+/// MTU policy unchanged. Limits are clamped to QUIC's 1200-byte minimum and affect
+/// only local sends, including PMTU probes; no transport parameter is changed.
+pub trait LocalUdpPayloadLimit: fmt::Debug + Send + Sync {
+    /// Current maximum UDP payload size for this destination, before host encapsulation.
+    fn max_udp_payload_size(&self, remote: SocketAddr) -> Option<u16>;
 }
 
 /// Parameters governing the core QUIC state machine
@@ -51,6 +61,7 @@ pub struct TransportConfig {
     pub(crate) initial_mtu: u16,
     pub(crate) min_mtu: u16,
     pub(crate) mtu_discovery_config: Option<MtuDiscoveryConfig>,
+    pub(crate) local_udp_payload_limit: Option<Arc<dyn LocalUdpPayloadLimit>>,
     pub(crate) pad_to_mtu: bool,
     pub(crate) ack_frequency_config: Option<AckFrequencyConfig>,
     pub(crate) ack_frequency_supported: bool,
@@ -289,6 +300,20 @@ impl TransportConfig {
     /// adapts to the network.
     pub fn min_mtu(&mut self, value: u16) -> &mut Self {
         self.min_mtu = value.max(INITIAL_MTU);
+        self
+    }
+
+    /// Set a local, destination-specific UDP payload limit provider.
+    ///
+    /// Queried before each transmit batch so encapsulation changes can lower an
+    /// established path's packet size without waiting for loss-based MTU recovery.
+    /// Removing a limit retains the current MTU until normal PMTU discovery grows it.
+    /// Disabled by default; peer-visible transport parameters are unchanged.
+    pub fn local_udp_payload_limit(
+        &mut self,
+        value: Option<Arc<dyn LocalUdpPayloadLimit>>,
+    ) -> &mut Self {
+        self.local_udp_payload_limit = value;
         self
     }
 
@@ -533,6 +558,7 @@ impl Default for TransportConfig {
             initial_mtu: INITIAL_MTU,
             min_mtu: INITIAL_MTU,
             mtu_discovery_config: Some(MtuDiscoveryConfig::default()),
+            local_udp_payload_limit: None,
             pad_to_mtu: false,
             ack_frequency_config: None,
             ack_frequency_supported: true,
@@ -582,6 +608,7 @@ impl fmt::Debug for TransportConfig {
             initial_mtu,
             min_mtu,
             mtu_discovery_config,
+            local_udp_payload_limit,
             pad_to_mtu,
             ack_frequency_config,
             ack_frequency_supported,
@@ -623,6 +650,7 @@ impl fmt::Debug for TransportConfig {
             .field("initial_mtu", initial_mtu)
             .field("min_mtu", min_mtu)
             .field("mtu_discovery_config", mtu_discovery_config)
+            .field("local_udp_payload_limit", local_udp_payload_limit)
             .field("pad_to_mtu", pad_to_mtu)
             .field("ack_frequency_config", ack_frequency_config)
             .field("ack_frequency_supported", ack_frequency_supported)

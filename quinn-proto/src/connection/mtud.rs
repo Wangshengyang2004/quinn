@@ -9,6 +9,7 @@ use tracing::trace;
 pub(crate) struct MtuDiscovery {
     /// Detected MTU for the path
     current_mtu: u16,
+    local_max_udp_payload_size: u16,
     /// The state of the MTU discovery, if enabled
     state: Option<EnabledMtuDiscovery>,
     /// The state of the black hole detector
@@ -51,18 +52,36 @@ impl MtuDiscovery {
     fn with_state(current_mtu: u16, min_mtu: u16, state: Option<EnabledMtuDiscovery>) -> Self {
         Self {
             current_mtu,
+            local_max_udp_payload_size: MAX_UDP_PAYLOAD,
             state,
             black_hole_detector: BlackHoleDetector::new(min_mtu),
         }
     }
 
     pub(super) fn reset(&mut self, current_mtu: u16, min_mtu: u16) {
-        self.current_mtu = current_mtu;
+        self.current_mtu = current_mtu.min(self.local_max_udp_payload_size);
         if let Some(state) = self.state.take() {
             self.state = Some(EnabledMtuDiscovery::new(state.config));
             self.on_peer_max_udp_payload_size_received(state.peer_max_udp_payload_size);
         }
         self.black_hole_detector = BlackHoleDetector::new(min_mtu);
+    }
+
+    /// Apply a changing local encapsulation budget without learning it as peer policy.
+    pub(crate) fn set_local_max_udp_payload_size(&mut self, limit: Option<u16>) {
+        let limit = limit
+            .unwrap_or(MAX_UDP_PAYLOAD)
+            .clamp(crate::INITIAL_MTU, MAX_UDP_PAYLOAD);
+        if limit == self.local_max_udp_payload_size {
+            return;
+        }
+        self.local_max_udp_payload_size = limit;
+        self.current_mtu = self.current_mtu.min(limit);
+        if let Some(state) = &mut self.state {
+            // A pending probe belongs to the old budget. Its late ACK must not
+            // restore an oversized MTU or interfere with the replacement search.
+            state.phase = Phase::Initial;
+        }
     }
 
     /// Returns the current MTU
@@ -72,15 +91,23 @@ impl MtuDiscovery {
 
     /// Returns the amount of bytes that should be sent as an MTU probe, if any
     pub(crate) fn poll_transmit(&mut self, now: Instant, next_pn: u64) -> Option<u16> {
-        self.state
-            .as_mut()
-            .and_then(|state| state.poll_transmit(now, self.current_mtu, next_pn))
+        self.state.as_mut().and_then(|state| {
+            state.poll_transmit(
+                now,
+                self.current_mtu,
+                next_pn,
+                self.local_max_udp_payload_size,
+            )
+        })
     }
 
     /// Notifies the [`MtuDiscovery`] that the peer's `max_udp_payload_size` transport parameter has
     /// been received
     pub(crate) fn on_peer_max_udp_payload_size_received(&mut self, peer_max_udp_payload_size: u16) {
-        self.current_mtu = self.current_mtu.min(peer_max_udp_payload_size);
+        self.current_mtu = self
+            .current_mtu
+            .min(peer_max_udp_payload_size)
+            .min(self.local_max_udp_payload_size);
 
         if let Some(state) = self.state.as_mut() {
             // It is possible for black hole detection to trigger before the connection has been
@@ -110,7 +137,7 @@ impl MtuDiscovery {
             .as_mut()
             .and_then(|state| state.on_probe_acked(pn))
         {
-            self.current_mtu = new_mtu;
+            self.current_mtu = new_mtu.min(self.local_max_udp_payload_size);
             trace!(current_mtu = self.current_mtu, "new MTU detected");
 
             self.black_hole_detector.on_probe_acked(pn, len);
@@ -157,7 +184,10 @@ impl MtuDiscovery {
             return false;
         }
 
-        self.current_mtu = self.black_hole_detector.min_mtu;
+        self.current_mtu = self
+            .black_hole_detector
+            .min_mtu
+            .min(self.local_max_udp_payload_size);
 
         if let Some(state) = &mut self.state {
             state.on_black_hole_detected(now);
@@ -185,12 +215,18 @@ impl EnabledMtuDiscovery {
     }
 
     /// Returns the amount of bytes that should be sent as an MTU probe, if any
-    fn poll_transmit(&mut self, now: Instant, current_mtu: u16, next_pn: u64) -> Option<u16> {
+    fn poll_transmit(
+        &mut self,
+        now: Instant,
+        current_mtu: u16,
+        next_pn: u64,
+        local_limit: u16,
+    ) -> Option<u16> {
         if let Phase::Initial = &self.phase {
             // Start the first search
             self.phase = Phase::Searching(SearchState::new(
                 current_mtu,
-                self.peer_max_udp_payload_size,
+                self.peer_max_udp_payload_size.min(local_limit),
                 &self.config,
             ));
         } else if let Phase::Complete(next_mtud_activation) = &self.phase {
@@ -201,7 +237,7 @@ impl EnabledMtuDiscovery {
             // Start a new search (we have reached the next activation time)
             self.phase = Phase::Searching(SearchState::new(
                 current_mtu,
-                self.peer_max_udp_payload_size,
+                self.peer_max_udp_payload_size.min(local_limit),
                 &self.config,
             ));
         }
@@ -570,6 +606,76 @@ mod tests {
             }
         }
         probed_sizes
+    }
+
+    #[test]
+    fn local_payload_limit_clamps_enabled_and_disabled_discovery() {
+        for enabled in [false, true] {
+            let mut mtud = if enabled {
+                MtuDiscovery::new(1452, 1200, None, MtuDiscoveryConfig::default())
+            } else {
+                MtuDiscovery::disabled(1452, 1200)
+            };
+            mtud.set_local_max_udp_payload_size(Some(1380));
+            assert_eq!(mtud.current_mtu(), 1380);
+            assert_eq!(mtud.poll_transmit(Instant::now(), 1), None);
+        }
+    }
+
+    #[test]
+    fn local_payload_limit_discards_an_oversized_pending_probe() {
+        let mut mtud = default_mtud();
+        let old_probe = mtud.poll_transmit(Instant::now(), 100).unwrap();
+        assert!(old_probe > 1250);
+        mtud.set_local_max_udp_payload_size(Some(1250));
+        assert!(!mtud.on_acked(SpaceId::Data, 100, old_probe));
+        assert_eq!(mtud.current_mtu(), 1200);
+        let sizes = drive_to_completion(&mut mtud, Instant::now(), 1452);
+        assert!(sizes.iter().all(|&size| size <= 1250));
+        assert_eq!(mtud.current_mtu(), 1250);
+    }
+
+    #[test]
+    fn local_payload_limit_release_allows_normal_discovery_to_grow() {
+        let mut mtud = MtuDiscovery::new(1452, 1200, None, MtuDiscoveryConfig::default());
+        mtud.set_local_max_udp_payload_size(Some(1380));
+        assert!(drive_to_completion(&mut mtud, Instant::now(), 1452).is_empty());
+        mtud.set_local_max_udp_payload_size(None);
+        assert_eq!(mtud.current_mtu(), 1380);
+        let sizes = drive_to_completion(&mut mtud, Instant::now(), 1452);
+        assert!(sizes.iter().all(|&size| size <= 1452));
+        assert_eq!(mtud.current_mtu(), 1452);
+    }
+
+    #[test]
+    fn local_payload_limit_preserves_peer_limit_and_path_reset() {
+        let mut mtud = MtuDiscovery::new(1452, 1200, Some(1300), MtuDiscoveryConfig::default());
+        mtud.set_local_max_udp_payload_size(Some(1380));
+        mtud.reset(1452, 1200);
+        assert_eq!(mtud.current_mtu(), 1300);
+        assert!(drive_to_completion(&mut mtud, Instant::now(), 1452).is_empty());
+        assert_eq!(mtud.state.as_ref().unwrap().peer_max_udp_payload_size, 1300);
+    }
+
+    #[test]
+    fn local_payload_limit_isolated_between_discovery_instances() {
+        let mut limited = default_mtud();
+        let mut other = limited.clone();
+        limited.set_local_max_udp_payload_size(Some(1250));
+        drive_to_completion(&mut limited, Instant::now(), 1452);
+        drive_to_completion(&mut other, Instant::now(), 1452);
+        assert_eq!(limited.current_mtu(), 1250);
+        assert_eq!(other.current_mtu(), 1452);
+    }
+
+    #[test]
+    fn local_payload_limit_honors_quic_minimum_and_black_hole_reset() {
+        let mut mtud = MtuDiscovery::new(9000, 9000, None, MtuDiscoveryConfig::default());
+        mtud.set_local_max_udp_payload_size(Some(0));
+        assert_eq!(mtud.current_mtu(), 1200);
+        assert_eq!(mtud.poll_transmit(Instant::now(), 1), None);
+        mtud.reset(9000, 9000);
+        assert_eq!(mtud.current_mtu(), 1200);
     }
 
     #[test]

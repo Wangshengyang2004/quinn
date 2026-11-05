@@ -478,6 +478,16 @@ impl Connection {
             true => max_datagrams,
         };
 
+        if let Some(provider) = &self.config.local_udp_payload_limit {
+            let old_mtu = self.path.current_mtu();
+            self.path
+                .mtud
+                .set_local_max_udp_payload_size(provider.max_udp_payload_size(self.path.remote));
+            let new_mtu = self.path.current_mtu();
+            if new_mtu != old_mtu {
+                self.path.congestion.on_mtu_update(new_mtu);
+            }
+        }
         let mut num_datagrams = 0;
         // Position in `buf` of the first byte of the current UDP datagram. When coalescing QUIC
         // packets, this can be earlier than the start of the current QUIC packet.
