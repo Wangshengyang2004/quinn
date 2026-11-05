@@ -563,7 +563,7 @@ impl Controller for Bbr {
             .event_min_rtt
             .take()
             .is_some_and(|sample| self.update_min_rtt(now, sample));
-        if let Some(app_limited_sample) = self.max_bandwidth.last_acked_packet_app_limited() {
+        if let Some(app_limited_sample) = self.max_bandwidth.last_event_packet_app_limited() {
             self.last_sample_is_app_limited = app_limited_sample;
         }
         let bandwidth_increased = self.max_bandwidth.estimate_increased_this_window();

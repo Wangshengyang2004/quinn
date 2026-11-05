@@ -35,7 +35,7 @@ pub(crate) struct BandwidthEstimation {
     is_app_limited: bool,
     end_of_app_limited_phase: Option<u64>,
     has_non_app_limited_sample: bool,
-    last_acked_packet_app_limited: Option<(u64, bool)>,
+    last_event_packet_app_limited: Option<(u64, bool)>,
     max_filter: MinMax,
     acked_at_last_window: u64,
     estimate_at_last_window: u64,
@@ -95,15 +95,9 @@ impl BandwidthEstimation {
 
     pub(crate) fn on_ack(&mut self, now: Instant, packet_number: u64, round: u64) -> Option<bool> {
         let sent = self.sent_packets.remove(&packet_number)?;
-        // Startup uses the send state of the largest ACKed packet, even when
-        // another packet supplies the batch's largest delivery-rate sample.
-        // Keep the valid send state before zero-duration samples can return.
-        if self
-            .last_acked_packet_app_limited
-            .is_none_or(|(last, _)| packet_number > last)
-        {
-            self.last_acked_packet_app_limited = Some((packet_number, sent.app_limited));
-        }
+        // Keep the newest valid send state across ACK and loss callbacks,
+        // including packets whose delivery-rate sample has zero duration.
+        self.record_event_send_state(packet_number, sent.app_limited);
         self.total_acked += sent.size;
         self.total_sent_at_last_ack = sent.total_sent;
         self.last_acked_packet_sent_time = Some(sent.sent_time);
@@ -162,7 +156,18 @@ impl BandwidthEstimation {
     }
 
     pub(crate) fn on_packet_lost(&mut self, packet_number: u64) {
-        self.sent_packets.remove(&packet_number);
+        if let Some(sent) = self.sent_packets.remove(&packet_number) {
+            self.record_event_send_state(packet_number, sent.app_limited);
+        }
+    }
+
+    fn record_event_send_state(&mut self, packet_number: u64, app_limited: bool) {
+        if self
+            .last_event_packet_app_limited
+            .is_none_or(|(last, _)| packet_number > last)
+        {
+            self.last_event_packet_app_limited = Some((packet_number, app_limited));
+        }
     }
 
     pub(crate) fn on_app_limited(&mut self, end_packet_number: u64) {
@@ -170,8 +175,8 @@ impl BandwidthEstimation {
         self.end_of_app_limited_phase = Some(end_packet_number);
     }
 
-    pub(crate) fn last_acked_packet_app_limited(&self) -> Option<bool> {
-        self.last_acked_packet_app_limited
+    pub(crate) fn last_event_packet_app_limited(&self) -> Option<bool> {
+        self.last_event_packet_app_limited
             .map(|(_, limited)| limited)
     }
 
@@ -195,7 +200,7 @@ impl BandwidthEstimation {
     ) {
         self.acked_at_last_window = self.total_acked;
         self.estimate_at_last_window = self.get_estimate();
-        self.last_acked_packet_app_limited = None;
+        self.last_event_packet_app_limited = None;
         if self.overestimate_avoidance && new_aggregation_epoch {
             if let Some(point) = self.recent_ack_points[0].or(self.recent_ack_points[1]) {
                 self.push_a0_candidate(point);
@@ -282,9 +287,9 @@ mod tests {
         estimation.on_app_limited(0);
         estimation.on_sent(now, 1, 1200, 0);
         assert_eq!(estimation.on_ack(now, 1, 0), None);
-        assert_eq!(estimation.last_acked_packet_app_limited(), Some(true));
+        assert_eq!(estimation.last_event_packet_app_limited(), Some(true));
         estimation.end_acks(0, false, false);
-        assert_eq!(estimation.last_acked_packet_app_limited(), None);
+        assert_eq!(estimation.last_event_packet_app_limited(), None);
     }
 
     #[test]
@@ -392,7 +397,7 @@ mod tests {
         );
         assert!(!estimation.is_app_limited);
         assert_eq!(estimation.get_estimate(), 66_666);
-        assert_eq!(estimation.last_acked_packet_app_limited(), Some(true));
+        assert_eq!(estimation.last_event_packet_app_limited(), Some(true));
 
         estimation.on_sent(start + Duration::from_millis(40), 3, 1000, 0);
         assert_eq!(
@@ -411,5 +416,29 @@ mod tests {
 
         estimation.on_packet_lost(7);
         assert!(!estimation.sent_packets.contains_key(&7));
+    }
+
+    #[test]
+    fn event_send_state_ignores_callback_order_and_unknown_loss() {
+        let start = Instant::now();
+        let mut estimation = BandwidthEstimation::default();
+        estimation.on_sent(start, 1, 1200, 0);
+        estimation.on_app_limited(1);
+        estimation.on_sent(start + Duration::from_millis(10), 2, 1200, 1200);
+        estimation.on_sent(start + Duration::from_millis(20), 3, 1200, 2400);
+
+        // The caller may deliver loss callbacks before ACKs or out of order.
+        estimation.on_packet_lost(3);
+        estimation.on_packet_lost(2);
+        estimation.on_ack(start + Duration::from_millis(100), 1, 0);
+        estimation.on_packet_lost(999);
+        assert_eq!(estimation.last_event_packet_app_limited(), Some(true));
+        assert_eq!(estimation.last_event_packet_app_limited.unwrap().0, 3);
+
+        estimation.end_acks(0, false, false);
+        estimation.on_packet_lost(3); // Duplicate notification has no send state.
+        estimation.on_sent(start + Duration::from_millis(110), 1000, 0, 0);
+        estimation.on_packet_lost(1000); // ACK-only packet is not sampled.
+        assert_eq!(estimation.last_event_packet_app_limited(), None);
     }
 }

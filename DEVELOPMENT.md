@@ -44,13 +44,15 @@ and account for lost bytes. Regressions cover a loss-only event outside recovery
 a loss-only event during growth, and an ACK/loss batch that enters recovery.
 This behavior alignment does not establish a throughput improvement.
 
-BBR's startup decision uses the send state of the largest newly acknowledged
-packet in the ACK batch, matching Hysteria 2.13.0. The maximum delivery-rate
-sample remains a separate bandwidth input. A valid send state is retained even
-when its bandwidth sample has zero duration, and ACK callback order cannot
-replace a larger packet's state. This prevents a mixed app-limited batch from
-falsely declaring the path's startup bandwidth plateau; it does not establish a
-real-path throughput improvement.
+BBR's startup decision uses the send state of the newest valid packet across
+newly acknowledged and lost packets in the congestion event, matching Hysteria
+2.13.0's sampler implementation. Loss-only events also retain that state. The
+maximum delivery-rate sample remains a separate bandwidth input. A valid send
+state is retained even when its bandwidth sample has zero duration, and callback
+order cannot replace a larger packet's state. Unknown or non-congestion-controlled
+packets have no sampler state and cannot overwrite it. This prevents an event
+whose newest valid send state is application-limited from falsely counting a
+startup bandwidth plateau; real-path throughput requires separate verification.
 
 EasyTier selects an exact Git revision in Cargo.toml and Cargo.lock. Updating
 this branch alone does not update its consumer. Validate both protocol and
