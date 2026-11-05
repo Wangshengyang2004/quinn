@@ -1156,6 +1156,69 @@ mod tests {
         bbr
     }
 
+    fn probe_bw_event(previous_above_target: bool, current_above_target: bool) -> Bbr {
+        let start = Instant::now();
+        let mut bbr = Bbr::new(Arc::new(BbrConfig::default()), 1200);
+        let rtt = RttEstimator::new(Duration::from_millis(20));
+        let mut pn = 1;
+        let now = run_round(
+            &mut bbr,
+            &rtt,
+            start,
+            &mut pn,
+            32,
+            1200,
+            Duration::from_micros(1),
+            false,
+        );
+        let target = bbr.get_target_cwnd(1.25);
+        let previous_flight = if previous_above_target { target * 4 } else { 0 };
+        bbr.on_begin_congestion_event(previous_flight);
+        bbr.on_end_acks(now, previous_flight, false, None);
+        bbr.mode = Mode::ProbeBw;
+        bbr.is_at_full_bandwidth = true;
+        bbr.current_cycle_offset = 0;
+        bbr.pacing_gain = 1.25;
+        bbr.last_cycle_start = Some(now - bbr.min_rtt * 2);
+        let current_flight = if current_above_target {
+            target * 4
+        } else {
+            target / 2
+        };
+        assert!(current_flight > 1200);
+        bbr.on_sent(now, 1200, pn, current_flight - 1200);
+        bbr.on_begin_congestion_event(current_flight);
+        let ack = now + Duration::from_millis(50);
+        bbr.on_ack(ack, now, pn, 1200, current_flight - 1200, false, &rtt);
+        bbr.on_end_acks(ack, current_flight - 1200, false, Some(pn));
+        assert_eq!(bbr.mode, Mode::ProbeBw);
+        bbr
+    }
+
+    #[test]
+    fn probe_bw_uses_current_event_flight_after_refill() {
+        let bbr = probe_bw_event(false, true);
+        assert_eq!(
+            bbr.pacing_gain, 0.75,
+            "refilled flight reached the probe target before this ACK"
+        );
+    }
+
+    #[test]
+    fn probe_bw_uses_current_event_flight_after_drain() {
+        let bbr = probe_bw_event(true, false);
+        assert_eq!(
+            bbr.pacing_gain, 1.25,
+            "an earlier large flight cannot prove this probe reached its target"
+        );
+    }
+
+    #[test]
+    fn probe_bw_current_and_previous_flight_agree_control() {
+        assert_eq!(probe_bw_event(true, true).pacing_gain, 0.75);
+        assert_eq!(probe_bw_event(false, false).pacing_gain, 1.25);
+    }
+
     #[test]
     fn upstream_mixed_ack_batch_uses_largest_packet_app_state() {
         let bbr = mixed_ack_batch(false);
