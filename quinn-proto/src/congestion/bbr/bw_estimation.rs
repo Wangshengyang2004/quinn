@@ -35,8 +35,7 @@ pub(crate) struct BandwidthEstimation {
     is_app_limited: bool,
     end_of_app_limited_phase: Option<u64>,
     has_non_app_limited_sample: bool,
-    window_max_sample: u64,
-    window_max_sample_app_limited: Option<bool>,
+    last_acked_packet_app_limited: Option<(u64, bool)>,
     max_filter: MinMax,
     acked_at_last_window: u64,
     estimate_at_last_window: u64,
@@ -94,13 +93,17 @@ impl BandwidthEstimation {
         );
     }
 
-    pub(crate) fn on_ack(
-        &mut self,
-        now: Instant,
-        packet_number: u64,
-        round: u64,
-    ) -> Option<bool> {
+    pub(crate) fn on_ack(&mut self, now: Instant, packet_number: u64, round: u64) -> Option<bool> {
         let sent = self.sent_packets.remove(&packet_number)?;
+        // Startup uses the send state of the largest ACKed packet, even when
+        // another packet supplies the batch's largest delivery-rate sample.
+        // Keep the valid send state before zero-duration samples can return.
+        if self
+            .last_acked_packet_app_limited
+            .is_none_or(|(last, _)| packet_number > last)
+        {
+            self.last_acked_packet_app_limited = Some((packet_number, sent.app_limited));
+        }
         self.total_acked += sent.size;
         self.total_sent_at_last_ack = sent.total_sent;
         self.last_acked_packet_sent_time = Some(sent.sent_time);
@@ -136,8 +139,7 @@ impl BandwidthEstimation {
             if now <= a0.time || self.total_acked < a0.total_acked {
                 0
             } else {
-                Self::bw_from_delta(self.total_acked - a0.total_acked, now - a0.time)
-                    .unwrap_or(0)
+                Self::bw_from_delta(self.total_acked - a0.total_acked, now - a0.time).unwrap_or(0)
             }
         } else if let Some(last_acked_time) = sent.last_acked_packet_ack_time {
             if now <= last_acked_time {
@@ -155,10 +157,6 @@ impl BandwidthEstimation {
         if bandwidth > 0 && (!sent.app_limited || bandwidth > self.max_filter.get()) {
             self.max_filter.update_max(round, bandwidth);
         }
-        if bandwidth > self.window_max_sample {
-            self.window_max_sample = bandwidth;
-            self.window_max_sample_app_limited = Some(sent.app_limited);
-        }
         self.has_non_app_limited_sample |= !sent.app_limited;
         Some(sent.app_limited)
     }
@@ -172,8 +170,9 @@ impl BandwidthEstimation {
         self.end_of_app_limited_phase = Some(end_packet_number);
     }
 
-    pub(crate) fn window_sample_app_limited(&self) -> Option<bool> {
-        self.window_max_sample_app_limited
+    pub(crate) fn last_acked_packet_app_limited(&self) -> Option<bool> {
+        self.last_acked_packet_app_limited
+            .map(|(_, limited)| limited)
     }
 
     pub(crate) fn has_non_app_limited_sample(&self) -> bool {
@@ -196,8 +195,7 @@ impl BandwidthEstimation {
     ) {
         self.acked_at_last_window = self.total_acked;
         self.estimate_at_last_window = self.get_estimate();
-        self.window_max_sample = 0;
-        self.window_max_sample_app_limited = None;
+        self.last_acked_packet_app_limited = None;
         if self.overestimate_avoidance && new_aggregation_epoch {
             if let Some(point) = self.recent_ack_points[0].or(self.recent_ack_points[1]) {
                 self.push_a0_candidate(point);
@@ -252,7 +250,9 @@ impl BandwidthEstimation {
             .a0_candidates
             .iter()
             .position(|point| point.total_acked > total_bytes_acked_at_send)
-            .map_or(self.a0_candidates.len() - 1, |index| index.saturating_sub(1));
+            .map_or(self.a0_candidates.len() - 1, |index| {
+                index.saturating_sub(1)
+            });
         let point = self.a0_candidates[selected];
         for _ in 0..selected {
             self.a0_candidates.pop_front();
@@ -274,6 +274,18 @@ impl Display for BandwidthEstimation {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn zero_duration_sample_retains_last_ack_send_state_until_batch_end() {
+        let now = Instant::now();
+        let mut estimation = BandwidthEstimation::default();
+        estimation.on_app_limited(0);
+        estimation.on_sent(now, 1, 1200, 0);
+        assert_eq!(estimation.on_ack(now, 1, 0), None);
+        assert_eq!(estimation.last_acked_packet_app_limited(), Some(true));
+        estimation.end_acks(0, false, false);
+        assert_eq!(estimation.last_acked_packet_app_limited(), None);
+    }
 
     #[test]
     fn application_limited_samples_raise_but_do_not_lower_the_estimate() {
@@ -330,10 +342,7 @@ mod tests {
             ..Default::default()
         };
 
-        assert_eq!(
-            estimation.choose_a0_point(150).unwrap().total_acked,
-            100
-        );
+        assert_eq!(estimation.choose_a0_point(150).unwrap().total_acked, 100);
         assert_eq!(estimation.a0_candidates.len(), 2);
     }
 
@@ -383,7 +392,7 @@ mod tests {
         );
         assert!(!estimation.is_app_limited);
         assert_eq!(estimation.get_estimate(), 66_666);
-        assert_eq!(estimation.window_sample_app_limited(), Some(true));
+        assert_eq!(estimation.last_acked_packet_app_limited(), Some(true));
 
         estimation.on_sent(start + Duration::from_millis(40), 3, 1000, 0);
         assert_eq!(

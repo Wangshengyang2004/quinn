@@ -562,7 +562,7 @@ impl Controller for Bbr {
             .event_min_rtt
             .take()
             .is_some_and(|sample| self.update_min_rtt(now, sample));
-        if let Some(app_limited_sample) = self.max_bandwidth.window_sample_app_limited() {
+        if let Some(app_limited_sample) = self.max_bandwidth.last_acked_packet_app_limited() {
             self.last_sample_is_app_limited = app_limited_sample;
         }
         let bandwidth_increased = self.max_bandwidth.estimate_increased_this_window();
@@ -1126,6 +1126,62 @@ mod tests {
         }
         bbr.on_end_acks(ack_at, 0, app_limited, Some(first + packets - 1));
         ack_at
+    }
+
+    // Hysteria 2.13.0's OnCongestionEventEx uses the send state of the
+    // largest acknowledged packet for startup, independently of which packet
+    // produced the largest delivery-rate sample in the same ACK event.
+    fn mixed_ack_batch(reverse: bool) -> Bbr {
+        let start = Instant::now();
+        let mut bbr = Bbr::new(Arc::new(BbrConfig::default()), 1200);
+        let rtt = RttEstimator::new(Duration::from_millis(100));
+        bbr.on_sent(start, 1200, 1, 0);
+        bbr.max_bandwidth.on_app_limited(1);
+        let small_sent = start + Duration::from_millis(99);
+        bbr.on_sent(small_sent, 64, 2, 1200);
+        let ack = start + Duration::from_millis(100);
+        bbr.on_begin_congestion_event(1264);
+        for pn in if reverse { [2, 1] } else { [1, 2] } {
+            let (sent, bytes, inflight) = if pn == 1 {
+                (start, 1200, 0)
+            } else {
+                (small_sent, 64, 1200)
+            };
+            bbr.on_ack(ack, sent, pn, bytes, inflight, false, &rtt);
+        }
+        // A preceding plateau makes this ACK event the startup-exit boundary.
+        bbr.bw_at_last_round = bbr.max_bandwidth.get_estimate();
+        bbr.round_wo_bw_gain = 2;
+        bbr.on_end_acks(ack, 0, false, Some(2));
+        bbr
+    }
+
+    #[test]
+    fn upstream_mixed_ack_batch_uses_largest_packet_app_state() {
+        let bbr = mixed_ack_batch(false);
+        assert!(
+            bbr.last_sample_is_app_limited,
+            "largest ACKed packet is app-limited although the larger rate sample is not"
+        );
+    }
+
+    #[test]
+    fn upstream_mixed_ack_batch_app_state_ignores_callback_order() {
+        let bbr = mixed_ack_batch(true);
+        assert!(
+            bbr.last_sample_is_app_limited,
+            "largest packet send state must survive reverse ACK callback order"
+        );
+    }
+
+    #[test]
+    fn upstream_mixed_ack_batch_does_not_end_app_limited_startup() {
+        let bbr = mixed_ack_batch(false);
+        assert!(
+            !bbr.is_at_full_bandwidth,
+            "an app-limited last send state cannot prove the path bandwidth plateaued"
+        );
+        assert_eq!(bbr.mode, Mode::Startup);
     }
 
     #[test]
