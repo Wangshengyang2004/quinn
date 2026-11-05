@@ -41,7 +41,7 @@ pub struct Bbr {
     current_cycle_offset: u8,
     init_cwnd: u64,
     min_cwnd: u64,
-    prev_in_flight_count: u64,
+    prior_in_flight: u64,
     exit_probe_rtt_at: Option<Instant>,
     probe_rtt_round_passed: bool,
     min_rtt_timestamp: Option<Instant>,
@@ -111,7 +111,7 @@ impl Bbr {
             current_cycle_offset: 0,
             init_cwnd: initial_window,
             min_cwnd: calculate_min_window(current_mtu as u64),
-            prev_in_flight_count: 0,
+            prior_in_flight: 0,
             exit_probe_rtt_at: None,
             probe_rtt_round_passed: false,
             min_rtt_timestamp: None,
@@ -213,7 +213,7 @@ impl Bbr {
         // hold that much.
         if self.pacing_gain > 1.0
             && !self.loss_state.has_losses()
-            && self.prev_in_flight_count < self.get_target_cwnd(self.pacing_gain)
+            && self.prior_in_flight < self.get_target_cwnd(self.pacing_gain)
         {
             should_advance_gain_cycling = false;
         }
@@ -516,6 +516,7 @@ impl Controller for Bbr {
     }
 
     fn on_begin_congestion_event(&mut self, prior_bytes_in_flight: u64) {
+        self.prior_in_flight = prior_bytes_in_flight;
         if prior_bytes_in_flight < self.get_target_cwnd(1.0) {
             self.max_bandwidth
                 .on_app_limited(self.max_sent_packet_number);
@@ -615,7 +616,6 @@ impl Controller for Bbr {
         self.calculate_cwnd(bytes_acked, excess_acked);
         self.calculate_recovery_window(bytes_acked, self.loss_state.lost_bytes, in_flight);
 
-        self.prev_in_flight_count = in_flight;
         self.loss_state.reset();
         self.last_event_packet_number = None;
         self.last_event_packet_bytes_in_flight_at_send = None;

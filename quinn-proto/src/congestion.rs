@@ -27,6 +27,8 @@ pub trait Controller: Send + Sync {
     }
 
     /// An acknowledgement and/or loss event is about to be processed.
+    /// `prior_bytes_in_flight` is this event's total before ACK/loss deductions,
+    /// including packets sent since the preceding event.
     #[allow(unused_variables)]
     fn on_begin_congestion_event(&mut self, prior_bytes_in_flight: u64) {}
 
