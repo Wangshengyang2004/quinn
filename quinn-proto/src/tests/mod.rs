@@ -5033,3 +5033,96 @@ fn assert_bbr_sampler_drained(conn: &Connection) {
         "0-RTT sampler records retained"
     );
 }
+
+// Exercise authenticated 1-RTT delivery, including a sender violating the
+// receiver's advertised capability. Sender-only override never changes the
+// receiver's config or the transport parameters it sent in the handshake.
+fn check_ack_frequency_receive_policy(receiver_is_client: bool, immediate: bool, enabled: bool) {
+    let mut client = client_config_with_deterministic_pns();
+    let mut server = server_config();
+    let mut frequency = AckFrequencyConfig::default();
+    frequency.max_ack_delay(Some(Duration::from_millis(30)));
+    Arc::get_mut(&mut client.transport).unwrap()
+        .ack_frequency_supported(!receiver_is_client || enabled)
+        .ack_frequency_config((!receiver_is_client && !immediate).then_some(frequency.clone()))
+        .mtu_discovery_config(None);
+    Arc::get_mut(&mut server.transport).unwrap()
+        .ack_frequency_supported(receiver_is_client || enabled)
+        .ack_frequency_config((receiver_is_client && !immediate).then_some(frequency))
+        .mtu_discovery_config(None);
+    let mut pair = Pair::new(Default::default(), server);
+    pair.latency = Duration::from_millis(10);
+    let (client_ch, server_ch) = pair.connect_with(client);
+    let sender = if receiver_is_client {
+        pair.server_conn_mut(server_ch)
+    } else {
+        pair.client_conn_mut(client_ch)
+    };
+    if immediate {
+        sender.immediate_ack();
+    } else if !enabled {
+        sender.override_peer_ack_frequency_for_test();
+        sender.ping();
+    }
+    pair.drive();
+    let receiver = if receiver_is_client {
+        pair.client_conn_mut(client_ch)
+    } else {
+        pair.server_conn_mut(server_ch)
+    };
+    let stats = receiver.stats();
+    assert!(if immediate { stats.frame_rx.immediate_ack > 0 } else { stats.frame_rx.ack_frequency > 0 });
+    let mut lost = None;
+    while let Some(event) = receiver.poll() {
+        if let Event::ConnectionLost { reason } = event {
+            lost = Some(reason);
+        }
+    }
+    if enabled {
+        assert!(lost.is_none(), "advertised extension rejected: {lost:?}");
+    } else {
+        assert_matches!(lost, Some(ConnectionError::TransportError(TransportError {
+            code: TransportErrorCode::PROTOCOL_VIOLATION, ..
+        })));
+    }
+}
+
+#[test]
+fn ack_frequency_policy_client_frequency_disabled() {
+    check_ack_frequency_receive_policy(true, false, false);
+}
+
+#[test]
+fn ack_frequency_policy_client_frequency_enabled() {
+    check_ack_frequency_receive_policy(true, false, true);
+}
+
+#[test]
+fn ack_frequency_policy_client_immediate_disabled() {
+    check_ack_frequency_receive_policy(true, true, false);
+}
+
+#[test]
+fn ack_frequency_policy_client_immediate_enabled() {
+    check_ack_frequency_receive_policy(true, true, true);
+}
+
+#[test]
+fn ack_frequency_policy_server_frequency_disabled() {
+    check_ack_frequency_receive_policy(false, false, false);
+}
+
+#[test]
+fn ack_frequency_policy_server_frequency_enabled() {
+    check_ack_frequency_receive_policy(false, false, true);
+}
+
+#[test]
+fn ack_frequency_policy_server_immediate_disabled() {
+    check_ack_frequency_receive_policy(false, true, false);
+}
+
+#[test]
+fn ack_frequency_policy_server_immediate_enabled() {
+    check_ack_frequency_receive_policy(false, true, true);
+}

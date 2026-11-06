@@ -3946,6 +3946,13 @@ impl Connection {
         Some(packet.payload.to_vec())
     }
 
+    /// Model a peer that sends the extension despite the receiver not advertising it.
+    #[cfg(test)]
+    pub(crate) fn override_peer_ack_frequency_for_test(&mut self) {
+        assert!(!self.peer_supports_ack_frequency());
+        self.peer_params.min_ack_delay = Some(VarInt::from_u32(1000));
+    }
+
     /// The number of bytes of packets containing retransmittable frames that have not been
     /// acknowledged or declared lost.
     #[cfg(test)]
