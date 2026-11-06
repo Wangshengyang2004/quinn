@@ -1996,7 +1996,7 @@ mod round_order_diagnostic {
             let ack = start + Duration::from_millis(300);
             b.on_sent(sent, 1_000, 2, 0);
             b.on_begin_congestion_event(1_000);
-            b.on_ack(ack, sent, 2, 1_000, 1_000, false, &RttEstimator::default());
+            b.on_ack(ack, sent, 2, 1_000, 1_000, false, &RttEstimator::new(Duration::from_millis(100)));
             b.on_end_acks(ack, 0, false, Some(2));
             assert_eq!(b.round_count, after);
             let actual = b.max_bandwidth.get_estimate();
