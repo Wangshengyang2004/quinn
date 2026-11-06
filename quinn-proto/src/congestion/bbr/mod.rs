@@ -2029,3 +2029,46 @@ mod round_order_diagnostic {
         );
     }
 }
+
+#[cfg(test)]
+mod startup_ack_source_tests {
+    use super::*;
+
+    fn fixture() -> (Bbr, Instant, RttEstimator) {
+        let mut config = BbrConfig::default();
+        config.initial_window(9600);
+        (Bbr::new(Arc::new(config), 1200), Instant::now(), RttEstimator::new(Duration::from_millis(20)))
+    }
+
+    #[test]
+    fn startup_ack_source_unknown_ack_does_not_spend_growth_allowance() {
+        let (mut b, now, rtt) = fixture();
+        b.on_begin_congestion_event(10800);
+        b.on_ack(now, now, 1, 9600, 9600, false, &rtt);
+        b.on_sent(now, 1200, 2, 0);
+        b.on_ack(now, now, 2, 1200, 1200, false, &rtt);
+        b.on_end_acks(now, 0, false, Some(2));
+        assert_eq!(b.window(), 10800, "untracked ACK cannot consume sampler startup allowance");
+    }
+
+    #[test]
+    fn startup_ack_source_duplicate_ack_does_not_spend_growth_allowance() {
+        let (mut b, now, rtt) = fixture();
+        b.on_sent(now, 1200, 1, 0);
+        b.on_begin_congestion_event(1200);
+        b.on_ack(now, now, 1, 1200, 1200, false, &rtt);
+        for _ in 0..7 { b.on_ack(now, now, 1, 1200, 1200, false, &rtt); }
+        b.on_end_acks(now, 0, false, Some(1));
+        assert_eq!(b.window(), 10800, "retired ACK cannot consume sampler startup allowance");
+    }
+
+    #[test]
+    fn startup_ack_source_tracked_zero_interval_ack_spends_allowance() {
+        let (mut b, now, rtt) = fixture();
+        b.on_sent(now, 9600, 1, 0);
+        b.on_begin_congestion_event(9600);
+        b.on_ack(now, now, 1, 9600, 9600, false, &rtt);
+        b.on_end_acks(now, 0, false, Some(1));
+        assert_eq!(b.window(), 9600, "tracked ACK counts even without a rate sample");
+    }
+}
