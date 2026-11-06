@@ -54,6 +54,11 @@ impl BandwidthEstimation {
         self.overestimate_avoidance
     }
 
+    #[cfg(test)]
+    pub(super) fn retained_packet_count(&self) -> usize {
+        self.sent_packets.len()
+    }
+
     pub(crate) fn on_sent(
         &mut self,
         now: Instant,

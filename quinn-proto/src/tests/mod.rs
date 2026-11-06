@@ -4933,3 +4933,50 @@ fn preferred_address() {
 }
 
 mod packet_event_context;
+
+#[test]
+fn bbr_path_validation_ack_releases_sampler_records() {
+    for rebind in [false, true] {
+        let mut transport = TransportConfig::default();
+        transport.congestion_controller_factory(Arc::new(crate::congestion::BbrConfig::default()));
+        let mut server = server_config();
+        server.transport = Arc::new(transport);
+        let mut pair = Pair::new(Default::default(), server);
+        let (client, server) = pair.connect();
+        pair.drive();
+        let retained = |conn: &Connection| {
+            conn.congestion_state()
+                .clone_box()
+                .into_any()
+                .downcast::<crate::congestion::Bbr>()
+                .unwrap()
+                .retained_packet_count()
+        };
+        assert_eq!(retained(pair.server_conn_mut(server)), 0, "baseline");
+        let stream = pair
+            .server_conn_mut(server)
+            .streams()
+            .open(Dir::Uni)
+            .unwrap();
+        pair.server_conn_mut(server)
+            .send_stream(stream)
+            .write(&[42; 1000])
+            .unwrap();
+        pair.drive_server();
+        assert!(retained(pair.server_conn_mut(server)) > 0);
+        if rebind {
+            pair.client
+                .addr
+                .set_port(CLIENT_PORTS.lock().unwrap().next().unwrap());
+        }
+        pair.client_conn_mut(client).ping();
+        pair.drive_client();
+        pair.drive_server();
+        pair.drive();
+        assert_eq!(
+            retained(pair.server_conn_mut(server)),
+            0,
+            "sampler retained acknowledged packets after rebind={rebind}"
+        );
+    }
+}

@@ -70,6 +70,11 @@ pub struct Bbr {
 }
 
 impl Bbr {
+    #[cfg(test)]
+    pub(crate) fn retained_packet_count(&self) -> usize {
+        self.max_bandwidth.retained_packet_count()
+    }
+
     /// Construct a state using the given `config` and current time `now`
     pub fn new(config: Arc<BbrConfig>, current_mtu: u16) -> Self {
         let initial_window = config
