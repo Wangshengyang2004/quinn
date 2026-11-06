@@ -72,6 +72,11 @@ impl Bbr {
         self.max_bandwidth.retained_packet_count()
     }
 
+    #[cfg(test)]
+    pub(crate) fn reached_full_bandwidth(&self) -> bool {
+        self.is_at_full_bandwidth
+    }
+
     /// Construct a state using the given `config` and current time `now`
     pub fn new(config: Arc<BbrConfig>, current_mtu: u16) -> Self {
         let initial_window = config
