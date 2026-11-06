@@ -159,6 +159,10 @@ impl BandwidthEstimation {
         Some(sent.app_limited)
     }
 
+    pub(crate) fn on_packet_discarded(&mut self, packet_number: u64) {
+        self.sent_packets.remove(&packet_number);
+    }
+
     pub(crate) fn on_packet_lost(&mut self, packet_number: u64) {
         if let Some(sent) = self.sent_packets.remove(&packet_number) {
             self.record_event_send_state(packet_number, sent.app_limited);

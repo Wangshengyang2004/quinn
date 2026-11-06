@@ -528,6 +528,10 @@ impl Controller for Bbr {
         }
     }
 
+    fn on_packet_discarded(&mut self, packet_number: u64) {
+        self.max_bandwidth.on_packet_discarded(packet_number);
+    }
+
     fn on_packet_lost(&mut self, packet_number: u64, _bytes: u64) {
         self.max_bandwidth.on_packet_lost(packet_number);
     }

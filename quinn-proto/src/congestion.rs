@@ -42,6 +42,11 @@ pub trait Controller: Send + Sync {
     #[allow(unused_variables)]
     fn on_packet_lost(&mut self, packet_number: u64, bytes: u64) {}
 
+    /// A packet is no longer tracked, without an ACK or loss sample.
+    /// Retire per-packet bookkeeping without changing congestion-event inputs.
+    #[allow(unused_variables)]
+    fn on_packet_discarded(&mut self, packet_number: u64) {}
+
     /// Packet deliveries were confirmed
     ///
     /// `app_limited` indicates whether the connection was blocked on outgoing
