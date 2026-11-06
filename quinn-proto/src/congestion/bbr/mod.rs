@@ -561,6 +561,20 @@ impl Controller for Bbr {
         if let Some(state) = send_state {
             self.last_sample_is_app_limited = state.app_limited;
         }
+        if let Some(largest_acked_packet) = largest_packet_num_acked {
+            self.max_acked_packet_number = largest_acked_packet;
+        }
+
+        let mut is_round_start = false;
+        if bytes_acked > 0 {
+            is_round_start =
+                self.max_acked_packet_number > self.current_round_trip_end_packet_number;
+            if is_round_start {
+                self.current_round_trip_end_packet_number = self.max_sent_packet_number;
+                self.round_count += 1;
+            }
+        }
+
         self.max_bandwidth.update_estimate(self.round_count);
         let bandwidth_increased = self.max_bandwidth.estimate_increased_this_window();
         let excess_acked = self.ack_aggregation.update_ack_aggregation_bytes(
@@ -575,19 +589,6 @@ impl Controller for Bbr {
             app_limited,
             bytes_acked > 0 && excess_acked == 0,
         );
-        if let Some(largest_acked_packet) = largest_packet_num_acked {
-            self.max_acked_packet_number = largest_acked_packet;
-        }
-
-        let mut is_round_start = false;
-        if bytes_acked > 0 {
-            is_round_start =
-                self.max_acked_packet_number > self.current_round_trip_end_packet_number;
-            if is_round_start {
-                self.current_round_trip_end_packet_number = self.max_sent_packet_number;
-                self.round_count += 1;
-            }
-        }
 
         // Match quic-go: only newly acknowledged congestion-controlled packets
         // advance recovery. A loss-only event still updates the existing window below.
