@@ -97,3 +97,13 @@ is disabled by default and changes no advertised transport parameter, congestion
 algorithm, timer or ordinary socket behavior. Host and consumer integration
 must be validated separately; already queued/in-flight packets retain normal
 loss recovery.
+
+`Controller::on_packet_discarded` retires packet bookkeeping without creating a
+congestion event, delivery-rate sample or loss sample. BBR uses it when an ACK
+is intentionally ignored during path validation, and when Retry or rejected
+0-RTT withdraws a tracked packet. Controller wrappers must forward this callback
+to controllers that may retain the packet, including an inactive controller
+after authentication selects a different algorithm. Existing ACK/loss callbacks
+retain their behavior. Same-IP port-rebinding and sampler regressions cover
+record retirement and preservation of event/delivery state; consumer and field
+validation remain separate requirements.
