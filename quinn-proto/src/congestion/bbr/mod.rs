@@ -1976,7 +1976,11 @@ mod round_order_diagnostic {
             (11, 1, 12, 10_000),
         ] {
             let start = Instant::now();
-            let mut b = Bbr::new(Arc::new(BbrConfig::default()), 1200);
+            let mut config = BbrConfig::default();
+            config.initial_window_packets(32).max_window_packets(20_000)
+                .enable_ack_aggregation_during_startup(false)
+                .expire_ack_aggregation_in_startup(false).drain_to_target(false);
+            let mut b = Bbr::new(Arc::new(config), 1200);
             // Seed a 100 KB/s sample at round zero through the real sampler.
             b.on_sent(start, 10_000, 1, 0);
             assert_eq!(b.max_bandwidth.on_ack(start + Duration::from_millis(100), 1), Some(false));
