@@ -216,6 +216,10 @@ impl BandwidthEstimation {
         self.has_non_app_limited_sample
     }
 
+    pub(crate) fn total_bytes_acked(&self) -> u64 {
+        self.total_acked
+    }
+
     pub(crate) fn bytes_acked_this_window(&self) -> u64 {
         self.total_acked - self.acked_at_last_window
     }

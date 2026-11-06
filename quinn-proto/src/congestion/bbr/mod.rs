@@ -26,7 +26,6 @@ pub struct Bbr {
     config: Arc<BbrConfig>,
     current_mtu: u64,
     max_bandwidth: BandwidthEstimation,
-    acked_bytes: u64,
     mode: Mode,
     loss_state: LossState,
     recovery_state: RecoveryState,
@@ -99,7 +98,6 @@ impl Bbr {
             config,
             current_mtu: current_mtu as u64,
             max_bandwidth,
-            acked_bytes: 0,
             mode: Mode::Startup,
             loss_state: Default::default(),
             recovery_state: RecoveryState::NotInRecovery,
@@ -401,7 +399,7 @@ impl Bbr {
         // time.
         if self.is_at_full_bandwidth {
             self.cwnd = target_window.min(self.cwnd + bytes_acked);
-        } else if (self.cwnd < target_window) || (self.acked_bytes < self.init_cwnd) {
+        } else if (self.cwnd < target_window) || (self.max_bandwidth.total_bytes_acked() < self.init_cwnd) {
             // If the connection is not yet out of startup phase, do not decrease
             // the window.
             self.cwnd += bytes_acked;
@@ -531,7 +529,7 @@ impl Controller for Bbr {
         now: Instant,
         sent: Instant,
         packet_number: u64,
-        bytes: u64,
+        _bytes: u64,
         _bytes_in_flight_at_send: u64,
         _app_limited: bool,
         _rtt: &RttEstimator,
@@ -542,7 +540,6 @@ impl Controller for Bbr {
                 self.event_min_rtt = Some(self.event_min_rtt.map_or(sample, |old| old.min(sample)));
             }
         }
-        self.acked_bytes += bytes;
     }
 
     fn on_end_acks(
@@ -1390,14 +1387,14 @@ mod tests {
         }
         assert_eq!(bbr.mode, Mode::Startup);
         assert!(
-            bbr.acked_bytes > 20 * bbr.init_cwnd,
+            bbr.max_bandwidth.total_bytes_acked() > 20 * bbr.init_cwnd,
             "scenario sanity: plenty of bytes must have been acked"
         );
         assert!(
             bbr.cwnd <= 4 * bbr.init_cwnd,
             "STARTUP cwnd must stay near the BDP-derived target, got {} after {} bytes acked (init_cwnd {})",
             bbr.cwnd,
-            bbr.acked_bytes,
+            bbr.max_bandwidth.total_bytes_acked(),
             bbr.init_cwnd
         );
     }
@@ -1436,14 +1433,14 @@ mod tests {
         }
         assert_eq!(bbr.mode, Mode::Startup);
         assert!(
-            bbr.acked_bytes > 20 * bbr.init_cwnd,
+            bbr.max_bandwidth.total_bytes_acked() > 20 * bbr.init_cwnd,
             "scenario sanity: plenty of bytes must have been acked"
         );
         assert!(
             bbr.cwnd <= 4 * bbr.init_cwnd,
             "app-limited-from-birth cwnd must stay bounded, got {} after {} bytes acked (init_cwnd {})",
             bbr.cwnd,
-            bbr.acked_bytes,
+            bbr.max_bandwidth.total_bytes_acked(),
             bbr.init_cwnd
         );
     }
