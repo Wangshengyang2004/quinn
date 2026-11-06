@@ -536,11 +536,7 @@ impl Controller for Bbr {
         _app_limited: bool,
         _rtt: &RttEstimator,
     ) {
-        if self
-            .max_bandwidth
-            .on_ack(now, packet_number, self.round_count)
-            .is_some()
-        {
+        if self.max_bandwidth.on_ack(now, packet_number).is_some() {
             let sample = now.saturating_duration_since(sent);
             if !sample.is_zero() {
                 self.event_min_rtt = Some(self.event_min_rtt.map_or(sample, |old| old.min(sample)));
@@ -565,6 +561,7 @@ impl Controller for Bbr {
         if let Some(state) = send_state {
             self.last_sample_is_app_limited = state.app_limited;
         }
+        self.max_bandwidth.update_estimate(self.round_count);
         let bandwidth_increased = self.max_bandwidth.estimate_increased_this_window();
         let excess_acked = self.ack_aggregation.update_ack_aggregation_bytes(
             bytes_acked,
@@ -1561,9 +1558,10 @@ mod profile_tests {
         bbr.max_bandwidth
             .on_sent(start + Duration::from_millis(10), 2, 1200, 1200);
         bbr.max_bandwidth
-            .on_ack(start + Duration::from_millis(20), 1, 0);
+            .on_ack(start + Duration::from_millis(20), 1);
         bbr.max_bandwidth
-            .on_ack(start + Duration::from_millis(30), 2, 0);
+            .on_ack(start + Duration::from_millis(30), 2);
+        bbr.max_bandwidth.update_estimate(0);
         assert_eq!(bbr.max_bandwidth.get_estimate(), 80_000);
 
         bbr.min_rtt = Duration::from_millis(100);
@@ -1792,7 +1790,8 @@ mod profile_tests {
         bbr.on_sent(sent, 1200, 1, 0);
         bbr.on_sent(sent + Duration::from_millis(10), 1200, 2, 1200);
         bbr.max_bandwidth
-            .on_ack(sent + Duration::from_millis(50), 2, 0);
+            .on_ack(sent + Duration::from_millis(50), 2);
+        bbr.max_bandwidth.update_estimate(0);
         bbr.max_bandwidth.end_acks(0, false, false);
         bbr.on_sent(sent + Duration::from_millis(60), 1200, 3, 1200);
         let now = sent + Duration::from_millis(160);

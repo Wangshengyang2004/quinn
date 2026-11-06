@@ -123,3 +123,12 @@ type. Capability is directional: an endpoint may request ACK behavior from a
 peer that advertises support while omitting its own receive capability.
 The default remains enabled. This admission check changes neither PTO backoff
 nor congestion parameters; throughput and recovery need consumer verification.
+
+Delivery-rate filtering selects the maximum valid ACK sample of the completed
+congestion event together with that sample's application-limited flag, then
+updates the bandwidth filter once. A smaller full-rate sample in the same batch
+cannot first expire the old peak and thereby admit an application-limited event
+maximum against an already-reduced estimate. The maximum sample and the newest
+packet send state used for STARTUP remain distinct inputs. Deterministic mixed
+batch and filter-expiry cases are compared with Hysteria 2.13.0; this alignment
+does not establish a field throughput benefit or full event-path equivalence.

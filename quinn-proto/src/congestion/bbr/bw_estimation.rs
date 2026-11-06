@@ -43,6 +43,7 @@ pub(crate) struct BandwidthEstimation {
     has_non_app_limited_sample: bool,
     last_event_packet_send_state: Option<(u64, PacketSendState)>,
     max_filter: MinMax,
+    event_max_bandwidth: Option<(u64, bool)>,
     acked_at_last_window: u64,
     estimate_at_last_window: u64,
     overestimate_avoidance: bool,
@@ -107,7 +108,7 @@ impl BandwidthEstimation {
         );
     }
 
-    pub(crate) fn on_ack(&mut self, now: Instant, packet_number: u64, round: u64) -> Option<bool> {
+    pub(crate) fn on_ack(&mut self, now: Instant, packet_number: u64) -> Option<bool> {
         let sent = self.sent_packets.remove(&packet_number)?;
         // Keep the newest valid send state across ACK and loss callbacks,
         // including packets whose delivery-rate sample has zero duration.
@@ -160,12 +161,27 @@ impl BandwidthEstimation {
         };
 
         let bandwidth = send_rate.min(ack_rate);
-        // Application-limited samples can raise the estimate. All valid full-rate
-        // samples must advance the filter so an old peak can expire.
-        if bandwidth > 0 && (!sent.send_state.app_limited || bandwidth > self.max_filter.get()) {
-            self.max_filter.update_max(round, bandwidth);
+        // Select the event maximum before applying the app-limited gate. Updating
+        // the filter per packet can expire its old peak on an earlier full-rate
+        // sample, then admit a smaller app-limited event maximum against that
+        // already-reduced peak. Hysteria gates the completed event instead.
+        if bandwidth > 0
+            && self
+                .event_max_bandwidth
+                .is_none_or(|(best, _)| bandwidth > best)
+        {
+            self.event_max_bandwidth = Some((bandwidth, sent.send_state.app_limited));
         }
         Some(sent.send_state.app_limited)
+    }
+
+    /// Commit one completed congestion event before its model is consumed.
+    pub(crate) fn update_estimate(&mut self, round: u64) {
+        if let Some((bandwidth, app_limited)) = self.event_max_bandwidth.take() {
+            if !app_limited || bandwidth > self.max_filter.get() {
+                self.max_filter.update_max(round, bandwidth);
+            }
+        }
     }
 
     pub(crate) fn on_packet_discarded(&mut self, packet_number: u64) {
@@ -214,6 +230,7 @@ impl BandwidthEstimation {
         _app_limited: bool,
         new_aggregation_epoch: bool,
     ) {
+        debug_assert!(self.event_max_bandwidth.is_none());
         self.acked_at_last_window = self.total_acked;
         self.estimate_at_last_window = self.get_estimate();
         // Overshoot history uses the same completed event send state as startup.
@@ -308,7 +325,8 @@ mod tests {
         estimation.on_sent(now, 1, 1200, 0);
         estimation.on_app_limited(1);
         estimation.on_sent(now, 2, 1200, 1200);
-        estimation.on_ack(now + Duration::from_millis(50), 1, 0);
+        estimation.on_ack(now + Duration::from_millis(50), 1);
+        estimation.update_estimate(0);
         let event = estimation.last_event_packet_send_state;
         let acked = estimation.total_acked;
         let estimate = estimation.get_estimate();
@@ -340,13 +358,14 @@ mod tests {
         let mut estimation = BandwidthEstimation::default();
         estimation.on_app_limited(0);
         estimation.on_sent(now, 1, 1200, 0);
-        assert_eq!(estimation.on_ack(now, 1, 0), None);
+        assert_eq!(estimation.on_ack(now, 1), None);
         assert_eq!(
             estimation
                 .last_event_packet_send_state()
                 .map(|state| state.app_limited),
             Some(true)
         );
+        estimation.update_estimate(0);
         estimation.end_acks(0, false, false);
         assert_eq!(estimation.last_event_packet_send_state(), None);
     }
@@ -362,7 +381,8 @@ mod tests {
                 estimator.on_app_limited(round - 1);
             }
             estimator.on_sent(now, round, bytes, 0);
-            estimator.on_ack(now + Duration::from_millis(50), round, round);
+            estimator.on_ack(now + Duration::from_millis(50), round);
+            estimator.update_estimate(round);
             if round > 0 {
                 assert_eq!(estimator.get_estimate(), 200_000);
             }
@@ -377,7 +397,8 @@ mod tests {
             let now = start + Duration::from_millis(round * 10);
             let bytes = if round < 2 { 10_000 } else { 1_000 };
             estimator.on_sent(now, round, bytes, 0);
-            estimator.on_ack(now + Duration::from_millis(50), round, round);
+            estimator.on_ack(now + Duration::from_millis(50), round);
+            estimator.update_estimate(round);
             if round == 1 {
                 assert_eq!(estimator.get_estimate(), 200_000);
             }
@@ -417,8 +438,9 @@ mod tests {
         estimation.enable_overestimate_avoidance();
         estimation.on_sent(start, 1, 1000, 0);
         estimation.on_sent(start + Duration::from_millis(10), 2, 1000, 1000);
-        estimation.on_ack(start + Duration::from_millis(100), 1, 0);
+        estimation.on_ack(start + Duration::from_millis(100), 1);
 
+        estimation.update_estimate(0);
         assert_eq!(estimation.get_estimate(), 10_000);
     }
 
@@ -429,11 +451,12 @@ mod tests {
         estimation.on_sent(start, 1, 1000, 0);
         estimation.on_sent(start + Duration::from_millis(10), 2, 1000, 1000);
 
-        estimation.on_ack(start + Duration::from_millis(20), 1, 0);
-        estimation.on_ack(start + Duration::from_millis(30), 2, 0);
+        estimation.on_ack(start + Duration::from_millis(20), 1);
+        estimation.on_ack(start + Duration::from_millis(30), 2);
 
         // Packet 2 was sent 10 ms after the opening packet (100 KB/s send rate), while 2 KB
         // were acknowledged over 30 ms (66.666 KB/s ACK rate). BBR uses the lower rate.
+        estimation.update_estimate(0);
         assert_eq!(estimation.get_estimate(), 66_666);
     }
 
@@ -446,15 +469,16 @@ mod tests {
         estimation.on_sent(start + Duration::from_millis(10), 2, 1000, 1000);
 
         assert_eq!(
-            estimation.on_ack(start + Duration::from_millis(20), 1, 0),
+            estimation.on_ack(start + Duration::from_millis(20), 1),
             Some(false)
         );
         assert!(estimation.is_app_limited);
         assert_eq!(
-            estimation.on_ack(start + Duration::from_millis(30), 2, 0),
+            estimation.on_ack(start + Duration::from_millis(30), 2),
             Some(true)
         );
         assert!(!estimation.is_app_limited);
+        estimation.update_estimate(0);
         assert_eq!(estimation.get_estimate(), 66_666);
         assert_eq!(
             estimation
@@ -465,9 +489,10 @@ mod tests {
 
         estimation.on_sent(start + Duration::from_millis(40), 3, 1000, 0);
         assert_eq!(
-            estimation.on_ack(start + Duration::from_millis(50), 3, 0),
+            estimation.on_ack(start + Duration::from_millis(50), 3),
             Some(false)
         );
+        estimation.update_estimate(0);
         estimation.end_acks(0, false, false);
         assert!(estimation.has_non_app_limited_sample());
     }
@@ -495,7 +520,7 @@ mod tests {
         // The caller may deliver loss callbacks before ACKs or out of order.
         estimation.on_packet_lost(3);
         estimation.on_packet_lost(2);
-        estimation.on_ack(start + Duration::from_millis(100), 1, 0);
+        estimation.on_ack(start + Duration::from_millis(100), 1);
         estimation.on_packet_lost(999);
         assert_eq!(
             estimation
@@ -505,6 +530,7 @@ mod tests {
         );
         assert_eq!(estimation.last_event_packet_send_state.unwrap().0, 3);
 
+        estimation.update_estimate(0);
         estimation.end_acks(0, false, false);
         estimation.on_packet_lost(3); // Duplicate notification has no send state.
         estimation.on_sent(start + Duration::from_millis(110), 1000, 0, 0);
@@ -525,17 +551,31 @@ mod event_filter_diagnostic {
                 e.max_filter.update_max(0, 100_000);
                 let start = Instant::now();
                 e.on_sent(start, 1, 1_000, 0);
-                if second_app_limited { e.on_app_limited(1); }
+                if second_app_limited {
+                    e.on_app_limited(1);
+                }
                 e.on_sent(start + Duration::from_millis(10), 2, 1_000, 1_000);
                 let now = start + Duration::from_millis(100);
-                assert_eq!(e.on_ack(now, 1, round), Some(false));
-                assert_eq!(e.on_ack(now, 2, round), Some(second_app_limited));
+                assert_eq!(e.on_ack(now, 1), Some(false));
+                assert_eq!(e.on_ack(now, 2), Some(second_app_limited));
+                e.update_estimate(round);
                 let actual = e.get_estimate();
-                let expected = if round == 11 && !second_app_limited {20_000} else {100_000};
-                println!("round={round} second_app_limited={second_app_limited} estimate_bytes_s={actual} expected_go={expected}");
-                if actual != expected { mismatches.push((round, second_app_limited, actual, expected)); }
+                let expected = if round == 11 && !second_app_limited {
+                    20_000
+                } else {
+                    100_000
+                };
+                println!(
+                    "round={round} second_app_limited={second_app_limited} estimate_bytes_s={actual} expected_go={expected}"
+                );
+                if actual != expected {
+                    mismatches.push((round, second_app_limited, actual, expected));
+                }
             }
         }
-        assert!(mismatches.is_empty(), "event filter divergence: {mismatches:?}");
+        assert!(
+            mismatches.is_empty(),
+            "event filter divergence: {mismatches:?}"
+        );
     }
 }
