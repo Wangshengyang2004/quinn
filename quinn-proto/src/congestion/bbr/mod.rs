@@ -1865,4 +1865,67 @@ mod profile_tests {
         assert!(!bbr.last_sample_is_app_limited);
         assert!(bbr.max_bandwidth.has_non_app_limited_sample());
     }
+
+    // The aggregate loss callback can name a packet not sampled by this BBR
+    // instance (e.g. a packet sent before authentication selected this controller).
+    // Its transport metadata must not replace a sampled packet's send state.
+    fn startup_loss_state_fixture() -> (Bbr, Instant) {
+        let mut bbr = Bbr::new(Arc::new(BbrConfig::default()), 1200);
+        bbr.loss_events_in_round = 8;
+        bbr.bytes_lost_in_round = 1000;
+        (bbr, Instant::now())
+    }
+
+    #[test]
+    fn startup_loss_state_ignores_unknown_ack() {
+        let (mut bbr, sent) = startup_loss_state_fixture();
+        bbr.on_sent(sent, 1200, 1, 98_800);
+        let now = sent + Duration::from_millis(100);
+        let rtt = RttEstimator::new(Duration::from_millis(100));
+        bbr.on_ack(now, sent, 1, 1200, 100_000, false, &rtt);
+        bbr.on_ack(now, sent, 2, 1200, 1200, false, &rtt);
+        assert!(!bbr.should_exit_startup_due_to_loss(),
+            "unknown ACK replaced the valid 100000-byte send state");
+    }
+
+    #[test]
+    fn startup_loss_state_ignores_unknown_aggregate_loss() {
+        let (mut bbr, sent) = startup_loss_state_fixture();
+        bbr.on_sent(sent, 1200, 1, 98_800);
+        let now = sent + Duration::from_millis(100);
+        bbr.on_ack(now, sent, 1, 1200, 100_000, false,
+            &RttEstimator::new(Duration::from_millis(100)));
+        bbr.on_packet_lost(2, 1200);
+        bbr.on_congestion_event(now, sent, false, 100, 1, Some(2), Some(1200));
+        assert!(!bbr.should_exit_startup_due_to_loss(),
+            "unknown loss replaced the valid ACK's send state");
+    }
+
+    #[test]
+    fn startup_loss_state_keeps_newest_sampled_loss() {
+        let (mut bbr, sent) = startup_loss_state_fixture();
+        bbr.on_sent(sent, 1200, 1, 0);
+        bbr.on_sent(sent, 1200, 2, 98_800);
+        let now = sent + Duration::from_millis(100);
+        bbr.on_packet_lost(2, 1200);
+        bbr.on_packet_lost(3, 0);
+        bbr.on_congestion_event(now, sent, false, 1200, 1, Some(3), Some(1_000_000));
+        bbr.on_ack(now, sent, 1, 1200, 1200, false,
+            &RttEstimator::new(Duration::from_millis(100)));
+        assert!(bbr.should_exit_startup_due_to_loss(),
+            "the newest valid lost packet had 100000 bytes in flight; 2200 lost exceeds 2%");
+    }
+
+    #[test]
+    fn startup_loss_state_retains_zero_duration_ack() {
+        let (mut bbr, sent) = startup_loss_state_fixture();
+        bbr.on_sent(sent, 1200, 1, 98_800);
+        // No previous ACK time: this has valid send state but no rate sample.
+        bbr.on_ack(sent, sent, 1, 1200, 100_000, false,
+            &RttEstimator::new(Duration::from_millis(100)));
+        bbr.on_congestion_event(sent, sent, false, 100, 1, Some(2), Some(1200));
+        assert!(!bbr.should_exit_startup_due_to_loss(),
+            "a valid send state must survive an absent bandwidth sample");
+    }
+
 }
