@@ -294,6 +294,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn discarding_packet_preserves_delivery_and_event_samples() {
+        let now = Instant::now();
+        let mut estimation = BandwidthEstimation::default();
+        estimation.on_sent(now, 1, 1200, 0);
+        estimation.on_app_limited(1);
+        estimation.on_sent(now, 2, 1200, 1200);
+        estimation.on_ack(now + Duration::from_millis(50), 1, 0);
+        let event = estimation.last_event_packet_app_limited;
+        let acked = estimation.total_acked;
+        let estimate = estimation.get_estimate();
+        let ack_time = estimation.last_acked_packet_ack_time;
+        assert_eq!(event, Some((1, false)));
+        assert_eq!(estimation.sent_packets.len(), 1);
+        estimation.on_packet_discarded(2);
+        estimation.on_packet_discarded(2);
+        estimation.on_packet_discarded(99);
+        assert!(estimation.sent_packets.is_empty());
+        assert_eq!(estimation.last_event_packet_app_limited, event);
+        assert_eq!(estimation.total_acked, acked);
+        assert_eq!(estimation.get_estimate(), estimate);
+        assert_eq!(estimation.last_acked_packet_ack_time, ack_time);
+    }
+
+    #[test]
     fn zero_duration_sample_retains_last_ack_send_state_until_batch_end() {
         let now = Instant::now();
         let mut estimation = BandwidthEstimation::default();
