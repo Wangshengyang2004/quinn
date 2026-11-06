@@ -593,6 +593,14 @@ impl Controller for Bbr {
             app_limited,
             bytes_acked > 0 && excess_acked == 0,
         );
+        // Quinn knows when application data ran out. In-flight bytes alone
+        // cannot distinguish a light stream's BDP from a saturated path.
+        // Mark future sends only: this event retains its recorded send state.
+        if app_limited {
+            self.max_bandwidth
+                .on_app_limited(self.max_sent_packet_number);
+        }
+
 
         // Match quic-go: only newly acknowledged congestion-controlled packets
         // advance recovery. A loss-only event still updates the existing window below.
@@ -2092,5 +2100,31 @@ mod startup_ack_source_tests {
             9600,
             "tracked ACK counts even without a rate sample"
         );
+    }
+}
+
+#[cfg(test)]
+mod transport_app_limited_tests {
+    use super::*;
+
+    #[test]
+    fn bbr_app_limited_hint_marks_future_sends_without_rewriting_history() {
+        let now = Instant::now();
+        let mut bbr = Bbr::new(Arc::new(BbrConfig::default()), 1200);
+        let rtt = RttEstimator::new(Duration::from_millis(100));
+        let mut sent = now;
+        for (packet, hint, expected_sample) in [(1, true, false), (2, false, true), (3, false, false)] {
+            // Above the heuristic's target: only the real application hint
+            // can mark packet 2. Packet 3 follows the ACK beyond the marker.
+            bbr.on_sent(sent, 1200, packet, 80_000);
+            let acked = sent + Duration::from_millis(100);
+            bbr.on_begin_congestion_event(81_200);
+            bbr.on_ack(acked, sent, packet, 1200, 81_200, hint, &rtt);
+            let state = bbr.max_bandwidth.last_event_packet_send_state().unwrap();
+            assert_eq!(state.app_limited, expected_sample, "packet={packet}");
+            bbr.on_end_acks(acked, 80_000, hint, Some(packet));
+            assert_eq!(bbr.last_sample_is_app_limited, expected_sample, "packet={packet}");
+            sent = acked + Duration::from_millis(1);
+        }
     }
 }

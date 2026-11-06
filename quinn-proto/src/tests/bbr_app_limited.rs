@@ -71,13 +71,23 @@ fn bbr_app_limited_light_stream_does_not_exhaust_startup() {
         !full_bandwidth(pair.client_conn_mut(client)),
         "a light stream cannot establish that the unconstrained path reached capacity"
     );
+    run_backlogged_phase(&mut pair, client, server, stream, true);
 }
 
 #[test]
 fn bbr_app_limited_backlogged_stream_still_exits_startup() {
     let (mut pair, client, server) = configured_pair();
     let stream = pair.client_streams(client).open(Dir::Uni).unwrap();
-    let mut accepted = false;
+    run_backlogged_phase(&mut pair, client, server, stream, false);
+}
+
+fn run_backlogged_phase(
+    pair: &mut Pair,
+    client: ConnectionHandle,
+    server: ConnectionHandle,
+    stream: StreamId,
+    mut accepted: bool,
+) {
     let mut sent = 0;
     let mut received = 0;
     for _ in 0..5000 {
@@ -95,7 +105,7 @@ fn bbr_app_limited_backlogged_stream_still_exits_startup() {
             }
         }
         if accepted {
-            received += consume_stream(&mut pair, server, stream);
+            received += consume_stream(pair, server, stream);
         }
         pair.time += Duration::from_millis(1);
     }
