@@ -601,7 +601,6 @@ impl Controller for Bbr {
                 .on_app_limited(self.max_sent_packet_number);
         }
 
-
         // Match quic-go: only newly acknowledged congestion-controlled packets
         // advance recovery. A loss-only event still updates the existing window below.
         if largest_packet_num_acked.is_some() {
@@ -2110,7 +2109,9 @@ mod transport_app_limited_tests {
     #[test]
     fn bbr_app_limited_hint_marks_future_sends_without_rewriting_history() {
         let now = Instant::now();
-        let mut bbr = Bbr::new(Arc::new(BbrConfig::default()), 1200);
+        let mut config = BbrConfig::default();
+        config.initial_window_packets(32);
+        let mut bbr = Bbr::new(Arc::new(config), 1200);
         let rtt = RttEstimator::new(Duration::from_millis(100));
         let mut sent = now;
         for (packet, hint, expected_sample) in [(1, true, false), (2, false, true), (3, false, false)] {
@@ -2118,6 +2119,7 @@ mod transport_app_limited_tests {
             // can mark packet 2. Packet 3 follows the ACK beyond the marker.
             bbr.on_sent(sent, 1200, packet, 80_000);
             let acked = sent + Duration::from_millis(100);
+            assert!(bbr.get_target_cwnd(1.0) < 81_200, "heuristic must not mark this fixture");
             bbr.on_begin_congestion_event(81_200);
             bbr.on_ack(acked, sent, packet, 1200, 81_200, hint, &rtt);
             let state = bbr.max_bandwidth.last_event_packet_send_state().unwrap();
