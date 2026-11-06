@@ -51,7 +51,10 @@ fn bbr_app_limited_light_stream_does_not_exhaust_startup() {
     let mut received = 0;
     for ms in 0..8500 {
         if ms < 8000 && ms % 10 == 0 {
-            assert_eq!(pair.client_send(client, stream).write(&[7; 368]).unwrap(), 368);
+            assert_eq!(
+                pair.client_send(client, stream).write(&[7; 368]).unwrap(),
+                368
+            );
         }
         pair.drive_client();
         pair.drive_server();

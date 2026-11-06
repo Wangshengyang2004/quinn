@@ -2114,18 +2114,26 @@ mod transport_app_limited_tests {
         let mut bbr = Bbr::new(Arc::new(config), 1200);
         let rtt = RttEstimator::new(Duration::from_millis(100));
         let mut sent = now;
-        for (packet, hint, expected_sample) in [(1, true, false), (2, false, true), (3, false, false)] {
+        for (packet, hint, expected_sample) in
+            [(1, true, false), (2, false, true), (3, false, false)]
+        {
             // Above the heuristic's target: only the real application hint
             // can mark packet 2. Packet 3 follows the ACK beyond the marker.
             bbr.on_sent(sent, 1200, packet, 80_000);
             let acked = sent + Duration::from_millis(100);
-            assert!(bbr.get_target_cwnd(1.0) < 81_200, "heuristic must not mark this fixture");
+            assert!(
+                bbr.get_target_cwnd(1.0) < 81_200,
+                "heuristic must not mark this fixture"
+            );
             bbr.on_begin_congestion_event(81_200);
             bbr.on_ack(acked, sent, packet, 1200, 81_200, hint, &rtt);
             let state = bbr.max_bandwidth.last_event_packet_send_state().unwrap();
             assert_eq!(state.app_limited, expected_sample, "packet={packet}");
             bbr.on_end_acks(acked, 80_000, hint, Some(packet));
-            assert_eq!(bbr.last_sample_is_app_limited, expected_sample, "packet={packet}");
+            assert_eq!(
+                bbr.last_sample_is_app_limited, expected_sample,
+                "packet={packet}"
+            );
             sent = acked + Duration::from_millis(1);
         }
     }
