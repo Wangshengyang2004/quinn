@@ -399,7 +399,9 @@ impl Bbr {
         // time.
         if self.is_at_full_bandwidth {
             self.cwnd = target_window.min(self.cwnd + bytes_acked);
-        } else if (self.cwnd < target_window) || (self.max_bandwidth.total_bytes_acked() < self.init_cwnd) {
+        } else if (self.cwnd < target_window)
+            || (self.max_bandwidth.total_bytes_acked() < self.init_cwnd)
+        {
             // If the connection is not yet out of startup phase, do not decrease
             // the window.
             self.cwnd += bytes_acked;
@@ -2034,7 +2036,11 @@ mod startup_ack_source_tests {
     fn fixture() -> (Bbr, Instant, RttEstimator) {
         let mut config = BbrConfig::default();
         config.initial_window(9600);
-        (Bbr::new(Arc::new(config), 1200), Instant::now(), RttEstimator::new(Duration::from_millis(20)))
+        (
+            Bbr::new(Arc::new(config), 1200),
+            Instant::now(),
+            RttEstimator::new(Duration::from_millis(20)),
+        )
     }
 
     #[test]
@@ -2045,7 +2051,11 @@ mod startup_ack_source_tests {
         b.on_sent(now, 1200, 2, 0);
         b.on_ack(now, now, 2, 1200, 1200, false, &rtt);
         b.on_end_acks(now, 0, false, Some(2));
-        assert_eq!(b.window(), 10800, "untracked ACK cannot consume sampler startup allowance");
+        assert_eq!(
+            b.window(),
+            10800,
+            "untracked ACK cannot consume sampler startup allowance"
+        );
     }
 
     #[test]
@@ -2054,9 +2064,15 @@ mod startup_ack_source_tests {
         b.on_sent(now, 1200, 1, 0);
         b.on_begin_congestion_event(1200);
         b.on_ack(now, now, 1, 1200, 1200, false, &rtt);
-        for _ in 0..7 { b.on_ack(now, now, 1, 1200, 1200, false, &rtt); }
+        for _ in 0..7 {
+            b.on_ack(now, now, 1, 1200, 1200, false, &rtt);
+        }
         b.on_end_acks(now, 0, false, Some(1));
-        assert_eq!(b.window(), 10800, "retired ACK cannot consume sampler startup allowance");
+        assert_eq!(
+            b.window(),
+            10800,
+            "retired ACK cannot consume sampler startup allowance"
+        );
     }
 
     #[test]
@@ -2066,6 +2082,10 @@ mod startup_ack_source_tests {
         b.on_begin_congestion_event(9600);
         b.on_ack(now, now, 1, 9600, 9600, false, &rtt);
         b.on_end_acks(now, 0, false, Some(1));
-        assert_eq!(b.window(), 9600, "tracked ACK counts even without a rate sample");
+        assert_eq!(
+            b.window(),
+            9600,
+            "tracked ACK counts even without a rate sample"
+        );
     }
 }
