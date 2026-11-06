@@ -12,6 +12,12 @@ struct AckPoint {
     total_acked: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct PacketSendState {
+    pub(super) app_limited: bool,
+    pub(super) bytes_in_flight: u64,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct SentPacketState {
     sent_time: Instant,
@@ -21,7 +27,7 @@ struct SentPacketState {
     total_sent_at_last_ack: u64,
     last_acked_packet_sent_time: Option<Instant>,
     last_acked_packet_ack_time: Option<Instant>,
-    app_limited: bool,
+    send_state: PacketSendState,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -35,7 +41,7 @@ pub(crate) struct BandwidthEstimation {
     is_app_limited: bool,
     end_of_app_limited_phase: Option<u64>,
     has_non_app_limited_sample: bool,
-    last_event_packet_app_limited: Option<(u64, bool)>,
+    last_event_packet_send_state: Option<(u64, PacketSendState)>,
     max_filter: MinMax,
     acked_at_last_window: u64,
     estimate_at_last_window: u64,
@@ -93,7 +99,10 @@ impl BandwidthEstimation {
                 total_sent_at_last_ack: self.total_sent_at_last_ack,
                 last_acked_packet_sent_time: self.last_acked_packet_sent_time,
                 last_acked_packet_ack_time: self.last_acked_packet_ack_time,
-                app_limited: self.is_app_limited,
+                send_state: PacketSendState {
+                    app_limited: self.is_app_limited,
+                    bytes_in_flight: bytes_in_flight_before + bytes,
+                },
             },
         );
     }
@@ -102,7 +111,7 @@ impl BandwidthEstimation {
         let sent = self.sent_packets.remove(&packet_number)?;
         // Keep the newest valid send state across ACK and loss callbacks,
         // including packets whose delivery-rate sample has zero duration.
-        self.record_event_send_state(packet_number, sent.app_limited);
+        self.record_event_send_state(packet_number, sent.send_state);
         self.total_acked += sent.size;
         self.total_sent_at_last_ack = sent.total_sent;
         self.last_acked_packet_sent_time = Some(sent.sent_time);
@@ -153,10 +162,10 @@ impl BandwidthEstimation {
         let bandwidth = send_rate.min(ack_rate);
         // Application-limited samples can raise the estimate. All valid full-rate
         // samples must advance the filter so an old peak can expire.
-        if bandwidth > 0 && (!sent.app_limited || bandwidth > self.max_filter.get()) {
+        if bandwidth > 0 && (!sent.send_state.app_limited || bandwidth > self.max_filter.get()) {
             self.max_filter.update_max(round, bandwidth);
         }
-        Some(sent.app_limited)
+        Some(sent.send_state.app_limited)
     }
 
     pub(crate) fn on_packet_discarded(&mut self, packet_number: u64) {
@@ -165,16 +174,16 @@ impl BandwidthEstimation {
 
     pub(crate) fn on_packet_lost(&mut self, packet_number: u64) {
         if let Some(sent) = self.sent_packets.remove(&packet_number) {
-            self.record_event_send_state(packet_number, sent.app_limited);
+            self.record_event_send_state(packet_number, sent.send_state);
         }
     }
 
-    fn record_event_send_state(&mut self, packet_number: u64, app_limited: bool) {
+    fn record_event_send_state(&mut self, packet_number: u64, send_state: PacketSendState) {
         if self
-            .last_event_packet_app_limited
+            .last_event_packet_send_state
             .is_none_or(|(last, _)| packet_number > last)
         {
-            self.last_event_packet_app_limited = Some((packet_number, app_limited));
+            self.last_event_packet_send_state = Some((packet_number, send_state));
         }
     }
 
@@ -183,9 +192,8 @@ impl BandwidthEstimation {
         self.end_of_app_limited_phase = Some(end_packet_number);
     }
 
-    pub(crate) fn last_event_packet_app_limited(&self) -> Option<bool> {
-        self.last_event_packet_app_limited
-            .map(|(_, limited)| limited)
+    pub(super) fn last_event_packet_send_state(&self) -> Option<PacketSendState> {
+        self.last_event_packet_send_state.map(|(_, state)| state)
     }
 
     pub(crate) fn has_non_app_limited_sample(&self) -> bool {
@@ -211,9 +219,9 @@ impl BandwidthEstimation {
         // Overshoot history uses the same completed event send state as startup.
         // A full-rate ACK can be older than an application-limited lost packet.
         self.has_non_app_limited_sample |= self
-            .last_event_packet_app_limited
-            .is_some_and(|(_, limited)| !limited);
-        self.last_event_packet_app_limited = None;
+            .last_event_packet_send_state
+            .is_some_and(|(_, state)| !state.app_limited);
+        self.last_event_packet_send_state = None;
         if self.overestimate_avoidance && new_aggregation_epoch {
             if let Some(point) = self.recent_ack_points[0].or(self.recent_ack_points[1]) {
                 self.push_a0_candidate(point);
@@ -301,17 +309,26 @@ mod tests {
         estimation.on_app_limited(1);
         estimation.on_sent(now, 2, 1200, 1200);
         estimation.on_ack(now + Duration::from_millis(50), 1, 0);
-        let event = estimation.last_event_packet_app_limited;
+        let event = estimation.last_event_packet_send_state;
         let acked = estimation.total_acked;
         let estimate = estimation.get_estimate();
         let ack_time = estimation.last_acked_packet_ack_time;
-        assert_eq!(event, Some((1, false)));
+        assert_eq!(
+            event,
+            Some((
+                1,
+                PacketSendState {
+                    app_limited: false,
+                    bytes_in_flight: 1200
+                }
+            ))
+        );
         assert_eq!(estimation.sent_packets.len(), 1);
         estimation.on_packet_discarded(2);
         estimation.on_packet_discarded(2);
         estimation.on_packet_discarded(99);
         assert!(estimation.sent_packets.is_empty());
-        assert_eq!(estimation.last_event_packet_app_limited, event);
+        assert_eq!(estimation.last_event_packet_send_state, event);
         assert_eq!(estimation.total_acked, acked);
         assert_eq!(estimation.get_estimate(), estimate);
         assert_eq!(estimation.last_acked_packet_ack_time, ack_time);
@@ -324,9 +341,14 @@ mod tests {
         estimation.on_app_limited(0);
         estimation.on_sent(now, 1, 1200, 0);
         assert_eq!(estimation.on_ack(now, 1, 0), None);
-        assert_eq!(estimation.last_event_packet_app_limited(), Some(true));
+        assert_eq!(
+            estimation
+                .last_event_packet_send_state()
+                .map(|state| state.app_limited),
+            Some(true)
+        );
         estimation.end_acks(0, false, false);
-        assert_eq!(estimation.last_event_packet_app_limited(), None);
+        assert_eq!(estimation.last_event_packet_send_state(), None);
     }
 
     #[test]
@@ -434,7 +456,12 @@ mod tests {
         );
         assert!(!estimation.is_app_limited);
         assert_eq!(estimation.get_estimate(), 66_666);
-        assert_eq!(estimation.last_event_packet_app_limited(), Some(true));
+        assert_eq!(
+            estimation
+                .last_event_packet_send_state()
+                .map(|state| state.app_limited),
+            Some(true)
+        );
 
         estimation.on_sent(start + Duration::from_millis(40), 3, 1000, 0);
         assert_eq!(
@@ -470,13 +497,18 @@ mod tests {
         estimation.on_packet_lost(2);
         estimation.on_ack(start + Duration::from_millis(100), 1, 0);
         estimation.on_packet_lost(999);
-        assert_eq!(estimation.last_event_packet_app_limited(), Some(true));
-        assert_eq!(estimation.last_event_packet_app_limited.unwrap().0, 3);
+        assert_eq!(
+            estimation
+                .last_event_packet_send_state()
+                .map(|state| state.app_limited),
+            Some(true)
+        );
+        assert_eq!(estimation.last_event_packet_send_state.unwrap().0, 3);
 
         estimation.end_acks(0, false, false);
         estimation.on_packet_lost(3); // Duplicate notification has no send state.
         estimation.on_sent(start + Duration::from_millis(110), 1000, 0, 0);
         estimation.on_packet_lost(1000); // ACK-only packet is not sampled.
-        assert_eq!(estimation.last_event_packet_app_limited(), None);
+        assert_eq!(estimation.last_event_packet_send_state(), None);
     }
 }

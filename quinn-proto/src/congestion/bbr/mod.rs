@@ -6,7 +6,7 @@ use rand::{RngExt, SeedableRng};
 use rand_pcg::Pcg32;
 
 use crate::congestion::ControllerMetrics;
-use crate::congestion::bbr::bw_estimation::BandwidthEstimation;
+use crate::congestion::bbr::bw_estimation::{BandwidthEstimation, PacketSendState};
 use crate::connection::RttEstimator;
 use crate::{Duration, Instant};
 
@@ -64,8 +64,6 @@ pub struct Bbr {
     last_sample_is_app_limited: bool,
     loss_events_in_round: u64,
     bytes_lost_in_round: u64,
-    last_event_packet_number: Option<u64>,
-    last_event_packet_bytes_in_flight_at_send: Option<u64>,
     random_number_generator: Pcg32,
 }
 
@@ -139,8 +137,6 @@ impl Bbr {
             last_sample_is_app_limited: false,
             loss_events_in_round: 0,
             bytes_lost_in_round: 0,
-            last_event_packet_number: None,
-            last_event_packet_bytes_in_flight_at_send: None,
             random_number_generator: Pcg32::from_rng(&mut rand::rng()),
         }
     }
@@ -454,8 +450,8 @@ impl Bbr {
     }
 
     /// <https://datatracker.ietf.org/doc/html/draft-cardwell-iccrg-bbr-congestion-control#section-4.3.2.2>
-    fn check_if_full_bw_reached(&mut self, app_limited: bool) {
-        if app_limited {
+    fn check_if_full_bw_reached(&mut self, send_state: Option<PacketSendState>) {
+        if self.last_sample_is_app_limited {
             return;
         }
         let target = (self.bw_at_last_round as f64 * K_STARTUP_GROWTH_TARGET as f64) as u64;
@@ -473,34 +469,28 @@ impl Bbr {
 
         self.round_wo_bw_gain += 1;
         if self.round_wo_bw_gain >= u64::from(self.config.startup_rounds_without_growth)
-            || self.should_exit_startup_due_to_loss()
+            || self.should_exit_startup_due_to_loss(send_state)
         {
             self.is_at_full_bandwidth = true;
         }
     }
 
-    fn should_exit_startup_due_to_loss(&self) -> bool {
+    fn should_exit_startup_due_to_loss(&self, send_state: Option<PacketSendState>) -> bool {
         const STARTUP_FULL_LOSS_COUNT: u64 = 8;
         const STARTUP_LOSS_THRESHOLD: f64 = 0.02;
 
         if self.loss_events_in_round < STARTUP_FULL_LOSS_COUNT {
             return false;
         }
-        let Some(in_flight_at_send) = self.last_event_packet_bytes_in_flight_at_send else {
+        let Some(PacketSendState {
+            bytes_in_flight: in_flight_at_send,
+            ..
+        }) = send_state
+        else {
             return false;
         };
         in_flight_at_send > 0
             && self.bytes_lost_in_round > (in_flight_at_send as f64 * STARTUP_LOSS_THRESHOLD) as u64
-    }
-
-    fn record_last_event_packet(&mut self, packet_number: u64, bytes_in_flight_at_send: u64) {
-        if self
-            .last_event_packet_number
-            .is_none_or(|last| packet_number >= last)
-        {
-            self.last_event_packet_number = Some(packet_number);
-            self.last_event_packet_bytes_in_flight_at_send = Some(bytes_in_flight_at_send);
-        }
     }
 }
 
@@ -542,11 +532,10 @@ impl Controller for Bbr {
         sent: Instant,
         packet_number: u64,
         bytes: u64,
-        bytes_in_flight_at_send: u64,
+        _bytes_in_flight_at_send: u64,
         _app_limited: bool,
         _rtt: &RttEstimator,
     ) {
-        self.record_last_event_packet(packet_number, bytes_in_flight_at_send);
         if self
             .max_bandwidth
             .on_ack(now, packet_number, self.round_count)
@@ -572,8 +561,9 @@ impl Controller for Bbr {
             .event_min_rtt
             .take()
             .is_some_and(|sample| self.update_min_rtt(now, sample));
-        if let Some(app_limited_sample) = self.max_bandwidth.last_event_packet_app_limited() {
-            self.last_sample_is_app_limited = app_limited_sample;
+        let send_state = self.max_bandwidth.last_event_packet_send_state();
+        if let Some(state) = send_state {
+            self.last_sample_is_app_limited = state.app_limited;
         }
         let bandwidth_increased = self.max_bandwidth.estimate_increased_this_window();
         let excess_acked = self.ack_aggregation.update_ack_aggregation_bytes(
@@ -613,7 +603,7 @@ impl Controller for Bbr {
         }
 
         if is_round_start && !self.is_at_full_bandwidth {
-            self.check_if_full_bw_reached(self.last_sample_is_app_limited);
+            self.check_if_full_bw_reached(send_state);
         }
 
         self.maybe_exit_startup_or_drain(now, in_flight);
@@ -626,8 +616,6 @@ impl Controller for Bbr {
         self.calculate_recovery_window(bytes_acked, self.loss_state.lost_bytes, in_flight);
 
         self.loss_state.reset();
-        self.last_event_packet_number = None;
-        self.last_event_packet_bytes_in_flight_at_send = None;
         if is_round_start {
             self.loss_events_in_round = 0;
             self.bytes_lost_in_round = 0;
@@ -641,18 +629,13 @@ impl Controller for Bbr {
         _is_persistent_congestion: bool,
         lost_bytes: u64,
         lost_packets: u64,
-        last_packet_number: Option<u64>,
-        last_packet_bytes_in_flight_at_send: Option<u64>,
+        _last_packet_number: Option<u64>,
+        _last_packet_bytes_in_flight_at_send: Option<u64>,
     ) {
         self.loss_state.lost_bytes += lost_bytes;
         if lost_packets > 0 {
             self.loss_events_in_round += 1;
             self.bytes_lost_in_round += lost_bytes;
-        }
-        if let (Some(packet_number), Some(bytes_in_flight_at_send)) =
-            (last_packet_number, last_packet_bytes_in_flight_at_send)
-        {
-            self.record_last_event_packet(packet_number, bytes_in_flight_at_send);
         }
     }
 
@@ -1599,15 +1582,27 @@ mod profile_tests {
         let now = Instant::now();
 
         for packet_number in 1..8 {
+            bbr.on_sent(now, 250, packet_number, 99_750);
+            bbr.on_packet_lost(packet_number, 250);
             bbr.on_congestion_event(now, now, false, 250, 1, Some(packet_number), Some(100_000));
         }
-        assert!(!bbr.should_exit_startup_due_to_loss());
+        assert!(
+            !bbr.should_exit_startup_due_to_loss(bbr.max_bandwidth.last_event_packet_send_state())
+        );
 
+        bbr.on_sent(now, 250, 8, 99_750);
+        bbr.on_packet_lost(8, 250);
         bbr.on_congestion_event(now, now, false, 250, 1, Some(8), Some(100_000));
-        assert!(!bbr.should_exit_startup_due_to_loss());
+        assert!(
+            !bbr.should_exit_startup_due_to_loss(bbr.max_bandwidth.last_event_packet_send_state())
+        );
 
+        bbr.on_sent(now, 1, 9, 99_999);
+        bbr.on_packet_lost(9, 1);
         bbr.on_congestion_event(now, now, false, 1, 1, Some(9), Some(100_000));
-        assert!(bbr.should_exit_startup_due_to_loss());
+        assert!(
+            bbr.should_exit_startup_due_to_loss(bbr.max_bandwidth.last_event_packet_send_state())
+        );
     }
 
     #[test]
@@ -1884,8 +1879,14 @@ mod profile_tests {
         let rtt = RttEstimator::new(Duration::from_millis(100));
         bbr.on_ack(now, sent, 1, 1200, 100_000, false, &rtt);
         bbr.on_ack(now, sent, 2, 1200, 1200, false, &rtt);
-        assert!(!bbr.should_exit_startup_due_to_loss(),
-            "unknown ACK replaced the valid 100000-byte send state");
+        assert!(
+            !bbr.should_exit_startup_due_to_loss(bbr.max_bandwidth.last_event_packet_send_state()),
+            "unknown ACK replaced the valid 100000-byte send state"
+        );
+        bbr.bw_at_last_round = 1_000_000_000;
+        bbr.on_end_acks(now, 0, false, Some(2));
+        assert!(!bbr.is_at_full_bandwidth);
+        assert_eq!(bbr.mode, Mode::Startup);
     }
 
     #[test]
@@ -1893,12 +1894,21 @@ mod profile_tests {
         let (mut bbr, sent) = startup_loss_state_fixture();
         bbr.on_sent(sent, 1200, 1, 98_800);
         let now = sent + Duration::from_millis(100);
-        bbr.on_ack(now, sent, 1, 1200, 100_000, false,
-            &RttEstimator::new(Duration::from_millis(100)));
+        bbr.on_ack(
+            now,
+            sent,
+            1,
+            1200,
+            100_000,
+            false,
+            &RttEstimator::new(Duration::from_millis(100)),
+        );
         bbr.on_packet_lost(2, 1200);
         bbr.on_congestion_event(now, sent, false, 100, 1, Some(2), Some(1200));
-        assert!(!bbr.should_exit_startup_due_to_loss(),
-            "unknown loss replaced the valid ACK's send state");
+        assert!(
+            !bbr.should_exit_startup_due_to_loss(bbr.max_bandwidth.last_event_packet_send_state()),
+            "unknown loss replaced the valid ACK's send state"
+        );
     }
 
     #[test]
@@ -1910,22 +1920,45 @@ mod profile_tests {
         bbr.on_packet_lost(2, 1200);
         bbr.on_packet_lost(3, 0);
         bbr.on_congestion_event(now, sent, false, 1200, 1, Some(3), Some(1_000_000));
-        bbr.on_ack(now, sent, 1, 1200, 1200, false,
-            &RttEstimator::new(Duration::from_millis(100)));
-        assert!(bbr.should_exit_startup_due_to_loss(),
-            "the newest valid lost packet had 100000 bytes in flight; 2200 lost exceeds 2%");
+        bbr.on_ack(
+            now,
+            sent,
+            1,
+            1200,
+            1200,
+            false,
+            &RttEstimator::new(Duration::from_millis(100)),
+        );
+        assert!(
+            bbr.should_exit_startup_due_to_loss(bbr.max_bandwidth.last_event_packet_send_state()),
+            "the newest valid lost packet had 100000 bytes in flight; 2200 lost exceeds 2%"
+        );
+        bbr.bw_at_last_round = 1_000_000_000;
+        bbr.on_end_acks(now, 0, false, Some(1));
+        assert!(bbr.is_at_full_bandwidth);
     }
 
     #[test]
     fn startup_loss_state_retains_zero_duration_ack() {
         let (mut bbr, sent) = startup_loss_state_fixture();
+        bbr.on_sent(sent, 1200, 0, 0);
         bbr.on_sent(sent, 1200, 1, 98_800);
-        // No previous ACK time: this has valid send state but no rate sample.
-        bbr.on_ack(sent, sent, 1, 1200, 100_000, false,
-            &RttEstimator::new(Duration::from_millis(100)));
+        // ACK time equals the sampler's initial timestamp: valid send state,
+        // zero-duration rate sample.
+        bbr.on_ack(
+            sent,
+            sent,
+            1,
+            1200,
+            100_000,
+            false,
+            &RttEstimator::new(Duration::from_millis(100)),
+        );
+        assert_eq!(bbr.max_bandwidth.get_estimate(), 0);
         bbr.on_congestion_event(sent, sent, false, 100, 1, Some(2), Some(1200));
-        assert!(!bbr.should_exit_startup_due_to_loss(),
-            "a valid send state must survive an absent bandwidth sample");
+        assert!(
+            !bbr.should_exit_startup_due_to_loss(bbr.max_bandwidth.last_event_packet_send_state()),
+            "a valid send state must survive an absent bandwidth sample"
+        );
     }
-
 }

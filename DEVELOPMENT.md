@@ -50,7 +50,10 @@ newly acknowledged and lost packets in the congestion event, matching Hysteria
 maximum delivery-rate sample remains a separate bandwidth input. A valid send
 state is retained even when its bandwidth sample has zero duration, and callback
 order cannot replace a larger packet's state. Unknown or non-congestion-controlled
-packets have no sampler state and cannot overwrite it. This prevents an event
+packets have no sampler state and cannot overwrite it. The sampler stores both
+the application-limited flag and in-flight bytes (including the sent packet)
+at transmission. STARTUP loss exit uses that same valid state, even when the
+aggregate loss callback names a newer packet absent from the sampler. This prevents an event
 whose newest valid send state is application-limited from falsely counting a
 startup bandwidth plateau; real-path throughput requires separate verification.
 The history used by startup overshoot detection advances from that same completed
