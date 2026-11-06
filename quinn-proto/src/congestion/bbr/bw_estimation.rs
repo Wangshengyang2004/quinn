@@ -512,3 +512,30 @@ mod tests {
         assert_eq!(estimation.last_event_packet_send_state(), None);
     }
 }
+
+#[cfg(test)]
+mod event_filter_diagnostic {
+    use super::*;
+    #[test]
+    fn diagnostic_mixed_event_filter_matches_go() {
+        let mut mismatches = Vec::new();
+        for round in [1, 11] {
+            for second_app_limited in [false, true] {
+                let mut e = BandwidthEstimation::default();
+                e.max_filter.update_max(0, 100_000);
+                let start = Instant::now();
+                e.on_sent(start, 1, 1_000, 0);
+                if second_app_limited { e.on_app_limited(1); }
+                e.on_sent(start + Duration::from_millis(10), 2, 1_000, 1_000);
+                let now = start + Duration::from_millis(100);
+                assert_eq!(e.on_ack(now, 1, round), Some(false));
+                assert_eq!(e.on_ack(now, 2, round), Some(second_app_limited));
+                let actual = e.get_estimate();
+                let expected = if round == 11 && !second_app_limited {20_000} else {100_000};
+                println!("round={round} second_app_limited={second_app_limited} estimate_bytes_s={actual} expected_go={expected}");
+                if actual != expected { mismatches.push((round, second_app_limited, actual, expected)); }
+            }
+        }
+        assert!(mismatches.is_empty(), "event filter divergence: {mismatches:?}");
+    }
+}
