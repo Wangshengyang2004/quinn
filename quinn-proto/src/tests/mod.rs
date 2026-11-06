@@ -1068,10 +1068,22 @@ fn high_latency_handshake() {
 
 #[test]
 fn zero_rtt_happypath() {
+    test_zero_rtt_happypath(false);
+}
+
+#[test]
+fn bbr_zero_rtt_happypath_releases_sampler_records() {
+    test_zero_rtt_happypath(true);
+}
+
+fn test_zero_rtt_happypath(bbr: bool) {
     let _guard = subscribe();
     let mut pair = Pair::default();
     pair.server.handle_incoming = Box::new(validate_incoming);
-    let config = client_config();
+    let mut config = client_config();
+    if bbr {
+        enable_test_bbr(&mut config);
+    }
 
     // Establish normal connection
     let client_ch = pair.begin_connect(config.clone());
@@ -1130,10 +1142,22 @@ fn zero_rtt_happypath() {
     );
     let _ = chunks.finalize();
     assert_eq!(pair.client_conn_mut(client_ch).stats().path.lost_packets, 0);
+    if bbr {
+        assert_bbr_sampler_drained(pair.client_conn_mut(client_ch));
+    }
 }
 
 #[test]
 fn zero_rtt_rejection() {
+    test_zero_rtt_rejection(false);
+}
+
+#[test]
+fn bbr_zero_rtt_rejection_releases_sampler_records() {
+    test_zero_rtt_rejection(true);
+}
+
+fn test_zero_rtt_rejection(bbr: bool) {
     let _guard = subscribe();
     let server_config = ServerConfig::with_crypto(Arc::new(server_crypto_with_alpn(vec![
         "foo".into(),
@@ -1141,9 +1165,12 @@ fn zero_rtt_rejection() {
     ])));
     let mut pair = Pair::new(Arc::new(EndpointConfig::default()), server_config);
     let mut client_crypto = Arc::new(client_crypto_with_alpn(vec!["foo".into()]));
-    let client_config = ClientConfig::new(client_crypto.clone());
+    let mut client_config = ClientConfig::new(client_crypto.clone());
 
     // Establish normal connection
+    if bbr {
+        enable_test_bbr(&mut client_config);
+    }
     let client_ch = pair.begin_connect(client_config);
     pair.drive();
     let server_ch = pair.server.assert_accept();
@@ -1178,8 +1205,11 @@ fn zero_rtt_rejection() {
     inner.alpn_protocols = vec!["bar".into()];
 
     // Changing protocols invalidates 0-RTT
-    let client_config = ClientConfig::new(client_crypto);
+    let mut client_config = ClientConfig::new(client_crypto);
     info!("resuming session");
+    if bbr {
+        enable_test_bbr(&mut client_config);
+    }
     let client_ch = pair.begin_connect(client_config);
     assert!(pair.client_conn_mut(client_ch).has_0rtt());
     let s = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
@@ -1220,6 +1250,9 @@ fn zero_rtt_rejection() {
     assert_eq!(chunks.next(usize::MAX).unwrap().unwrap().bytes, MSG);
     assert_eq!(chunks.next(usize::MAX).unwrap(), None);
     let _ = chunks.finalize();
+    if bbr {
+        assert_bbr_sampler_drained(pair.client_conn_mut(client_ch));
+    }
 }
 
 fn test_zero_rtt_incoming_limit<F: FnOnce(&mut ServerConfig)>(configure_server: F) {
@@ -4979,4 +5012,24 @@ fn bbr_path_validation_ack_releases_sampler_records() {
             "sampler retained acknowledged packets after rebind={rebind}"
         );
     }
+}
+
+fn enable_test_bbr(config: &mut ClientConfig) {
+    Arc::get_mut(&mut config.transport)
+        .expect("test config owns its transport")
+        .congestion_controller_factory(Arc::new(crate::congestion::BbrConfig::default()));
+}
+
+fn assert_bbr_sampler_drained(conn: &Connection) {
+    let controller = conn
+        .congestion_state()
+        .clone_box()
+        .into_any()
+        .downcast::<crate::congestion::Bbr>()
+        .unwrap();
+    assert_eq!(
+        controller.retained_packet_count(),
+        0,
+        "0-RTT sampler records retained"
+    );
 }
