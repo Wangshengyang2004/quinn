@@ -107,3 +107,11 @@ after authentication selects a different algorithm. Existing ACK/loss callbacks
 retain their behavior. Same-IP port-rebinding and sampler regressions cover
 record retirement and preservation of event/delivery state; consumer and field
 validation remain separate requirements.
+
+Disabling `ack_frequency_supported` omits the local `min_ack_delay` transport
+parameter and rejects received ACK_FREQUENCY and IMMEDIATE_ACK frames before
+they can change ACK state. Rejection is a PROTOCOL_VIOLATION carrying the frame
+type. Capability is directional: an endpoint may request ACK behavior from a
+peer that advertises support while omitting its own receive capability.
+The default remains enabled. This admission check changes neither PTO backoff
+nor congestion parameters; throughput and recovery need consumer verification.

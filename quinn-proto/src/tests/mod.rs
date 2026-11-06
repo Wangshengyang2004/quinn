@@ -5037,17 +5037,32 @@ fn assert_bbr_sampler_drained(conn: &Connection) {
 // Exercise authenticated 1-RTT delivery, including a sender violating the
 // receiver's advertised capability. Sender-only override never changes the
 // receiver's config or the transport parameters it sent in the handshake.
-fn check_ack_frequency_receive_policy(receiver_is_client: bool, immediate: bool, enabled: bool) {
+fn check_ack_frequency_receive_policy(
+    receiver_is_client: bool,
+    immediate: bool,
+    enabled: bool,
+    sender_advertises: bool,
+) {
     let mut client = client_config_with_deterministic_pns();
     let mut server = server_config();
     let mut frequency = AckFrequencyConfig::default();
     frequency.max_ack_delay(Some(Duration::from_millis(30)));
-    Arc::get_mut(&mut client.transport).unwrap()
-        .ack_frequency_supported(!receiver_is_client || enabled)
+    Arc::get_mut(&mut client.transport)
+        .unwrap()
+        .ack_frequency_supported(if receiver_is_client {
+            enabled
+        } else {
+            sender_advertises
+        })
         .ack_frequency_config((!receiver_is_client && !immediate).then_some(frequency.clone()))
         .mtu_discovery_config(None);
-    Arc::get_mut(&mut server.transport).unwrap()
-        .ack_frequency_supported(receiver_is_client || enabled)
+    Arc::get_mut(&mut server.transport)
+        .unwrap()
+        .ack_frequency_supported(if receiver_is_client {
+            sender_advertises
+        } else {
+            enabled
+        })
         .ack_frequency_config((receiver_is_client && !immediate).then_some(frequency))
         .mtu_discovery_config(None);
     let mut pair = Pair::new(Default::default(), server);
@@ -5071,7 +5086,11 @@ fn check_ack_frequency_receive_policy(receiver_is_client: bool, immediate: bool,
         pair.server_conn_mut(server_ch)
     };
     let stats = receiver.stats();
-    assert!(if immediate { stats.frame_rx.immediate_ack > 0 } else { stats.frame_rx.ack_frequency > 0 });
+    assert!(if immediate {
+        stats.frame_rx.immediate_ack > 0
+    } else {
+        stats.frame_rx.ack_frequency > 0
+    });
     let mut lost = None;
     while let Some(event) = receiver.poll() {
         if let Event::ConnectionLost { reason } = event {
@@ -5081,48 +5100,73 @@ fn check_ack_frequency_receive_policy(receiver_is_client: bool, immediate: bool,
     if enabled {
         assert!(lost.is_none(), "advertised extension rejected: {lost:?}");
     } else {
-        assert_matches!(lost, Some(ConnectionError::TransportError(TransportError {
-            code: TransportErrorCode::PROTOCOL_VIOLATION, ..
-        })));
+        let expected_frame = if immediate {
+            frame::FrameType::IMMEDIATE_ACK
+        } else {
+            frame::FrameType::ACK_FREQUENCY
+        };
+        assert_matches!(lost, Some(ConnectionError::TransportError(ref error))
+            if error.code == TransportErrorCode::PROTOCOL_VIOLATION
+                && error.frame == Some(expected_frame));
     }
 }
 
 #[test]
 fn ack_frequency_policy_client_frequency_disabled() {
-    check_ack_frequency_receive_policy(true, false, false);
+    check_ack_frequency_receive_policy(true, false, false, true);
 }
 
 #[test]
 fn ack_frequency_policy_client_frequency_enabled() {
-    check_ack_frequency_receive_policy(true, false, true);
+    check_ack_frequency_receive_policy(true, false, true, true);
 }
 
 #[test]
 fn ack_frequency_policy_client_immediate_disabled() {
-    check_ack_frequency_receive_policy(true, true, false);
+    check_ack_frequency_receive_policy(true, true, false, true);
 }
 
 #[test]
 fn ack_frequency_policy_client_immediate_enabled() {
-    check_ack_frequency_receive_policy(true, true, true);
+    check_ack_frequency_receive_policy(true, true, true, true);
 }
 
 #[test]
 fn ack_frequency_policy_server_frequency_disabled() {
-    check_ack_frequency_receive_policy(false, false, false);
+    check_ack_frequency_receive_policy(false, false, false, true);
 }
 
 #[test]
 fn ack_frequency_policy_server_frequency_enabled() {
-    check_ack_frequency_receive_policy(false, false, true);
+    check_ack_frequency_receive_policy(false, false, true, true);
 }
 
 #[test]
 fn ack_frequency_policy_server_immediate_disabled() {
-    check_ack_frequency_receive_policy(false, true, false);
+    check_ack_frequency_receive_policy(false, true, false, true);
 }
 
 #[test]
 fn ack_frequency_policy_server_immediate_enabled() {
-    check_ack_frequency_receive_policy(false, true, true);
+    check_ack_frequency_receive_policy(false, true, true, true);
+}
+
+#[test]
+fn ack_frequency_policy_client_frequency_unilateral() {
+    check_ack_frequency_receive_policy(true, false, true, false);
+}
+
+#[test]
+fn ack_frequency_policy_client_immediate_unilateral() {
+    check_ack_frequency_receive_policy(true, true, true, false);
+}
+
+#[test]
+fn ack_frequency_policy_server_frequency_unilateral() {
+    check_ack_frequency_receive_policy(false, false, true, false);
+}
+
+#[test]
+fn ack_frequency_policy_server_immediate_unilateral() {
+    check_ack_frequency_receive_policy(false, true, true, false);
 }

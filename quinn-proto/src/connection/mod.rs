@@ -3209,6 +3209,15 @@ impl Connection {
                         self.events.push_back(Event::DatagramReceived);
                     }
                 }
+                Frame::AckFrequency(_) | Frame::ImmediateAck
+                    if !self.config.ack_frequency_supported =>
+                {
+                    return Err(TransportError {
+                        code: TransportErrorCode::PROTOCOL_VIOLATION,
+                        frame: Some(frame.ty()),
+                        reason: "ACK frequency extension was not advertised".into(),
+                    });
+                }
                 Frame::AckFrequency(ack_frequency) => {
                     // This frame can only be sent in the Data space
                     let space = &mut self.spaces[SpaceId::Data];
