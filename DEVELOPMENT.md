@@ -45,20 +45,25 @@ a loss-only event during growth, and an ACK/loss batch that enters recovery.
 This behavior alignment does not establish a throughput improvement.
 
 BBR's startup decision uses the send state of the newest valid packet across
-newly acknowledged and lost packets in the congestion event, matching Hysteria
-2.13.0's sampler implementation. Loss-only events also retain that state. The
-maximum delivery-rate sample remains a separate bandwidth input. A valid send
-state is retained even when its bandwidth sample has zero duration, and callback
-order cannot replace a larger packet's state. Unknown or non-congestion-controlled
-packets have no sampler state and cannot overwrite it. The sampler stores both
-the application-limited flag and in-flight bytes (including the sent packet)
-at transmission. STARTUP loss exit uses that same valid state, even when the
-aggregate loss callback names a newer packet absent from the sampler. This prevents an event
-whose newest valid send state is application-limited from falsely counting a
-startup bandwidth plateau; real-path throughput requires separate verification.
+newly acknowledged and lost packets in the congestion event. Hysteria 2.13.0
+also selects the startup loss denominator from sampler state. Loss-only events
+retain that state; the maximum delivery-rate sample remains a separate input.
+Unknown or non-congestion-controlled packets have no sampler state and cannot
+overwrite it. The sampler stores both the application-limited flag and in-flight
+bytes (including the sent packet) at transmission. STARTUP loss exit uses that
+same valid state, including when the aggregate loss callback names a newer packet
+absent from the sampler. Callback order cannot replace a larger packet's state.
+
+One retained Rust boundary differs from Hysteria 2.13.0: a known ACK contributes
+its send state even when no bandwidth sample can be formed, including a zero ACK
+time interval. Go omits the ACK state in those cases. This is covered by the Rust
+sampler contract and an explicit Go boundary test; it must not be described as
+exact behavior equivalence. Field impact requires separate verification.
+
 The history used by startup overshoot detection advances from that same completed
 event state. An older full-rate ACK in an application-limited event cannot prove
-overshoot; a full-rate loss-only event does contribute to the history.
+overshoot; a full-rate loss-only event does contribute to the history. These state
+contracts and the loss-denominator correction do not establish a throughput gain.
 
 EasyTier selects an exact Git revision in Cargo.toml and Cargo.lock. Updating
 this branch alone does not update its consumer. Validate both protocol and
