@@ -1961,3 +1961,44 @@ mod profile_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod round_order_diagnostic {
+    use super::*;
+
+    #[test]
+    fn first_ack_of_new_round_uses_the_new_round_for_filter_expiry() {
+        let mut mismatches = Vec::new();
+        for (before, end, after, expected) in [
+            (9, 1, 10, 100_000),
+            (10, 1, 11, 10_000),
+            (10, 2, 10, 100_000),
+            (11, 1, 12, 10_000),
+        ] {
+            let start = Instant::now();
+            let mut b = Bbr::new(Arc::new(BbrConfig::default()), 1200);
+            // Seed a 100 KB/s sample at round zero through the real sampler.
+            b.on_sent(start, 10_000, 1, 0);
+            assert_eq!(b.max_bandwidth.on_ack(start + Duration::from_millis(100), 1), Some(false));
+            b.max_bandwidth.update_estimate(0);
+            b.max_bandwidth.end_acks(0, false, false);
+            assert_eq!(b.max_bandwidth.get_estimate(), 100_000);
+            b.min_rtt = Duration::from_millis(100);
+            b.min_rtt_timestamp = Some(start + Duration::from_millis(100));
+            b.round_count = before;
+            b.current_round_trip_end_packet_number = end;
+            b.max_acked_packet_number = 1;
+            let sent = start + Duration::from_millis(200);
+            let ack = start + Duration::from_millis(300);
+            b.on_sent(sent, 1_000, 2, 0);
+            b.on_begin_congestion_event(1_000);
+            b.on_ack(ack, sent, 2, 1_000, 1_000, false, &RttEstimator::default());
+            b.on_end_acks(ack, 0, false, Some(2));
+            assert_eq!(b.round_count, after);
+            let actual = b.max_bandwidth.get_estimate();
+            println!("before={before} end={end} after={after} estimate_bytes_s={actual} expected_go={expected}");
+            if actual != expected { mismatches.push((before, end, actual, expected)); }
+        }
+        assert!(mismatches.is_empty(), "round-tag divergence: {mismatches:?}");
+    }
+}
