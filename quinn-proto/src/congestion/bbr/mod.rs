@@ -1978,13 +1978,20 @@ mod round_order_diagnostic {
         ] {
             let start = Instant::now();
             let mut config = BbrConfig::default();
-            config.initial_window_packets(32).max_window_packets(20_000)
+            config
+                .initial_window_packets(32)
+                .max_window_packets(20_000)
                 .enable_ack_aggregation_during_startup(false)
-                .expire_ack_aggregation_in_startup(false).drain_to_target(false);
+                .expire_ack_aggregation_in_startup(false)
+                .drain_to_target(false);
             let mut b = Bbr::new(Arc::new(config), 1200);
             // Seed a 100 KB/s sample at round zero through the real sampler.
             b.on_sent(start, 10_000, 1, 0);
-            assert_eq!(b.max_bandwidth.on_ack(start + Duration::from_millis(100), 1), Some(false));
+            assert_eq!(
+                b.max_bandwidth
+                    .on_ack(start + Duration::from_millis(100), 1),
+                Some(false)
+            );
             b.max_bandwidth.update_estimate(0);
             b.max_bandwidth.end_acks(0, false, false);
             assert_eq!(b.max_bandwidth.get_estimate(), 100_000);
@@ -1997,13 +2004,28 @@ mod round_order_diagnostic {
             let ack = start + Duration::from_millis(300);
             b.on_sent(sent, 1_000, 2, 0);
             b.on_begin_congestion_event(1_000);
-            b.on_ack(ack, sent, 2, 1_000, 1_000, false, &RttEstimator::new(Duration::from_millis(100)));
+            b.on_ack(
+                ack,
+                sent,
+                2,
+                1_000,
+                1_000,
+                false,
+                &RttEstimator::new(Duration::from_millis(100)),
+            );
             b.on_end_acks(ack, 0, false, Some(2));
             assert_eq!(b.round_count, after);
             let actual = b.max_bandwidth.get_estimate();
-            println!("before={before} end={end} after={after} estimate_bytes_s={actual} expected_go={expected}");
-            if actual != expected { mismatches.push((before, end, actual, expected)); }
+            println!(
+                "before={before} end={end} after={after} estimate_bytes_s={actual} expected_go={expected}"
+            );
+            if actual != expected {
+                mismatches.push((before, end, actual, expected));
+            }
         }
-        assert!(mismatches.is_empty(), "round-tag divergence: {mismatches:?}");
+        assert!(
+            mismatches.is_empty(),
+            "round-tag divergence: {mismatches:?}"
+        );
     }
 }
