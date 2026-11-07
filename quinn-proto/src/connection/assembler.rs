@@ -790,6 +790,34 @@ mod test {
         );
     }
 
+    #[test]
+    fn large_contiguous_prefix_with_sparse_tail_survives_compaction() {
+        let mut x = Assembler::new();
+        let large = Bytes::from(vec![0x61; 4096]);
+        let small = Bytes::from(vec![0x62; 32]);
+        // A delayed first byte holds a valid receive window. The large prefix
+        // is contiguous; the tail adds only 600 genuine one-byte holes.
+        let mut offset = 1u64;
+        for _ in 0..600 {
+            x.insert(offset, large.clone(), large.len()).unwrap();
+            offset += large.len() as u64;
+        }
+        for _ in 0..600 {
+            offset += 1;
+            x.insert(offset, small.clone(), small.len()).unwrap();
+            offset += small.len() as u64;
+        }
+        let last = offset - small.len() as u64;
+        // Retransmissions may duplicate stream bytes with fresh packet numbers.
+        // They must not turn 601 genuine spans into a connection-fatal limit.
+        for _ in 0..1000 {
+            x.insert(last, small.clone(), small.len())
+                .expect("legal stream with 601 receive spans must survive compaction");
+        }
+        x.defragment();
+        assert!(x.data.len() <= MAX_CHUNKS);
+    }
+
     fn next_unordered(x: &mut Assembler) -> Chunk {
         x.read(usize::MAX, false).unwrap()
     }
