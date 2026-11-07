@@ -2212,6 +2212,7 @@ mod tests {
         let mut client = make(Side::Client);
         let id = StreamId::new(Side::Server, Dir::Uni, 0);
         let initial_max = client.local_max_data;
+        let now = crate::Instant::now();
         let _ = client
             .received(
                 frame::Stream {
@@ -2221,14 +2222,18 @@ mod tests {
                     data: Bytes::from_static(&[0; 32]),
                 },
                 32,
+                now,
             )
             .unwrap();
         let _ = client
-            .received_reset(frame::ResetStream {
-                id,
-                error_code: 0u32.into(),
-                final_offset: 48u32.into(),
-            })
+            .received_reset(
+                frame::ResetStream {
+                    id,
+                    error_code: 0u32.into(),
+                    final_offset: 48u32.into(),
+                },
+                now,
+            )
             .unwrap();
         assert_eq!(client.local_max_data - initial_max, 48);
 
