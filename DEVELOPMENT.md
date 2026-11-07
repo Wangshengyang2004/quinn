@@ -71,6 +71,13 @@ consumer paths before changing the pin or deploying. Historical experiments
 remain under `archive/*` tags; restoring one does not authorize its integration.
 `dev` is the integration branch; preserve `main` and its history.
 
+Stopping a receive stream after RESET_STREAM returns no additional connection
+receive credit: the reset already released credit through the final offset.
+This follows upstream 0.11 fix `4b52785a` and preserves ordinary stop, stream
+window autotuning and the opt-in low-credit update policy. The regression covers
+unread received data followed by reset and stop; HY2 stream-drop integration
+requires separate consumer verification.
+
 An opt-in local send-credit policy reserves connection flow-control and send-buffer
 space for high-priority control streams and bounded initial exchanges on new
 streams. Bulk writes preserve both reserves at admission, before data enters QUIC
