@@ -103,6 +103,15 @@ session decisions into a fresh controller; initial connections always call
 hook. Same-IPv4 port rebinding keeps the existing cloned-state behavior. RTT,
 pacer, MTU and congestion history retain their normal path reset contracts.
 
+PMTU probes wait until the current path is validated, following upstream 0.11
+fix `77a51bdc`. The independent probe branch bypasses the ordinary send loop's
+anti-amplification check; a migrated path must retain that budget for its
+PATH_CHALLENGE until PATH_RESPONSE validates it. Validation timeout still
+restores the previous path, and successful validation resumes normal MTU search.
+The local UDP payload budget remains active before packetization and during
+subsequent discovery, including budget changes while validation is pending.
+This guard changes neither congestion control nor migration/PMTU defaults.
+
 `TransportConfig::local_udp_payload_limit` is an opt-in, destination-specific
 host budget queried before packetization. It clamps ordinary sends and PMTU
 probes on an existing path, including when encapsulation changes at runtime.
