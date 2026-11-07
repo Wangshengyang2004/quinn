@@ -103,8 +103,18 @@ impl Assembler {
     /// This makes sure we're not unnecessarily holding on to many larger allocations.
     /// We merge contiguous chunks in the process of doing so.
     fn defragment(&mut self) {
-        // Chunks smaller than min_chunk_size are merged regardless of fragmentation
+        // Keep well-utilized large allocations on the common path.
         let min_chunk_size = max(self.buffered.div_ceil(MAX_CHUNKS), MIN_RETAINED_CHUNK_SIZE);
+        self.defragment_with_min_chunk_size(min_chunk_size);
+        if self.data.len() > MAX_CHUNKS {
+            // Retained large chunks may be adjacent to each other or to copied
+            // small chunks. Count actual disjoint spans before rejecting a valid
+            // receive window; the size threshold alone cannot guarantee the cap.
+            self.defragment_with_min_chunk_size(usize::MAX);
+        }
+    }
+
+    fn defragment_with_min_chunk_size(&mut self, min_chunk_size: usize) {
         let new = BinaryHeap::with_capacity(self.data.len());
         let old = mem::replace(&mut self.data, new);
         let mut buffers = old.into_sorted_vec();
@@ -816,6 +826,52 @@ mod test {
         }
         x.defragment();
         assert!(x.data.len() <= MAX_CHUNKS);
+        x.insert(0, Bytes::from_static(b"p"), 1).unwrap();
+        let mut gap = 1 + 600 * large.len() as u64;
+        for _ in 0..600 {
+            x.insert(gap, Bytes::from_static(b"g"), 1).unwrap();
+            gap += 1 + small.len() as u64;
+        }
+        let mut received = Vec::new();
+        while let Some(chunk) = x.read(usize::MAX, true) {
+            assert_eq!(chunk.offset, received.len() as u64);
+            received.extend_from_slice(&chunk.bytes);
+        }
+        let mut expected = vec![b'p'];
+        expected.extend(std::iter::repeat_n(b'a', 600 * large.len()));
+        for _ in 0..600 {
+            expected.push(b'g');
+            expected.extend_from_slice(&small);
+        }
+        assert_eq!(received, expected);
+        assert_eq!(x.buffered, 0);
+        assert_eq!(x.allocated, 0);
+    }
+
+    #[test]
+    fn retained_prefix_does_not_hide_excess_distinct_spans() {
+        let mut x = Assembler::new();
+        let large = Bytes::from(vec![0x61; 4096]);
+        let small = Bytes::from(vec![0x62; 32]);
+        let mut offset = 1;
+        for _ in 0..600 {
+            x.insert(offset, large.clone(), large.len()).unwrap();
+            offset += large.len() as u64;
+        }
+        for _ in 0..1100 {
+            offset += 1;
+            x.insert(offset, small.clone(), small.len()).unwrap();
+            offset += small.len() as u64;
+        }
+        let mut result = Ok(());
+        for _ in 0..1000 {
+            result = x.insert(offset - small.len() as u64, small.clone(), small.len());
+            if result.is_err() {
+                break;
+            }
+        }
+        assert_matches!(result, Err(TooManyChunks));
+        assert!(x.data.len() <= COMPACT_THRESHOLD + 1);
     }
 
     fn next_unordered(x: &mut Assembler) -> Chunk {
