@@ -37,6 +37,7 @@ mod util;
 use util::*;
 
 mod ack_congestion;
+mod migration_mtu;
 mod token;
 
 #[test]
