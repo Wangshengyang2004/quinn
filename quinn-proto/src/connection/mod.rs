@@ -273,7 +273,7 @@ impl Connection {
         let side = connection_side.side();
         let mut initial_space = PacketSpace {
             crypto: Some(crypto.initial_keys(&init_cid, side)),
-            ..PacketSpace::new(now)
+            ..PacketSpace::new(now, config.hy2_receive_history)
         };
         if side.is_client() && config.chrome_packet_numbers {
             initial_space.next_packet_number = 1;
@@ -320,7 +320,11 @@ impl Connection {
             endpoint_events: VecDeque::new(),
             spin_enabled: config.allow_spin && rng.random_ratio(7, 8),
             spin: false,
-            spaces: [initial_space, PacketSpace::new(now), PacketSpace::new(now)],
+            spaces: [
+                initial_space,
+                PacketSpace::new(now, config.hy2_receive_history),
+                PacketSpace::new(now, config.hy2_receive_history),
+            ],
             highest_space: SpaceId::Initial,
             prev_crypto: None,
             next_crypto: None,
@@ -2717,7 +2721,7 @@ impl Connection {
                     crypto: Some(self.crypto.initial_keys(&rem_cid, self.side.side())),
                     next_packet_number: self.spaces[SpaceId::Initial].next_packet_number,
                     crypto_offset: client_hello.len() as u64,
-                    ..PacketSpace::new(now)
+                    ..PacketSpace::new(now, self.config.hy2_receive_history)
                 };
                 self.spaces[SpaceId::Initial]
                     .pending

@@ -52,3 +52,16 @@ comparison on the dedicated build host. The Go probe is test-only and pinned in
 `tools/chrome-wire-reference`; set `HY2_CHROME_GO_PROBE` when running the ignored
 test. Consumer integration, cross-platform runtime, capacity comparisons and
 rollout remain separate release gates. This document does not assert deployment.
+
+## Bounded receive replay history
+
+EasyTier HY2 explicitly enables `hy2_receive_history(true)`. Each packet-number
+space retains the latest 16,384 numbers in a fixed 2 KiB bitmap. Sparse arrivals
+use the same packet-distance budget as contiguous arrivals. Authenticated first
+arrivals remain eligible inside the window; duplicates and numbers below a
+monotonic floor remain rejected. Ordinary Quinn defaults to its compact window.
+The 64 ACK-range budget, wire format, loss/PTO settings and congestion algorithms
+retain their existing contracts. The option is local and needs no negotiation.
+
+This implementation extracts the replay-window correction from `1ad6d29d`;
+adaptive loss learning and ProbeRTT experiments remain separate.

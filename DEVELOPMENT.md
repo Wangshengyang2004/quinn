@@ -9,7 +9,16 @@ pacing, and adds the scoped HY2 alignment described in
 Chrome wire shaping and HY2 window/profile options are explicit. Ordinary Quinn
 builds and default settings retain their existing contracts. The `hy2-rustls`
 feature requires EasyTier's TLS patch; default builds use official rustls.
-Adaptive loss thresholds and extended receive-history experiments remain archived.
+Adaptive loss thresholds remain archived.
+
+`hy2_receive_history(true)` uses a fixed 16,384-packet replay window with a
+2 KiB bitmap in each packet-number space. First arrivals within the window stay
+eligible even after sparse/deep reordering; duplicate packet numbers and numbers
+below the monotonic retirement floor remain rejected. Ordinary Quinn keeps its
+compact default window. The ACK encoder retains its 64-range budget, and loss
+thresholds, BBR, PTO and packet layouts retain their existing contracts. EasyTier
+HY2 enables this receive profile explicitly. This corrects authenticated original
+packet rejection; it does not establish WAN capacity or recovery acceptance.
 
 Due ACKs remain sendable when queued application data is blocked by the congestion
 window or pacer. Such feedback is emitted on its own, without optional MTU or GSO

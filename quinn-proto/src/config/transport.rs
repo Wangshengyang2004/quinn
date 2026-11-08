@@ -56,6 +56,7 @@ pub struct TransportConfig {
     pub(crate) low_credit_updates: bool,
 
     pub(crate) packet_threshold: u32,
+    pub(crate) hy2_receive_history: bool,
     pub(crate) time_threshold: f32,
     pub(crate) initial_rtt: Duration,
     pub(crate) initial_mtu: u16,
@@ -251,6 +252,16 @@ impl TransportConfig {
     /// packet lost. Should not be less than 3, per RFC5681.
     pub fn packet_threshold(&mut self, value: u32) -> &mut Self {
         self.packet_threshold = value;
+        self
+    }
+
+    /// Retain a fixed packet-number window for deeply reordered HY2 packets.
+    /// Defaults to false. Each packet-number space uses a 2 KiB bitmap for its
+    /// latest 16,384 numbers;
+    /// duplicates and numbers below its monotonic floor remain rejected.
+    /// Packet layouts, ACK range limits and loss thresholds are unchanged.
+    pub fn hy2_receive_history(&mut self, enabled: bool) -> &mut Self {
+        self.hy2_receive_history = enabled;
         self
     }
 
@@ -553,6 +564,7 @@ impl Default for TransportConfig {
             low_credit_updates: false,
 
             packet_threshold: 3,
+            hy2_receive_history: false,
             time_threshold: 9.0 / 8.0,
             initial_rtt: Duration::from_millis(333), // per spec, intentionally distinct from EXPECTED_RTT
             initial_mtu: INITIAL_MTU,
@@ -603,6 +615,7 @@ impl fmt::Debug for TransportConfig {
             send_credit_reserve,
             low_credit_updates,
             packet_threshold,
+            hy2_receive_history,
             time_threshold,
             initial_rtt,
             initial_mtu,
@@ -645,6 +658,7 @@ impl fmt::Debug for TransportConfig {
             .field("send_credit_reserve", send_credit_reserve)
             .field("low_credit_updates", low_credit_updates)
             .field("packet_threshold", packet_threshold)
+            .field("hy2_receive_history", hy2_receive_history)
             .field("time_threshold", time_threshold)
             .field("initial_rtt", initial_rtt)
             .field("initial_mtu", initial_mtu)

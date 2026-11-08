@@ -11,7 +11,10 @@ fn hy2_history_sparse_arrivals_deliver_complete_stream_without_retransmission() 
 }
 
 fn original_flight(sparse: bool) {
-    let server = server_config();
+    let mut server = server_config();
+    let mut receive = TransportConfig::default();
+    receive.hy2_receive_history(true);
+    server.transport_config(Arc::new(receive));
     let mut pair = Pair::new(Default::default(), server);
     pair.latency = Duration::from_millis(75);
 

@@ -72,10 +72,10 @@ pub(super) struct PacketSpace {
 }
 
 impl PacketSpace {
-    pub(super) fn new(now: Instant) -> Self {
+    pub(super) fn new(now: Instant, hy2_receive_history: bool) -> Self {
         Self {
             crypto: None,
-            dedup: Dedup::new(),
+            dedup: Dedup::with_hy2_history(hy2_receive_history),
             rx_packet: 0,
 
             pending: Retransmits::default(),
@@ -463,7 +463,7 @@ impl ThinRetransmits {
     }
 }
 
-/// RFC4303-style sliding window packet number deduplicator.
+/// Packet-number deduplicator: compact replay window by default, fixed packet-distance bitmap for HY2.
 ///
 /// A contiguous bitfield, where each bit corresponds to a packet number and the rightmost bit is
 /// always set. A set bit represents a packet that has been successfully authenticated. Bits left of
@@ -478,6 +478,77 @@ pub(super) struct Dedup {
     window: Window,
     /// Lowest packet number higher than all yet authenticated.
     next: u64,
+    /// HY2 accepts deep reordering while retaining a monotonic replay floor.
+    history: Option<Box<ReceiveHistory>>,
+}
+
+// Keep replay protection independent from the number of disjoint ACK ranges.
+// A fixed 2 KiB bitmap covers sparse arrival within this packet-number window;
+// the ACK encoder retains its existing 64-range budget.
+const HY2_RECEIVE_WINDOW: u64 = 16_384;
+const HY2_RECEIVE_WORDS: usize = HY2_RECEIVE_WINDOW as usize / 64;
+
+struct ReceiveHistory {
+    bits: [u64; HY2_RECEIVE_WORDS],
+    next: u64,
+    retired_below: u64,
+}
+
+impl Default for ReceiveHistory {
+    fn default() -> Self {
+        Self {
+            bits: [0; HY2_RECEIVE_WORDS],
+            next: 0,
+            retired_below: 0,
+        }
+    }
+}
+
+impl ReceiveHistory {
+    fn insert(&mut self, packet: u64) -> bool {
+        if packet < self.retired_below {
+            return true;
+        }
+        if packet >= self.next {
+            let next = packet + 1;
+            let floor = next.saturating_sub(HY2_RECEIVE_WINDOW);
+            if floor - self.retired_below >= HY2_RECEIVE_WINDOW {
+                self.bits.fill(0);
+            } else {
+                let mut cursor = self.retired_below;
+                while cursor < floor {
+                    let shift = cursor % 64;
+                    let length = (64 - shift).min(floor - cursor);
+                    let mask = (u64::MAX >> (64 - length)) << shift;
+                    self.bits[(cursor % HY2_RECEIVE_WINDOW / 64) as usize] &= !mask;
+                    cursor += length;
+                }
+            }
+            self.next = next;
+            self.retired_below = floor;
+        }
+        let word = &mut self.bits[(packet % HY2_RECEIVE_WINDOW / 64) as usize];
+        let bit = 1u64 << (packet % 64);
+        let duplicate = *word & bit != 0;
+        *word |= bit;
+        duplicate
+    }
+
+    fn smallest_missing_in_interval(&self, lower_bound: u64, upper_bound: u64) -> Option<u64> {
+        let mut cursor = lower_bound.saturating_add(1).max(self.retired_below);
+        let upper = upper_bound.min(self.next);
+        while cursor < upper {
+            let shift = cursor % 64;
+            let length = (64 - shift).min(upper - cursor);
+            let mask = (u64::MAX >> (64 - length)) << shift;
+            let gaps = !self.bits[(cursor % HY2_RECEIVE_WINDOW / 64) as usize] & mask;
+            if gaps != 0 {
+                return Some(cursor + u64::from(gaps.trailing_zeros()) - shift);
+            }
+            cursor += length;
+        }
+        None
+    }
 }
 
 /// Inner bitfield type.
@@ -492,7 +563,18 @@ const WINDOW_SIZE: u64 = 1 + mem::size_of::<Window>() as u64 * 8;
 impl Dedup {
     /// Construct an empty window positioned at the start.
     pub(super) fn new() -> Self {
-        Self { window: 0, next: 0 }
+        Self {
+            window: 0,
+            next: 0,
+            history: None,
+        }
+    }
+
+    fn with_hy2_history(enabled: bool) -> Self {
+        Self {
+            history: enabled.then(|| Box::new(ReceiveHistory::default())),
+            ..Self::new()
+        }
     }
 
     /// Highest packet number authenticated.
@@ -504,6 +586,13 @@ impl Dedup {
     ///
     /// Returns whether the packet might be a duplicate.
     pub(super) fn insert(&mut self, packet: u64) -> bool {
+        if let Some(history) = self.history.as_mut() {
+            let duplicate = history.insert(packet);
+            if !duplicate {
+                self.next = self.next.max(packet + 1);
+            }
+            return duplicate;
+        }
         if let Some(diff) = packet.checked_sub(self.next) {
             // Right of window
             self.window = ((self.window << 1) | 1)
@@ -535,6 +624,9 @@ impl Dedup {
     fn smallest_missing_in_interval(&self, lower_bound: u64, upper_bound: u64) -> Option<u64> {
         debug_assert!(lower_bound <= upper_bound);
         debug_assert!(upper_bound <= self.highest());
+        if let Some(history) = &self.history {
+            return history.smallest_missing_in_interval(lower_bound, upper_bound);
+        }
         const BITFIELD_SIZE: u64 = (mem::size_of::<Window>() * 8) as u64;
 
         // Since we already know the packets at the boundaries have been received, we only need to
@@ -933,6 +1025,143 @@ const MAX_ACK_BLOCKS: usize = 64;
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn hy2_history_accepts_unseen_deeply_reordered_packet() {
+        let mut space = PacketSpace::new(Instant::now(), true);
+        assert!(!space.dedup.insert(0));
+        for packet in 1000..3000 {
+            assert!(!space.dedup.insert(packet));
+        }
+        assert!(
+            !space.dedup.insert(100),
+            "unseen authenticated packet must survive deep reordering"
+        );
+        assert!(
+            space.dedup.insert(100),
+            "a real duplicate must remain rejected"
+        );
+    }
+
+    #[test]
+    fn hy2_history_first_delivery_survives_many_pending_ack_ranges() {
+        let mut dedup = Dedup::with_hy2_history(true);
+        assert!(!dedup.insert(0));
+        for packet in (2..=512).step_by(2) {
+            assert!(!dedup.insert(packet));
+        }
+        assert!(
+            !dedup.insert(1),
+            "unseen packet inside the receive window must survive sparse arrival"
+        );
+        assert!(
+            dedup.insert(1),
+            "the same packet must still be rejected on replay"
+        );
+        for packet in (0..=512).step_by(2) {
+            assert!(dedup.insert(packet));
+        }
+    }
+
+    #[test]
+    fn ordinary_history_preserves_fixed_window() {
+        let mut space = PacketSpace::new(Instant::now(), false);
+        space.dedup.insert(3000);
+        assert!(space.dedup.insert(100));
+    }
+
+    #[test]
+    fn hy2_history_tracks_sparse_gaps_and_fills_them() {
+        let mut dedup = Dedup::with_hy2_history(true);
+        for packet in [0, 1000, 3000] {
+            assert!(!dedup.insert(packet));
+        }
+        assert_eq!(dedup.smallest_missing_in_interval(0, 3000), Some(1));
+        for packet in 1..3000 {
+            assert_eq!(dedup.insert(packet), packet == 1000);
+        }
+        assert_eq!(dedup.smallest_missing_in_interval(0, 3000), None);
+        for packet in 0..=3000 {
+            assert!(dedup.insert(packet));
+        }
+    }
+
+    #[test]
+    fn hy2_history_is_bounded_and_retired_packets_stay_rejected() {
+        let mut dedup = Dedup::with_hy2_history(true);
+        for packet in (0..2 * HY2_RECEIVE_WINDOW + 2048).step_by(2) {
+            assert!(!dedup.insert(packet));
+            assert_eq!(
+                dedup.history.as_ref().unwrap().bits.len(),
+                HY2_RECEIVE_WORDS
+            );
+        }
+        let retired = dedup.history.as_ref().unwrap().retired_below;
+        assert!(retired > 0);
+        for packet in 0..retired {
+            assert!(dedup.insert(packet));
+        }
+        for packet in (0..2 * HY2_RECEIVE_WINDOW + 2048).step_by(2) {
+            assert!(dedup.insert(packet));
+        }
+        assert_eq!(
+            dedup.smallest_missing_in_interval(0, 2 * HY2_RECEIVE_WINDOW + 2046),
+            Some(retired)
+        );
+        assert!(!dedup.insert(retired));
+        assert!(dedup.insert(retired));
+        assert_eq!(dedup.history.as_ref().unwrap().retired_below, retired);
+    }
+
+    #[test]
+    fn hy2_history_matches_set_oracle_through_wraps_and_large_jumps() {
+        use std::collections::BTreeSet;
+        let mut history = ReceiveHistory::default();
+        let mut seen = BTreeSet::new();
+        let mut highest = 0u64;
+        let mut random = 17u64;
+        for i in 0..60_000 {
+            random = random.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let packet = if i % 8192 == 0 {
+                highest + HY2_RECEIVE_WINDOW * 3
+            } else if i % 4 == 0 {
+                highest.saturating_sub(random % (HY2_RECEIVE_WINDOW * 2))
+            } else {
+                highest + 1
+            };
+            highest = highest.max(packet);
+            let floor = (highest + 1).saturating_sub(HY2_RECEIVE_WINDOW);
+            let duplicate = packet < floor || !seen.insert(packet);
+            assert_eq!(history.insert(packet), duplicate, "packet {packet}");
+            assert_eq!(history.retired_below, floor);
+            if i % 97 == 0 {
+                let expected = (floor.max(1)..highest).find(|pn| !seen.contains(pn));
+                assert_eq!(history.smallest_missing_in_interval(0, highest), expected);
+            }
+        }
+        assert!(mem::size_of::<ReceiveHistory>() <= 3 * 1024);
+    }
+
+    #[test]
+    fn hy2_history_rejects_aliases_and_finds_gaps_at_large_packet_numbers() {
+        let mut history = ReceiveHistory::default();
+        let base = 1u64 << 40;
+        assert!(!history.insert(base));
+        assert!(!history.insert(base + 64));
+        assert_eq!(
+            history.smallest_missing_in_interval(base, base + 64),
+            Some(base + 1)
+        );
+        for packet in base + 1..base + 64 {
+            assert!(!history.insert(packet));
+        }
+        assert_eq!(history.smallest_missing_in_interval(base, base + 64), None);
+        assert!(history.insert(base + 32));
+        assert!(!history.insert(base + HY2_RECEIVE_WINDOW + 64));
+        assert!(history.insert(base));
+        assert!(!history.insert(base + HY2_RECEIVE_WINDOW + 32));
+        assert!(history.insert(base + HY2_RECEIVE_WINDOW + 32));
+    }
 
     #[test]
     fn sanity() {
