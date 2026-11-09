@@ -160,9 +160,10 @@ packet send state used for STARTUP remain distinct inputs. Deterministic mixed
 batch and filter-expiry cases are compared with Hysteria 2.13.0; this alignment
 does not establish a field throughput benefit or full event-path equivalence.
 
-BBR also consumes Quinn's application-limited hint after each ACK batch. It marks
-subsequent packet samples as application-limited through the existing packet-number
-boundary; recorded ACK/loss send states remain unchanged. An in-flight-only BDP
+BBR consumes Quinn's application-limited notification at actual transmit
+exhaustion. It marks subsequent packet samples through the existing packet-number
+boundary; cached ACK hints do not renew that marker, and recorded ACK/loss send
+states remain unchanged. An in-flight-only BDP
 heuristic can mistake a light stream for a saturated path and end STARTUP at that
 stream's offered rate. This is an explicit extension beyond Hysteria 2.13.0's
 heuristic, with unchanged loss/no-growth thresholds. Real protocol regressions
