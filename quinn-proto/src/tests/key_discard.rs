@@ -66,7 +66,9 @@ fn key_discard_loss_free_handshake_reports_retirement_without_packet_loss() {
     assert!(events.iter().any(|(kind, _)| *kind == "sent"));
     assert!(events.iter().any(|(kind, _)| *kind == "discarded"));
     assert!(
-        events.iter().all(|(kind, _)| *kind != "lost" && *kind != "congestion"),
+        events
+            .iter()
+            .all(|(kind, _)| *kind != "lost" && *kind != "congestion"),
         "a successful loss-free handshake must not create loss samples: {events:?}"
     );
 }

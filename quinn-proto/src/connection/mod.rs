@@ -2426,7 +2426,7 @@ impl Connection {
         for packet in sent_packets.into_values() {
             self.path
                 .congestion
-                .on_packet_lost(packet.congestion_sequence, u64::from(packet.size));
+                .on_packet_discarded(packet.congestion_sequence);
             self.remove_in_flight(&packet);
         }
         self.set_loss_detection_timer(now)
@@ -4673,17 +4673,24 @@ mod tests {
     fn key_discard_retires_unacknowledged_initial_without_loss_sample() {
         use crate::tests::key_discard::{PacketLifecycle, recording_client};
         let events = PacketLifecycle::default();
-        let mut endpoint = crate::Endpoint::new(
-            Arc::new(EndpointConfig::default()), None, true, None,
-        );
+        let mut endpoint =
+            crate::Endpoint::new(Arc::new(EndpointConfig::default()), None, true, None);
         let now = Instant::now();
-        let (_, mut connection) = endpoint.connect(
-            now, recording_client(&events), "[::1]:4433".parse().unwrap(), "localhost",
-        ).unwrap();
+        let (_, mut connection) = endpoint
+            .connect(
+                now,
+                recording_client(&events),
+                "[::1]:4433".parse().unwrap(),
+                "localhost",
+            )
+            .unwrap();
         let mut buf = Vec::new();
         assert!(connection.poll_transmit(now, 1, &mut buf).is_some());
-        let outstanding = connection.spaces[SpaceId::Initial].sent_packets.values()
-            .map(|packet| packet.congestion_sequence).collect::<Vec<_>>();
+        let outstanding = connection.spaces[SpaceId::Initial]
+            .sent_packets
+            .values()
+            .map(|packet| packet.congestion_sequence)
+            .collect::<Vec<_>>();
         assert!(!outstanding.is_empty());
         assert!(connection.bytes_in_flight() > 0);
         events.0.lock().unwrap().clear();
@@ -4692,11 +4699,13 @@ mod tests {
         assert!(connection.spaces[SpaceId::Initial].sent_packets.is_empty());
         assert_eq!(
             *events.0.lock().unwrap(),
-            outstanding.into_iter().map(|packet| ("discarded", packet)).collect::<Vec<_>>(),
+            outstanding
+                .into_iter()
+                .map(|packet| ("discarded", packet))
+                .collect::<Vec<_>>(),
             "key retirement must not inject a loss sample into the next congestion event",
         );
     }
-
 
     #[cfg(feature = "rustls-ring")]
     #[test]

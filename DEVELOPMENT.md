@@ -133,8 +133,10 @@ loss recovery.
 
 `Controller::on_packet_discarded` retires packet bookkeeping without creating a
 congestion event, delivery-rate sample or loss sample. BBR uses it when an ACK
-is intentionally ignored during path validation, and when Retry or rejected
-0-RTT withdraws a tracked packet. Controller wrappers must forward this callback
+is intentionally ignored during path validation, when Retry or rejected
+0-RTT withdraws a tracked packet, and when Initial or Handshake keys retire
+their packet-number space. Key retirement removes in-flight bytes while leaving
+the next congestion event free of synthetic loss send-state. Controller wrappers must forward this callback
 to controllers that may retain the packet, including an inactive controller
 after authentication selects a different algorithm. Existing ACK/loss callbacks
 retain their behavior. Same-IP port-rebinding and sampler regressions cover
