@@ -2138,3 +2138,33 @@ mod transport_app_limited_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod app_limited_marker_boundary_tests {
+    use super::*;
+
+    #[test]
+    fn stale_ack_hint_does_not_extend_an_exhausted_send_marker() {
+        let now = Instant::now();
+        let mut bbr = Bbr::new(Arc::new(BbrConfig::default()), 1200);
+        let rtt = RttEstimator::new(Duration::from_millis(100));
+        // A real exhaustion observation before packet 1 marks that packet.
+        // The next ACK is beyond this marker and ends that limited phase.
+        bbr.max_bandwidth.on_app_limited(0);
+        for (packet, expected) in [(1, true), (2, false)] {
+            let sent = now + Duration::from_millis(packet * 101);
+            bbr.on_sent(sent, 1200, packet, 80_000);
+            let acked = sent + Duration::from_millis(100);
+            assert!(bbr.get_target_cwnd(1.0) < 81_200);
+            bbr.on_begin_congestion_event(81_200);
+            bbr.on_ack(acked, sent, packet, 1200, 81_200, true, &rtt);
+            assert_eq!(
+                bbr.max_bandwidth.last_event_packet_send_state().unwrap().app_limited,
+                expected,
+                "packet={packet}: no new transmit exhaustion occurred"
+            );
+            // Historical ACK-time state must not create a new send marker.
+            bbr.on_end_acks(acked, 80_000, true, Some(packet));
+        }
+    }
+}
