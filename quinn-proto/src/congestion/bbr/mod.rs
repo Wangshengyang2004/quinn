@@ -2146,7 +2146,9 @@ mod app_limited_marker_boundary_tests {
     #[test]
     fn stale_ack_hint_does_not_extend_an_exhausted_send_marker() {
         let now = Instant::now();
-        let mut bbr = Bbr::new(Arc::new(BbrConfig::default()), 1200);
+        let mut config = BbrConfig::default();
+        config.initial_window_packets(32);
+        let mut bbr = Bbr::new(Arc::new(config), 1200);
         let rtt = RttEstimator::new(Duration::from_millis(100));
         // A real exhaustion observation before packet 1 marks that packet.
         // The next ACK is beyond this marker and ends that limited phase.
