@@ -32,6 +32,11 @@ pub trait Controller: Send + Sync {
     #[allow(unused_variables)]
     fn on_begin_congestion_event(&mut self, prior_bytes_in_flight: u64) {}
 
+    /// A transmit poll exhausted application data without congestion or pacing
+    /// blocking transmission. Records the send boundary when it is observed;
+    /// ACK callbacks can still carry an older application-limited observation.
+    fn on_app_limited(&mut self) {}
+
     /// One fresh RTT sample for this ACK frame, before individual ACK callbacks.
     /// Controllers implementing delay-based slow-start exit can sample once per
     /// frame, independently of the number of packets acknowledged by it.

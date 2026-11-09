@@ -523,6 +523,10 @@ impl Controller for Bbr {
         }
     }
 
+    fn on_app_limited(&mut self) {
+        self.max_bandwidth.on_app_limited(self.max_sent_packet_number);
+    }
+
     fn on_packet_discarded(&mut self, packet_number: u64) {
         self.max_bandwidth.on_packet_discarded(packet_number);
     }
@@ -593,13 +597,8 @@ impl Controller for Bbr {
             app_limited,
             bytes_acked > 0 && excess_acked == 0,
         );
-        // Quinn knows when application data ran out. In-flight bytes alone
-        // cannot distinguish a light stream's BDP from a saturated path.
-        // Mark future sends only: this event retains its recorded send state.
-        if app_limited {
-            self.max_bandwidth
-                .on_app_limited(self.max_sent_packet_number);
-        }
+        // Actual transmit exhaustion marks future sends through on_app_limited.
+        // The cached ACK-time hint must not extend that marker past newer sends.
 
         // Match quic-go: only newly acknowledged congestion-controlled packets
         // advance recovery. A loss-only event still updates the existing window below.
@@ -2130,6 +2129,9 @@ mod transport_app_limited_tests {
             let state = bbr.max_bandwidth.last_event_packet_send_state().unwrap();
             assert_eq!(state.app_limited, expected_sample, "packet={packet}");
             bbr.on_end_acks(acked, 80_000, hint, Some(packet));
+            if hint {
+                bbr.on_app_limited();
+            }
             assert_eq!(
                 bbr.last_sample_is_app_limited, expected_sample,
                 "packet={packet}"
@@ -2161,7 +2163,10 @@ mod app_limited_marker_boundary_tests {
             bbr.on_begin_congestion_event(81_200);
             bbr.on_ack(acked, sent, packet, 1200, 81_200, true, &rtt);
             assert_eq!(
-                bbr.max_bandwidth.last_event_packet_send_state().unwrap().app_limited,
+                bbr.max_bandwidth
+                    .last_event_packet_send_state()
+                    .unwrap()
+                    .app_limited,
                 expected,
                 "packet={packet}: no new transmit exhaustion occurred"
             );

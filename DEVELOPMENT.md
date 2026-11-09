@@ -195,3 +195,12 @@ ordered body remains incomplete; the explicit quic-go policy delivers the full
 reordering. Interface capture order alone does not identify encrypted packet
 numbers or prove this caused every observed WAN stall. EasyTier must explicitly
 enable the option and validate the exact dependency revision before deployment.
+
+The explicit BBR application-limited extension observes actual transmit
+exhaustion through `Controller::on_app_limited`: no datagram was produced and
+neither congestion nor pacing blocked sending. It records the last sent packet
+at that boundary. ACK-time cached hints retain their existing callback contract
+but do not renew the BBR sampler's marker. Merely queuing a small write does not
+establish a saturated source. The BDP heuristic and historical packet send
+states are unchanged; light-to-bulk and continuous-backlog regressions remain
+required alongside consumer and throughput validation.

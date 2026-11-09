@@ -1037,6 +1037,9 @@ impl Connection {
         }
 
         self.app_limited = buf.is_empty() && !congestion_blocked;
+        if self.app_limited {
+            self.path.congestion.on_app_limited();
+        }
 
         // Send MTU probe if necessary. Only probe validated paths: probes bypass the
         // anti-amplification check above, and until a migrated path is validated, its budget is
