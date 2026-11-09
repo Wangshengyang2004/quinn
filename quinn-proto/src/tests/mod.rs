@@ -5175,5 +5175,6 @@ fn ack_frequency_policy_server_immediate_unilateral() {
 }
 
 mod bbr_app_limited;
+mod send_exhaustion;
 
 mod hy2_receive_history;
