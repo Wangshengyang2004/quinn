@@ -168,3 +168,12 @@ stream's offered rate. This is an explicit extension beyond Hysteria 2.13.0's
 heuristic, with unchanged loss/no-growth thresholds. Real protocol regressions
 cover light input followed by backlog and continuously backlogged input; field
 queueing, convergence and fairness remain separate acceptance requirements.
+
+Discarding Initial or Handshake keys resets PTO backoff before rearming loss
+detection, following RFC 9002 sections 6.2.2 and A.11. A client that loses one or
+two Initial flights still backs off while no progress is made; after sending its
+first Handshake flight, loss of that flight is probed at the current base PTO.
+Controlled-clock tests cover those cases and the no-loss baseline, including
+actual CRYPTO retransmission timing and successful handshake completion. This
+correction concerns handshake recovery; it does not establish the cause of
+established-session stalls or a real-path throughput improvement.

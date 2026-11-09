@@ -2429,6 +2429,9 @@ impl Connection {
                 .on_packet_discarded(packet.congestion_sequence);
             self.remove_in_flight(&packet);
         }
+        // Key retirement signals handshake progress. Do not carry PTO backoff
+        // from the discarded packet-number space into the remaining spaces.
+        self.pto_count = 0;
         self.set_loss_detection_timer(now)
     }
 
