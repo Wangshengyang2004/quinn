@@ -35,6 +35,7 @@ impl Assembler {
         *self = Self::default();
         self.data = old_data;
         self.data.clear();
+        self.shrink_metadata();
     }
 
     pub(super) fn ensure_ordering(&mut self, ordered: bool) -> Result<(), IllegalOrderedRead> {
@@ -70,6 +71,7 @@ impl Assembler {
                     self.buffered -= chunk.bytes.len();
                     self.allocated -= chunk.allocation_size;
                     PeekMut::pop(chunk);
+                    self.shrink_metadata();
                     continue;
                 }
 
@@ -82,19 +84,44 @@ impl Assembler {
                 }
             }
 
-            return Some(if max_length < chunk.bytes.len() {
+            let result = if max_length < chunk.bytes.len() {
                 self.bytes_read += max_length as u64;
                 let offset = chunk.offset;
                 chunk.offset += max_length as u64;
                 self.buffered -= max_length;
-                Chunk::new(offset, chunk.bytes.split_to(max_length))
+                let result = Chunk::new(offset, chunk.bytes.split_to(max_length));
+                drop(chunk);
+                result
             } else {
                 self.bytes_read += chunk.bytes.len() as u64;
                 self.buffered -= chunk.bytes.len();
                 self.allocated -= chunk.allocation_size;
                 let chunk = PeekMut::pop(chunk);
                 Chunk::new(chunk.offset, chunk.bytes)
-            });
+            };
+            self.shrink_metadata();
+            return Some(result);
+        }
+    }
+
+    /// Bound metadata by the receive-window bytes, with a fixed allowance for
+    /// small frames. Before compaction `buffered` may include duplicates, so
+    /// cap it by the unread offset span and recompute after deduplication.
+    fn chunk_limit(&self) -> usize {
+        let span = usize::try_from(self.end - self.bytes_read).unwrap_or(usize::MAX);
+        BASE_CHUNKS.saturating_add(self.buffered.min(span) / MIN_RETAINED_CHUNK_SIZE)
+    }
+
+    /// Release metadata paid for by bytes that the application has consumed.
+    /// Geometric slack amortizes shrinking while a sparse tail remains.
+    fn shrink_metadata(&mut self) {
+        if self.data.is_empty() {
+            self.data.shrink_to(BASE_CHUNKS);
+        } else {
+            let limit = self.chunk_limit();
+            if self.data.capacity() > limit.saturating_mul(4) {
+                self.data.shrink_to(limit.saturating_mul(2));
+            }
         }
     }
 
@@ -104,14 +131,18 @@ impl Assembler {
     /// We merge contiguous chunks in the process of doing so.
     fn defragment(&mut self) {
         // Keep well-utilized large allocations on the common path.
-        let min_chunk_size = max(self.buffered.div_ceil(MAX_CHUNKS), MIN_RETAINED_CHUNK_SIZE);
+        let min_chunk_size = max(
+            self.buffered.div_ceil(self.chunk_limit()),
+            MIN_RETAINED_CHUNK_SIZE,
+        );
         self.defragment_with_min_chunk_size(min_chunk_size);
-        if self.data.len() > MAX_CHUNKS {
+        if self.data.len() > self.chunk_limit() {
             // Retained large chunks may be adjacent to each other or to copied
             // small chunks. Count actual disjoint spans before rejecting a valid
             // receive window; the size threshold alone cannot guarantee the cap.
             self.defragment_with_min_chunk_size(usize::MAX);
         }
+        self.shrink_metadata();
     }
 
     fn defragment_with_min_chunk_size(&mut self, min_chunk_size: usize) {
@@ -222,10 +253,10 @@ impl Assembler {
         // balance between defragmentation overhead and over-allocation.
         let threshold = 32768.max(buffered * 3 / 2);
         // Small gapped frames hold over-allocation below the threshold, so bound the count too.
-        if over_allocation > threshold || self.data.len() > COMPACT_THRESHOLD {
+        if over_allocation > threshold || self.data.len() > self.chunk_limit().saturating_mul(2) {
             self.defragment();
-            // ngtcp2 uses a threshold of 4000 -- try to be a little more conservative?
-            if self.data.len() > MAX_CHUNKS {
+            // Recompute the byte-funded limit after duplicates and overlaps are removed.
+            if self.data.len() > self.chunk_limit() {
                 return Err(TooManyChunks);
             }
         }
@@ -248,6 +279,7 @@ impl Assembler {
         self.data.clear();
         self.buffered = 0;
         self.allocated = 0;
+        self.shrink_metadata();
     }
 }
 
@@ -369,11 +401,12 @@ pub struct IllegalOrderedRead;
 #[derive(Debug)]
 pub(crate) struct TooManyChunks;
 
-/// Bound on the number of distinct spans kept for a stream
+/// Base metadata allowance for a stream, including tiny or malicious frames.
 ///
-/// Independent of how much memory those spans over-allocate. A frame is rejected only
-/// if compaction cannot get the count back down to this.
-const MAX_CHUNKS: usize = 1024;
+/// Every additional MIN_RETAINED_CHUNK_SIZE buffered bytes funds one more node.
+/// This keeps metadata proportional to flow-controlled bytes while admitting
+/// normal datagram-sized gaps in multi-MiB receive windows.
+const BASE_CHUNKS: usize = 1024;
 
 /// Minimum size of a defragmented chunk that is retained without coalescing.
 ///
@@ -381,11 +414,10 @@ const MAX_CHUNKS: usize = 1024;
 /// being cheap to copy while reducing the overhead of many small buffer nodes.
 const MIN_RETAINED_CHUNK_SIZE: usize = 128;
 
-/// Chunk count past which `insert` compacts before deciding whether to reject
-///
-/// Above `MAX_CHUNKS` so a flood of mergeable frames cannot force a defragmentation
-/// per frame.
-const COMPACT_THRESHOLD: usize = 2 * MAX_CHUNKS;
+/// Test workload scale. Runtime compaction uses twice the current byte-funded
+/// chunk budget, so mergeable frames do not force a compaction on every insert.
+#[cfg(test)]
+const COMPACT_THRESHOLD: usize = 2 * BASE_CHUNKS;
 
 #[cfg(test)]
 mod test {
@@ -715,20 +747,20 @@ mod test {
     }
 
     #[test]
-    fn defrag_respects_max_chunks_at_rounding_boundary() {
+    fn defrag_respects_byte_funded_chunk_budget() {
         let mut x = Assembler::new();
         let data = Bytes::from(vec![0; MIN_RETAINED_CHUNK_SIZE]);
         let mut offset = 0;
         // Fill with minimium sized chunks.
-        for _ in 0..MAX_CHUNKS {
+        for _ in 0..BASE_CHUNKS {
             x.insert(offset, data.clone(), data.len()).unwrap();
             offset += data.len() as u64;
         }
-        // Add 1 extra chunk, defragment must coalesce the previous
-        // chunks to stay within MAX_CHUNKS
+        // Add one extra chunk. Metadata remains within the byte-funded budget,
+        // whether contiguous retained buffers need copying or not.
         x.insert(offset, Bytes::from_static(b"x"), 1).unwrap();
         x.defragment();
-        assert!(x.data.len() <= MAX_CHUNKS);
+        assert!(x.data.len() <= x.chunk_limit());
     }
 
     #[test]
@@ -739,7 +771,7 @@ mod test {
         // Withhold offset 0 so an ordered reader can never drain anything.
         let mut offset = 1u64;
         let mut result = Ok(());
-        for _ in 0..(MAX_CHUNKS * 8) {
+        for _ in 0..(BASE_CHUNKS * 8) {
             result = x.insert(offset, Bytes::from_static(b"gap"), 3);
             if result.is_err() {
                 break;
@@ -748,7 +780,7 @@ mod test {
         }
         assert_matches!(result, Err(TooManyChunks));
         assert!(
-            x.data.len() <= COMPACT_THRESHOLD + 1,
+            x.data.len() <= x.chunk_limit().saturating_mul(2) + 1,
             "chunk count {} exceeded the bound",
             x.data.len()
         );
@@ -763,10 +795,10 @@ mod test {
         x.ensure_ordering(false).unwrap();
         let top = 1_000_000u64;
         x.insert(top, Bytes::from_static(b"ab"), 2).unwrap();
-        for k in 0..(4 * MAX_CHUNKS as u64) {
+        for k in 0..(4 * BASE_CHUNKS as u64) {
             x.insert(top - k - 1, Bytes::from_static(b"ab"), 2).unwrap();
             assert!(
-                x.data.len() <= COMPACT_THRESHOLD + 1,
+                x.data.len() <= x.chunk_limit().saturating_mul(2) + 1,
                 "chunk count {} exceeded the bound at k={k}",
                 x.data.len()
             );
@@ -779,23 +811,23 @@ mod test {
         // so each one pushes a chunk; they must not be rejected, or compact every frame.
         let mut x = Assembler::new();
         // Withhold offset 0 so nothing can be drained.
-        for i in 0..MAX_CHUNKS as u64 {
+        for i in 0..BASE_CHUNKS as u64 {
             x.insert(1 + i * 4, Bytes::from_static(b"abc"), 3).unwrap();
         }
         let mut max_len = x.data.len();
-        for _ in 0..(3 * MAX_CHUNKS) {
+        for _ in 0..(3 * BASE_CHUNKS) {
             x.insert(1, Bytes::from_static(b"abc"), 3)
                 .expect("duplicate flood must not be rejected");
             max_len = max_len.max(x.data.len());
             assert!(
-                x.data.len() <= COMPACT_THRESHOLD + 1,
+                x.data.len() <= x.chunk_limit().saturating_mul(2) + 1,
                 "chunk count {} exceeded the bound",
                 x.data.len()
             );
         }
-        // Compacting on every frame would pin the count at `MAX_CHUNKS`.
+        // Compacting on every frame would pin the count at `BASE_CHUNKS`.
         assert!(
-            max_len > MAX_CHUNKS,
+            max_len > BASE_CHUNKS,
             "buffer compacted on every frame (max observed len {max_len})"
         );
     }
@@ -825,7 +857,7 @@ mod test {
                 .expect("legal stream with 601 receive spans must survive compaction");
         }
         x.defragment();
-        assert!(x.data.len() <= MAX_CHUNKS);
+        assert!(x.data.len() <= x.chunk_limit());
         x.insert(0, Bytes::from_static(b"p"), 1).unwrap();
         let mut gap = 1 + 600 * large.len() as u64;
         for _ in 0..600 {
@@ -849,7 +881,106 @@ mod test {
     }
 
     #[test]
-    fn retained_prefix_does_not_hide_excess_distinct_spans() {
+    fn byte_funded_metadata_is_released_after_drain_clear_and_reinit() {
+        for action in ["drain", "clear", "reinit"] {
+            let mut assembler = Assembler::new();
+            let payload = Bytes::from(vec![0x61; 1200]);
+            for index in 0..5000u64 {
+                assembler
+                    .insert(1 + index * 2400, payload.clone(), payload.len())
+                    .unwrap();
+            }
+            assert!(assembler.data.capacity() > BASE_CHUNKS);
+            match action {
+                "drain" => {
+                    assembler.insert(0, Bytes::from_static(b"p"), 1).unwrap();
+                    for index in 0..5000u64 {
+                        assembler
+                            .insert(1201 + index * 2400, payload.clone(), payload.len())
+                            .unwrap();
+                    }
+                    let mut total = 0;
+                    while let Some(chunk) = assembler.read(usize::MAX, true) {
+                        assert_eq!(chunk.offset, total);
+                        total += chunk.bytes.len() as u64;
+                    }
+                    assert_eq!(total, 1 + 5000 * 2400);
+                }
+                "clear" => assembler.clear(),
+                "reinit" => assembler.reinit(),
+                _ => unreachable!(),
+            }
+            assert_eq!(assembler.buffered, 0);
+            assert_eq!(assembler.allocated, 0);
+            assert!(
+                assembler.data.capacity() <= BASE_CHUNKS,
+                "{action} retained metadata without payload"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_offset_space_does_not_fund_tiny_gap_metadata() {
+        let mut assembler = Assembler::new();
+        assembler
+            .insert(1 << 30, Bytes::from_static(b"x"), 1)
+            .unwrap();
+        let mut rejected = false;
+        for index in 0..4096u64 {
+            if assembler
+                .insert(1 + index * 4, Bytes::from_static(b"abc"), 3)
+                .is_err()
+            {
+                rejected = true;
+                break;
+            }
+        }
+        assert!(
+            rejected,
+            "offset space without payload must not bypass the small-frame bound"
+        );
+        assert!(
+            assembler.data.len() <= 4096,
+            "tiny-frame metadata must remain bounded"
+        );
+    }
+
+    #[test]
+    fn receive_window_sized_datagrams_survive_sparse_delivery() {
+        let mut assembler = Assembler::new();
+        let payload = Bytes::from(vec![0x61; 1200]);
+        // Three MiB of received payload, with a delayed datagram between each
+        // pair. This geometry fits the HY2 receive window and comes from a
+        // fixed large-datagram loss pattern, not tiny malicious stream frames.
+        for index in 0..2500u64 {
+            assembler
+                .insert(1 + index * 2400, payload.clone(), payload.len())
+                .expect("legal datagram-sized sparse delivery must survive");
+        }
+        assembler.insert(0, Bytes::from_static(b"p"), 1).unwrap();
+        for index in 0..2500u64 {
+            assembler
+                .insert(1201 + index * 2400, payload.clone(), payload.len())
+                .unwrap();
+        }
+        let mut total = 0;
+        while let Some(chunk) = assembler.read(usize::MAX, true) {
+            assert_eq!(chunk.offset, total);
+            if total == 0 {
+                assert_eq!(chunk.bytes[0], b'p');
+                assert!(chunk.bytes[1..].iter().all(|b| *b == 0x61));
+            } else {
+                assert!(chunk.bytes.iter().all(|b| *b == 0x61));
+            }
+            total += chunk.bytes.len() as u64;
+        }
+        assert_eq!(total, 1 + 2500 * 2400);
+        assert_eq!(assembler.buffered, 0);
+        assert_eq!(assembler.allocated, 0);
+    }
+
+    #[test]
+    fn retained_prefix_funds_bounded_sparse_tail_metadata() {
         let mut x = Assembler::new();
         let large = Bytes::from(vec![0x61; 4096]);
         let small = Bytes::from(vec![0x62; 32]);
@@ -863,15 +994,15 @@ mod test {
             x.insert(offset, small.clone(), small.len()).unwrap();
             offset += small.len() as u64;
         }
-        let mut result = Ok(());
         for _ in 0..1000 {
-            result = x.insert(offset - small.len() as u64, small.clone(), small.len());
-            if result.is_err() {
-                break;
-            }
+            x.insert(offset - small.len() as u64, small.clone(), small.len())
+                .expect("the large received prefix funds bounded tail metadata");
         }
-        assert_matches!(result, Err(TooManyChunks));
-        assert!(x.data.len() <= COMPACT_THRESHOLD + 1);
+        x.defragment();
+        assert!(x.data.len() <= x.chunk_limit());
+        // Duplicates do not contribute to the compacted byte budget.
+        assert_eq!(x.buffered, 600 * large.len() + 1100 * small.len());
+        assert!(x.chunk_limit() <= BASE_CHUNKS + x.buffered / MIN_RETAINED_CHUNK_SIZE);
     }
 
     fn next_unordered(x: &mut Assembler) -> Chunk {

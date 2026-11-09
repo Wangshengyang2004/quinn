@@ -208,3 +208,13 @@ hint is unchanged for Reno/Cubic and does not renew the BBR sampler's marker. Me
 establish a saturated source. The BDP heuristic and historical packet send
 states are unchanged; light-to-bulk and continuous-backlog regressions remain
 required alongside consumer and throughput validation.
+
+Stream assembly retains a fixed allowance of 1024 metadata nodes plus one node
+per 128 buffered bytes, capped by the unread offset span before compaction and
+recomputed after deduplication. Compaction starts at twice that budget; sparse
+small-frame attacks remain bounded, while datagram-sized gaps in multi-MiB
+receive windows can be reassembled without a connection-fatal fixed-span limit.
+Consumed, cleared and reused assemblers release excess metadata capacity, with
+geometric slack while unread data remains. This changes local resource accounting,
+not QUIC frame layouts, flow-control credit or congestion control. Protocol and
+consumer acceptance remain separate from WAN throughput and heartbeat recovery.
