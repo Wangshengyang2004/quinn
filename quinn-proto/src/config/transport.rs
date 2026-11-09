@@ -67,6 +67,7 @@ pub struct TransportConfig {
     pub(crate) ack_frequency_config: Option<AckFrequencyConfig>,
     pub(crate) ack_frequency_supported: bool,
     pub(crate) chrome_packet_numbers: bool,
+    pub(crate) quic_go_packet_numbers: bool,
     pub(crate) chrome_no_coalescing: bool,
     pub(crate) chrome_initial_crypto_split: bool,
     pub(crate) chrome_initial_payload_chaos: bool,
@@ -371,6 +372,14 @@ impl TransportConfig {
         self
     }
 
+    /// Whether ordinary packets use quic-go's two-byte minimum packet-number encoding.
+    ///
+    /// Defaults to `false`. Explicit Chrome client encoding takes precedence.
+    pub fn quic_go_packet_numbers(&mut self, enabled: bool) -> &mut Self {
+        self.quic_go_packet_numbers = enabled;
+        self
+    }
+
     /// Whether clients use Chrome's packet-number start and encoded-length policy.
     ///
     /// This is ignored for servers. Defaults to `false`.
@@ -575,6 +584,7 @@ impl Default for TransportConfig {
             ack_frequency_config: None,
             ack_frequency_supported: true,
             chrome_packet_numbers: false,
+            quic_go_packet_numbers: false,
             chrome_no_coalescing: false,
             chrome_initial_crypto_split: false,
             chrome_initial_payload_chaos: false,
@@ -626,6 +636,7 @@ impl fmt::Debug for TransportConfig {
             ack_frequency_config,
             ack_frequency_supported,
             chrome_packet_numbers,
+            quic_go_packet_numbers,
             chrome_no_coalescing,
             chrome_initial_crypto_split,
             chrome_initial_payload_chaos,
@@ -669,6 +680,7 @@ impl fmt::Debug for TransportConfig {
             .field("ack_frequency_config", ack_frequency_config)
             .field("ack_frequency_supported", ack_frequency_supported)
             .field("chrome_packet_numbers", chrome_packet_numbers)
+            .field("quic_go_packet_numbers", quic_go_packet_numbers)
             .field("chrome_no_coalescing", chrome_no_coalescing)
             .field("chrome_initial_crypto_split", chrome_initial_crypto_split)
             .field("chrome_initial_payload_chaos", chrome_initial_payload_chaos)
