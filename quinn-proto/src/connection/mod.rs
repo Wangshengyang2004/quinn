@@ -4670,6 +4670,36 @@ mod tests {
 
     #[cfg(feature = "rustls-ring")]
     #[test]
+    fn key_discard_retires_unacknowledged_initial_without_loss_sample() {
+        use crate::tests::key_discard::{PacketLifecycle, recording_client};
+        let events = PacketLifecycle::default();
+        let mut endpoint = crate::Endpoint::new(
+            Arc::new(EndpointConfig::default()), None, true, None,
+        );
+        let now = Instant::now();
+        let (_, mut connection) = endpoint.connect(
+            now, recording_client(&events), "[::1]:4433".parse().unwrap(), "localhost",
+        ).unwrap();
+        let mut buf = Vec::new();
+        assert!(connection.poll_transmit(now, 1, &mut buf).is_some());
+        let outstanding = connection.spaces[SpaceId::Initial].sent_packets.values()
+            .map(|packet| packet.congestion_sequence).collect::<Vec<_>>();
+        assert!(!outstanding.is_empty());
+        assert!(connection.bytes_in_flight() > 0);
+        events.0.lock().unwrap().clear();
+        connection.discard_space(now, SpaceId::Initial);
+        assert_eq!(connection.bytes_in_flight(), 0);
+        assert!(connection.spaces[SpaceId::Initial].sent_packets.is_empty());
+        assert_eq!(
+            *events.0.lock().unwrap(),
+            outstanding.into_iter().map(|packet| ("discarded", packet)).collect::<Vec<_>>(),
+            "key retirement must not inject a loss sample into the next congestion event",
+        );
+    }
+
+
+    #[cfg(feature = "rustls-ring")]
+    #[test]
     fn large_initial_token_leaves_room_for_close() {
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
         let mut roots = rustls::RootCertStore::empty();

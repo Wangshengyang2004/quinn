@@ -37,6 +37,7 @@ mod util;
 use util::*;
 
 mod ack_congestion;
+pub(crate) mod key_discard;
 mod migration_mtu;
 mod token;
 
