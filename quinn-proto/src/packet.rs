@@ -702,6 +702,16 @@ impl PacketNumber {
         }
     }
 
+    /// Apply quic-go's ordinary packet-number length policy, including its two-byte floor.
+    pub(crate) fn new_quic_go(n: u64, largest_acked: Option<u64>) -> Self {
+        let unacked = largest_acked.map_or(n + 1, |acked| n - acked);
+        match unacked {
+            0..32_768 => Self::U16(n as u16),
+            32_768..8_388_608 => Self::U24(n as u32),
+            _ => Self::U32(n as u32),
+        }
+    }
+
     /// Apply Chromium's packet-number length policy.
     ///
     /// The congestion window provides a floor for the encoded range, one-byte packet numbers are
@@ -937,6 +947,30 @@ mod tests {
         check_pn(PacketNumber::new(0x10, 0), &hex!("10"));
         check_pn(PacketNumber::new(0x100, 0), &hex!("0100"));
         check_pn(PacketNumber::new(0x10000, 0), &hex!("010000"));
+    }
+
+    #[test]
+    fn quic_go_packet_number_lengths_follow_hysteria_2_13_boundaries() {
+        // quic-go a10df75c: ordinary mode never uses one byte; no ACK means pn + 1.
+        for (pn, acked, expected) in [
+            (0, None, 2),
+            (32_766, None, 2),
+            (32_767, None, 3),
+            (8_388_606, None, 3),
+            (8_388_607, None, 4),
+            (32_777, Some(10), 2),
+            (32_778, Some(10), 3),
+            (8_388_617, Some(10), 3),
+            (8_388_618, Some(10), 4),
+            ((1 << 62) - 1, None, 4),
+        ] {
+            let encoded = PacketNumber::new_quic_go(pn, acked);
+            assert_eq!(encoded.len(), expected, "pn={pn}, acked={acked:?}");
+            let mut bytes = Vec::new();
+            encoded.encode(&mut bytes);
+            assert_eq!(encoded.expand(pn), pn);
+            assert_eq!(bytes.len(), expected);
+        }
     }
 
     #[test]

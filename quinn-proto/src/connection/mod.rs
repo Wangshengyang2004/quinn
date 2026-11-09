@@ -4032,6 +4032,36 @@ impl Connection {
             .collect()
     }
 
+    #[cfg(test)]
+    pub(crate) fn assert_packet_number_policy_and_sizing(&mut self) {
+        let client = self.side.is_client();
+        for (chrome, quic_go, expected_len) in [
+            (false, false, 1),
+            (false, true, 2),
+            (true, true, if client { 1 } else { 2 }),
+            (true, false, 1),
+        ] {
+            let mut config = TransportConfig::default();
+            config
+                .chrome_packet_numbers(chrome)
+                .quic_go_packet_numbers(quic_go);
+            self.config = Arc::new(config);
+            for space in [SpaceId::Initial, SpaceId::Handshake, SpaceId::Data] {
+                let pn = self.spaces[space].largest_acked_packet.unwrap_or(0) + 1;
+                assert_eq!(
+                    self.encode_packet_number(space, pn).len(),
+                    expected_len,
+                    "client={client}, chrome={chrome}, quic_go={quic_go}, space={space:?}"
+                );
+            }
+            let pn = self.spaces[SpaceId::Data].largest_acked_packet.unwrap_or(0) + 1;
+            assert_eq!(
+                self.predict_1rtt_overhead(Some(pn)),
+                1 + self.rem_cids.active().len() + expected_len + self.tag_len_1rtt()
+            );
+        }
+    }
+
     /// Whether no timers but keepalive, idle, rtt, pushnewcid, and key discard are running
     #[cfg(test)]
     pub(crate) fn is_idle(&self) -> bool {
@@ -4123,6 +4153,28 @@ impl Connection {
         self.path.current_mtu()
     }
 
+    /// Select the same packet-number encoding for sizing and actual serialization.
+    fn encode_packet_number(&self, space: SpaceId, pn: u64) -> PacketNumber {
+        let largest_acked = self.spaces[space].largest_acked_packet;
+        if self.side.is_client() && self.config.chrome_packet_numbers {
+            const MIN_DATAGRAM_ROOM_FOR_SIZING: u64 = 40;
+            let sizing_unit = if self.chrome_last_datagram_padding >= MIN_DATAGRAM_ROOM_FOR_SIZING {
+                self.chrome_last_datagram_padding
+            } else {
+                u64::from(self.path.current_mtu())
+            };
+            PacketNumber::new_chrome(
+                pn,
+                largest_acked,
+                self.path.congestion.window() / sizing_unit,
+            )
+        } else if self.config.quic_go_packet_numbers {
+            PacketNumber::new_quic_go(pn, largest_acked)
+        } else {
+            PacketNumber::new(pn, largest_acked.unwrap_or(0))
+        }
+    }
+
     /// Size of non-frame data for a 1-RTT packet
     ///
     /// Quantifies space consumed by the QUIC header and AEAD tag. All other bytes in a packet are
@@ -4131,11 +4183,7 @@ impl Connection {
     /// latency and packet loss.
     fn predict_1rtt_overhead(&self, pn: Option<u64>) -> usize {
         let pn_len = match pn {
-            Some(pn) => PacketNumber::new(
-                pn,
-                self.spaces[SpaceId::Data].largest_acked_packet.unwrap_or(0),
-            )
-            .len(),
+            Some(pn) => self.encode_packet_number(SpaceId::Data, pn).len(),
             // Upper bound
             None => 4,
         };
@@ -4684,7 +4732,6 @@ fn negotiate_max_idle_timeout(x: Option<VarInt>, y: Option<VarInt>) -> Option<Du
 #[cfg(test)]
 mod tests {
     use super::*;
-
     #[cfg(feature = "rustls-ring")]
     #[test]
     fn key_discard_retires_unacknowledged_initial_without_loss_sample() {

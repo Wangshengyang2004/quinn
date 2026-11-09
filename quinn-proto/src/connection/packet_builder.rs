@@ -7,7 +7,7 @@ use crate::{
     ConnectionId, Instant, TransportError, TransportErrorCode,
     connection::ConnectionSide,
     frame::{self, Close, FrameStruct},
-    packet::{FIXED_BIT, Header, InitialHeader, LongType, PacketNumber, PartialEncode, SpaceId},
+    packet::{FIXED_BIT, Header, InitialHeader, LongType, PartialEncode, SpaceId},
 };
 
 pub(super) struct PacketBuilder {
@@ -78,18 +78,6 @@ impl PacketBuilder {
             }
         }
 
-        let chrome_packet_numbers = conn.side.is_client() && conn.config.chrome_packet_numbers;
-        let cwnd_packets = if chrome_packet_numbers {
-            const MIN_DATAGRAM_ROOM_FOR_SIZING: u64 = 40;
-            let sizing_unit = if conn.chrome_last_datagram_padding >= MIN_DATAGRAM_ROOM_FOR_SIZING {
-                conn.chrome_last_datagram_padding
-            } else {
-                u64::from(conn.path.current_mtu())
-            };
-            conn.path.congestion.window() / sizing_unit
-        } else {
-            0
-        };
         let space = &mut conn.spaces[space_id];
         let exact_number = match space_id {
             SpaceId::Data => conn.packet_number_filter.allocate(&mut conn.rng, space),
@@ -98,11 +86,8 @@ impl PacketBuilder {
 
         let span = trace_span!("send", space = ?space_id, pn = exact_number).entered();
 
-        let number = if chrome_packet_numbers {
-            PacketNumber::new_chrome(exact_number, space.largest_acked_packet, cwnd_packets)
-        } else {
-            PacketNumber::new(exact_number, space.largest_acked_packet.unwrap_or(0))
-        };
+        let number = conn.encode_packet_number(space_id, exact_number);
+        let space = &conn.spaces[space_id];
         let header = match space_id {
             SpaceId::Data if space.crypto.is_some() => Header::Short {
                 dst_cid,

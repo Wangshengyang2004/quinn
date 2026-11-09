@@ -177,3 +177,21 @@ Controlled-clock tests cover those cases and the no-loss baseline, including
 actual CRYPTO retransmission timing and successful handshake completion. This
 correction concerns handshake recovery; it does not establish the cause of
 established-session stalls or a real-path throughput improvement.
+
+
+`quic_go_packet_numbers(true)` selects the ordinary packet-number encoding used
+by Hysteria 2.13.0's quic-go dependency (`a10df75c260c`): a two-byte minimum,
+three bytes at an unacknowledged range of 32,768, and four bytes at 8,388,608.
+With no ACK, that range is the next packet number plus one. Explicit Chrome
+client shaping takes precedence; servers use the ordinary policy even if the
+Chrome flag is set. The option defaults to false for ordinary Quinn consumers.
+Header serialization and 1-RTT size prediction share the same selection.
+
+The real TLS regression delays the first encrypted server datagram until over
+1,213 later datagrams have arrived, then delivers the original before returning
+any ACK or timer event to the sender. Under the existing short encoding the
+ordered body remains incomplete; the explicit quic-go policy delivers the full
+3 MiB without retransmission. This proves that encoding boundary under controlled
+reordering. Interface capture order alone does not identify encrypted packet
+numbers or prove this caused every observed WAN stall. EasyTier must explicitly
+enable the option and validate the exact dependency revision before deployment.
