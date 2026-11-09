@@ -3924,6 +3924,20 @@ impl Connection {
         self.spaces[self.highest_space].immediate_ack_pending = true;
     }
 
+    #[cfg(test)]
+    pub(crate) fn handshake_pto_state_for_test(
+        &self,
+        now: Instant,
+    ) -> (u32, bool, bool, Duration, Option<Instant>) {
+        (
+            self.pto_count,
+            self.spaces[SpaceId::Initial].crypto.is_some(),
+            self.spaces[SpaceId::Handshake].crypto.is_some(),
+            self.pto(SpaceId::Handshake),
+            self.pto_time_and_space(now).map(|(time, _)| time),
+        )
+    }
+
     /// Decodes a packet, returning its decrypted payload, so it can be inspected in tests
     #[cfg(test)]
     pub(crate) fn decode_packet(&self, event: &ConnectionEvent) -> Option<Vec<u8>> {
