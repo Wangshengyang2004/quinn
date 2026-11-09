@@ -33,8 +33,11 @@ pub trait Controller: Send + Sync {
     fn on_begin_congestion_event(&mut self, prior_bytes_in_flight: u64) {}
 
     /// A transmit poll exhausted application data without congestion or pacing
-    /// blocking transmission. Records the send boundary when it is observed;
-    /// ACK callbacks can still carry an older application-limited observation.
+    /// blocking transmission, and without a known writer still blocked on stream,
+    /// connection or local send-window credit. A blocked write suppresses this
+    /// notification only while its credit remains unavailable and the stream is
+    /// still writable. Records the send boundary when observed; the historical
+    /// ACK hint retains its existing contract for other controllers.
     fn on_app_limited(&mut self) {}
 
     /// One fresh RTT sample for this ACK frame, before individual ACK callbacks.

@@ -1037,7 +1037,9 @@ impl Connection {
         }
 
         self.app_limited = buf.is_empty() && !congestion_blocked;
-        if self.app_limited {
+        // Preserve the historical ACK hint for loss-based controllers. The
+        // explicit demand notification must exclude callers blocked on credit.
+        if self.app_limited && !self.streams.has_blocked_stream_writer() {
             self.path.congestion.on_app_limited();
         }
 

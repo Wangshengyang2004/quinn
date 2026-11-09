@@ -200,8 +200,11 @@ enable the option and validate the exact dependency revision before deployment.
 The explicit BBR application-limited extension observes actual transmit
 exhaustion through `Controller::on_app_limited`: no datagram was produced and
 neither congestion nor pacing blocked sending. It records the last sent packet
-at that boundary. ACK-time cached hints retain their existing callback contract
-but do not renew the BBR sampler's marker. Merely queuing a small write does not
+at that boundary only when no known stream writer is still blocked on stream,
+connection, or local send-window credit. Credit exhaustion alone does not imply
+continued source demand: a preceding failed write is required. Closed, reset,
+stopped, or recredited streams do not retain that blocker. The historical ACK-time
+hint is unchanged for Reno/Cubic and does not renew the BBR sampler's marker. Merely queuing a small write does not
 establish a saturated source. The BDP heuristic and historical packet send
 states are unchanged; light-to-bulk and continuous-backlog regressions remain
 required alongside consumer and throughput validation.

@@ -151,6 +151,22 @@ pub struct StreamsState {
 }
 
 impl StreamsState {
+    /// An application attempted another write, and its stream still lacks credit.
+    /// Keep this distinct from an empty pending queue: accepted bytes can all
+    /// have been transmitted while the caller waits to supply the next chunk.
+    pub(crate) fn has_blocked_stream_writer(&self) -> bool {
+        self.send.iter().any(|(&id, stream)| {
+            let Some(stream) = stream else {
+                return false;
+            };
+            stream.is_writable()
+                && stream.stop_reason.is_none()
+                && ((stream.connection_blocked && self.stream_write_limit(id) == 0)
+                    || (stream.data_blocked_limit == Some(stream.max_data)
+                        && stream.pending.offset() == stream.max_data))
+        })
+    }
+
     #[allow(unreachable_pub)] // fuzzing only
     pub fn new(
         side: Side,

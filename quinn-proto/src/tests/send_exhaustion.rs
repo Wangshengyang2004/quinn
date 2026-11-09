@@ -24,10 +24,14 @@ impl Controller for Boundaries {
         _: u64,
         _: u64,
         _: u64,
-        _: bool,
+        app_limited: bool,
         _: &crate::connection::RttEstimator,
     ) {
-        self.0.lock().unwrap().push("ack");
+        let mut events = self.0.lock().unwrap();
+        events.push("ack");
+        if app_limited {
+            events.push("legacy-limited");
+        }
     }
     fn on_congestion_event(
         &mut self,
@@ -78,7 +82,7 @@ fn check_boundary(datagrams: bool, light: bool) {
         .unwrap()
         .mtu_discovery_config(None)
         .congestion_controller_factory(Arc::new(observations.clone()));
-    let (client, server) = pair.connect_with(config);
+    let (client, _server) = pair.connect_with(config);
     pair.drive();
     let stream = pair.client_streams(client).open(Dir::Uni).unwrap();
     for byte in [1, 2] {
@@ -179,6 +183,13 @@ fn blocked_credit_does_not_report_source_exhaustion(limit: CreditLimit) {
         !events.contains(&"idle"),
         "{limit:?}: source still has a blocked write: {events:?}"
     );
+    drop(events);
+    pair.drive_server();
+    pair.drive_client();
+    assert!(
+        observations.0.lock().unwrap().contains(&"legacy-limited"),
+        "the generic ACK hint must retain its loss-based-controller contract"
+    );
 }
 
 #[test]
@@ -246,5 +257,80 @@ fn send_exhaustion_credit_closed_writer_does_not_hold_demand() {
                 "{limit:?}, reset={reset}"
             );
         }
+    }
+}
+
+#[test]
+fn send_exhaustion_credit_restoration_does_not_keep_a_stale_blocker() {
+    for limit in [
+        CreditLimit::Stream,
+        CreditLimit::Connection,
+        CreditLimit::SendWindow,
+    ] {
+        let (mut pair, client, server, observations) = credit_pair(limit);
+        let stream = pair.client_streams(client).open(Dir::Uni).unwrap();
+        assert_eq!(
+            pair.client_send(client, stream).write(&[7; 4096]).unwrap(),
+            4096
+        );
+        assert_matches!(
+            pair.client_send(client, stream).write(&[7; 1]),
+            Err(WriteError::Blocked)
+        );
+        pair.drive_client();
+        pair.drive_server();
+        assert_eq!(pair.server_streams(server).accept(Dir::Uni), Some(stream));
+        let mut recv = pair.server_recv(server, stream);
+        let mut chunks = recv.read(true).unwrap();
+        let mut bytes = 0;
+        while let Ok(Some(chunk)) = chunks.next(usize::MAX) {
+            assert!(chunk.bytes.iter().all(|byte| *byte == 7));
+            bytes += chunk.bytes.len();
+        }
+        let _ = chunks.finalize();
+        assert_eq!(bytes, 4096);
+        observations.0.lock().unwrap().clear();
+        pair.drive();
+        assert!(
+            observations.0.lock().unwrap().contains(&"idle"),
+            "{limit:?}: stale blocked-write state"
+        );
+        assert_eq!(pair.client_send(client, stream).write(&[7]).unwrap(), 1);
+        observations.0.lock().unwrap().clear();
+        pair.drive_client();
+        assert!(
+            observations.0.lock().unwrap().contains(&"idle"),
+            "{limit:?}: write is unblocked"
+        );
+    }
+}
+
+#[test]
+fn send_exhaustion_credit_stopped_writer_does_not_hold_demand() {
+    for limit in [
+        CreditLimit::Stream,
+        CreditLimit::Connection,
+        CreditLimit::SendWindow,
+    ] {
+        let (mut pair, client, server, observations) = credit_pair(limit);
+        let stream = pair.client_streams(client).open(Dir::Uni).unwrap();
+        assert_eq!(
+            pair.client_send(client, stream).write(&[7; 4096]).unwrap(),
+            4096
+        );
+        assert_matches!(
+            pair.client_send(client, stream).write(&[7; 1]),
+            Err(WriteError::Blocked)
+        );
+        pair.drive_client();
+        pair.drive_server();
+        assert_eq!(pair.server_streams(server).accept(Dir::Uni), Some(stream));
+        pair.server_recv(server, stream).stop(0u32.into()).unwrap();
+        observations.0.lock().unwrap().clear();
+        pair.drive();
+        assert!(
+            observations.0.lock().unwrap().contains(&"idle"),
+            "{limit:?}"
+        );
     }
 }
