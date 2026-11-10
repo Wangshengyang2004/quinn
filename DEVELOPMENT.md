@@ -6,17 +6,48 @@ quinn-udp 0.5.16. It retains application-limited BBR fixes and bounded byte-rate
 pacing, and adds the scoped HY2 alignment described in
 [HY2-RUST-UPSTREAM.md](HY2-RUST-UPSTREAM.md).
 
-Chrome wire shaping and HY2 window/profile options are explicit. Ordinary Quinn
-builds and default settings retain their existing contracts. The `hy2-rustls`
-feature requires EasyTier's TLS patch; default builds use official rustls.
-Adaptive loss thresholds remain archived.
+Chrome wire shaping and HY2 window/profile options are explicit. The `hy2-rustls`
+feature requires EasyTier's TLS patch; builds without that feature use official
+rustls. Other fork changes also apply to ordinary Quinn consumers. Adaptive loss
+thresholds remain archived.
+
+## Fork compatibility boundary
+
+The package retains the upstream version `0.11.19` for dependency resolution.
+Consumers must identify this fork by its exact Git revision. Its public Rust API
+includes incompatible changes: `congestion::Controller::on_sent` and `on_ack`
+accept additional in-flight state, and controller lifecycle callbacks include
+congestion-event boundaries, application-limited observations, RTT updates,
+losses and discarded packets. Third-party controller implementations need source
+updates and explicit validation. `ConnectError::InvalidTransportParameters` also
+extends a public enum, affecting exhaustive matches. The version number alone
+does not promise source compatibility with crates.io Quinn.
+
+These maintained changes are active independently of the HY2 profile switches:
+
+- Due ACK-only feedback can bypass the congestion window and pacer, while
+  remaining separate from congestion-controlled padding and GSO batches.
+- Retiring Initial or Handshake keys resets PTO backoff before rearming loss
+  detection. Lack of handshake progress continues to use PTO backoff.
+- Stream writable-event polling rechecks current credit and stream state before
+  waking blocked writers. Explicit reserve configuration changes credit policy;
+  the revised polling code also runs with the default reserve values.
+- The selected BBR controller uses the maintained delivery sampler, event state,
+  application-limited detection and recovery/ProbeRTT fixes described below.
+  Selecting another congestion controller does not enable BBR.
+- Receive assembly uses a byte-funded metadata allowance and consumption-driven
+  reclamation for all receive streams, including ordinary QUIC.
+
+Profile-specific tests and ordinary QUIC tests cover different consumers. Validate
+both when changing shared code; these source contracts establish no WAN
+throughput or recovery guarantee.
 
 `hy2_receive_history(true)` uses a fixed 16,384-packet replay window with a
 2 KiB bitmap in each packet-number space. First arrivals within the window stay
 eligible even after sparse/deep reordering; duplicate packet numbers and numbers
 below the monotonic retirement floor remain rejected. Ordinary Quinn keeps its
-compact default window. The ACK encoder retains its 64-range budget, and loss
-thresholds, BBR, PTO and packet layouts retain their existing contracts. EasyTier
+compact default window. The receive-history option preserves the ACK encoder's 64-range budget and the
+fork's existing loss, BBR, PTO and packet-layout policies. EasyTier
 HY2 enables this receive profile explicitly. This corrects authenticated original
 packet rejection; it does not establish WAN capacity or recovery acceptance.
 
