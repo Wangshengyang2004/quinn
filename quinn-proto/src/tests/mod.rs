@@ -3513,6 +3513,21 @@ fn migrate_detects_new_mtu_and_respects_original_peer_max_udp_payload_size() {
 }
 
 #[test]
+fn server_with_disabled_idle_timeout_accepts_connections() {
+    let _guard = subscribe();
+    // A zero max_idle_timeout disables the idle timeout (RFC 9000 section 18.2), so it must not
+    // make every Initial look stale when the server accepts it.
+    let mut server_config = server_config();
+    Arc::get_mut(&mut server_config.transport)
+        .unwrap()
+        .max_idle_timeout(Some(VarInt::from_u32(0).into()));
+    let mut pair = Pair::new(Default::default(), server_config);
+    let (client_ch, server_ch) = pair.connect();
+    assert!(!pair.client_conn_mut(client_ch).is_closed());
+    assert!(!pair.server_conn_mut(server_ch).is_closed());
+}
+
+#[test]
 fn connect_runs_mtud_again_after_600_seconds() {
     let _guard = subscribe();
     let mut server_config = server_config();
