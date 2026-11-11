@@ -42,6 +42,38 @@ Profile-specific tests and ordinary QUIC tests cover different consumers. Valida
 both when changing shared code; these source contracts establish no WAN
 throughput or recovery guarantee.
 
+## Upstream 0.11.x maintenance
+
+Relative to official `0.11.x` at `8edb4028` (merge base `8192ed39`), these
+`quinn-proto` fixes are incorporated, each with a regression test:
+
+- Cherry-picked: `50f5519c` (illegal ordered reads keep receive state),
+  `9ba03eb5` (nonminimal integer transport parameters), `e716bf53` (zero idle
+  timeout does not refuse Initials), `98c9372f` (APPLICATION_CLOSE reason
+  budget), `8edb4028` (server handshake data waits for ALPN after a
+  HelloRetryRequest; without server ALPN it becomes available at completion).
+- Adapted: `5303ccc1` (switching to unordered reads drops already-read
+  duplicates) passes the start offset through both fork defragmentation
+  helpers; metadata budgeting is unchanged. `e367976e` (DATAGRAM wire limit
+  separate from memory budget): a frame within the limit that does not fit the
+  receive buffer is dropped; a frame whose encoded size exceeds the limit this
+  endpoint advertised is a PROTOCOL_VIOLATION. The advertised value and the
+  check share one helper, so `max_datagram_frame_size` overrides apply to both.
+  With `omit_max_datagram_frame_size` no limit is advertised, so received
+  frames are bounded only by the receive buffer.
+- Independently ported earlier: `4b52785a` (fork `06b9f575`, `c7f28f99`) and
+  `77a51bdc` (fork `834b764f`, `11cc25c3`).
+
+Deliberately not taken:
+
+- The connection-acceptance series `8a1e53da`..`5aebe8f7` (14 commits): the
+  consumer's locked `quinn` 0.11.12 wrapper never calls the new API.
+- `quinn` and `quinn-udp` commits `808dcfe7`, `6e5b60d9`, `c6d94ce4`,
+  `8675d095`, `c2a47f6d`, `322e38a3`, `f0f8c66f`, `4b84837d`, `b86fc003`,
+  `5efe8318`: the consumer takes those crates from crates.io and uses its own
+  sockets.
+- Lockfile and advisory commits `b8306e19`, `974f96b3`, `49cf1206`.
+
 `hy2_receive_history(true)` uses a fixed 16,384-packet replay window with a
 2 KiB bitmap in each packet-number space. First arrivals within the window stay
 eligible even after sparse/deep reordering; duplicate packet numbers and numbers
