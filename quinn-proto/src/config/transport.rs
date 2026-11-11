@@ -462,7 +462,9 @@ impl TransportConfig {
     /// Override the maximum DATAGRAM frame size advertised to the peer.
     ///
     /// The override is only advertised when incoming datagrams are enabled. The receive buffer
-    /// must be at least this large so that the advertised capability is usable.
+    /// must be at least this large so that the advertised capability is usable. A received frame
+    /// whose encoded size exceeds the advertised limit is a protocol violation; a frame within it
+    /// that does not fit the receive buffer is dropped.
     pub fn max_datagram_frame_size(&mut self, value: Option<VarInt>) -> &mut Self {
         self.max_datagram_frame_size = value;
         self
@@ -472,6 +474,8 @@ impl TransportConfig {
     ///
     /// Only use for application protocols, such as HY2, that negotiate this
     /// capability separately. Ordinary QUIC endpoints must advertise support.
+    /// With no advertised limit, received DATAGRAM frames are bounded only by
+    /// the receive buffer; frames that do not fit it are dropped.
     pub fn omit_max_datagram_frame_size(&mut self, omit: bool) -> &mut Self {
         self.omit_max_datagram_frame_size = omit;
         self
@@ -497,6 +501,19 @@ impl TransportConfig {
     pub fn assume_peer_max_datagram_frame_size(&mut self, value: Option<VarInt>) -> &mut Self {
         self.assume_peer_max_datagram_frame_size = value;
         self
+    }
+
+    /// The `max_datagram_frame_size` transport parameter this configuration advertises
+    ///
+    /// `None` when incoming datagrams are disabled or the parameter is omitted. Received DATAGRAM
+    /// frames are checked against this same value.
+    pub(crate) fn advertised_max_datagram_frame_size(&self) -> Option<VarInt> {
+        self.datagram_receive_buffer_size
+            .filter(|_| !self.omit_max_datagram_frame_size)
+            .map(|x| {
+                self.max_datagram_frame_size
+                    .unwrap_or_else(|| VarInt::from_u64(x.min(u16::MAX.into()) as u64).unwrap())
+            })
     }
 
     /// Whether to force every packet number to be used

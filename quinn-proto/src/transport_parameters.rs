@@ -169,14 +169,7 @@ impl TransportParameters {
                 CidQueue::LEN as u32
             }
             .into(),
-            max_datagram_frame_size: config
-                .datagram_receive_buffer_size
-                .filter(|_| !config.omit_max_datagram_frame_size)
-                .map(|x| {
-                    config
-                        .max_datagram_frame_size
-                        .unwrap_or_else(|| VarInt::from_u64(x.min(u16::MAX.into()) as u64).unwrap())
-                }),
+            max_datagram_frame_size: config.advertised_max_datagram_frame_size(),
             grease_quic_bit: endpoint_config.grease_quic_bit,
             min_ack_delay: config.ack_frequency_supported.then(|| {
                 VarInt::from_u64(u64::try_from(TIMER_GRANULARITY.as_micros()).unwrap()).unwrap()
