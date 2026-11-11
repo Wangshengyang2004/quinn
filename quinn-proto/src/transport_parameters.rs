@@ -923,6 +923,38 @@ mod test {
     }
 
     #[test]
+    fn read_nonminimal_integer_parameters() {
+        // RFC 9000 section 16 permits any VarInt encoding length, so two-, four- and eight-byte
+        // encodings of small values must decode, provided the parameter length covers them.
+        let mut buf = Vec::new();
+        buf.write_var(TransportParameterId::InitialMaxData as u64);
+        buf.write_var(2);
+        buf.extend_from_slice(&[0x40, 0x07]);
+        buf.write_var(TransportParameterId::InitialMaxStreamsBidi as u64);
+        buf.write_var(4);
+        buf.extend_from_slice(&[0x80, 0x00, 0x00, 0x10]);
+        buf.write_var(TransportParameterId::MaxIdleTimeout as u64);
+        buf.write_var(8);
+        buf.extend_from_slice(&[0xc0, 0, 0, 0, 0, 0, 0x75, 0x30]);
+        let params = TransportParameters::read(Side::Server, &mut buf.as_slice()).unwrap();
+        assert_eq!(params.initial_max_data, VarInt::from_u32(7));
+        assert_eq!(params.initial_max_streams_bidi, VarInt::from_u32(16));
+        assert_eq!(params.max_idle_timeout, VarInt::from_u32(30_000));
+
+        // A repeated parameter remains malformed regardless of its encoding.
+        let mut buf = Vec::new();
+        for _ in 0..2 {
+            buf.write_var(TransportParameterId::InitialMaxData as u64);
+            buf.write_var(2);
+            buf.extend_from_slice(&[0x40, 0x07]);
+        }
+        assert_eq!(
+            TransportParameters::read(Side::Server, &mut buf.as_slice()),
+            Err(Error::Malformed)
+        );
+    }
+
+    #[test]
     fn read_min_ack_delay_length_mismatch() {
         // `min_ack_delay` claims no value at all, so its `VarInt` starts on the parameter that
         // follows it.
