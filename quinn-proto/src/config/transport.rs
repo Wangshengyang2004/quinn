@@ -59,6 +59,7 @@ pub struct TransportConfig {
     pub(crate) hy2_receive_history: bool,
     pub(crate) time_threshold: f32,
     pub(crate) initial_rtt: Duration,
+    pub(crate) max_pto_interval: Option<Duration>,
     pub(crate) initial_mtu: u16,
     pub(crate) min_mtu: u16,
     pub(crate) mtu_discovery_config: Option<MtuDiscoveryConfig>,
@@ -276,6 +277,17 @@ impl TransportConfig {
     /// The RTT used before an RTT sample is taken
     pub fn initial_rtt(&mut self, value: Duration) -> &mut Self {
         self.initial_rtt = value;
+        self
+    }
+
+    /// Maximum backed-off probe timeout interval for application data, or `None` for none
+    ///
+    /// Applies once the handshake is confirmed. An interval never falls below the PTO without
+    /// backoff, including the peer's maximum ACK delay. Initial and Handshake probes keep the
+    /// exponential backoff. Setting a value departs from the doubling rule of RFC 9002 section
+    /// 6.2.1; it is a local timer policy with no wire-format effect. Defaults to `None`.
+    pub fn max_pto_interval(&mut self, value: Option<Duration>) -> &mut Self {
+        self.max_pto_interval = value;
         self
     }
 
@@ -593,6 +605,7 @@ impl Default for TransportConfig {
             hy2_receive_history: false,
             time_threshold: 9.0 / 8.0,
             initial_rtt: Duration::from_millis(333), // per spec, intentionally distinct from EXPECTED_RTT
+            max_pto_interval: None,
             initial_mtu: INITIAL_MTU,
             min_mtu: INITIAL_MTU,
             mtu_discovery_config: Some(MtuDiscoveryConfig::default()),
@@ -645,6 +658,7 @@ impl fmt::Debug for TransportConfig {
             hy2_receive_history,
             time_threshold,
             initial_rtt,
+            max_pto_interval,
             initial_mtu,
             min_mtu,
             mtu_discovery_config,
@@ -689,6 +703,7 @@ impl fmt::Debug for TransportConfig {
             .field("hy2_receive_history", hy2_receive_history)
             .field("time_threshold", time_threshold)
             .field("initial_rtt", initial_rtt)
+            .field("max_pto_interval", max_pto_interval)
             .field("initial_mtu", initial_mtu)
             .field("min_mtu", min_mtu)
             .field("mtu_discovery_config", mtu_discovery_config)

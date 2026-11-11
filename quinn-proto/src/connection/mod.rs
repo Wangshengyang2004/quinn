@@ -2040,6 +2040,11 @@ impl Connection {
                 }
                 // Include max_ack_delay and backoff for ApplicationData.
                 duration += self.ack_frequency.max_ack_delay_for_pto() * backoff;
+                if let Some(max) = self.config.max_pto_interval {
+                    if self.is_handshake_confirmed() {
+                        duration = duration.min(max).max(self.pto(SpaceId::Data));
+                    }
+                }
             }
             let last_ack_eliciting = match self.spaces[space].time_of_last_ack_eliciting_packet {
                 Some(time) => time,
@@ -2051,6 +2056,12 @@ impl Connection {
             }
         }
         result
+    }
+
+    /// Whether the handshake is confirmed (RFC 9001 section 4.1.2), at which point Handshake keys
+    /// are discarded
+    fn is_handshake_confirmed(&self) -> bool {
+        !self.is_handshaking() && self.spaces[SpaceId::Handshake].crypto.is_none()
     }
 
     fn peer_completed_address_validation(&self) -> bool {

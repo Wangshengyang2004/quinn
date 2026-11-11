@@ -194,6 +194,15 @@ algorithm, timer or ordinary socket behavior. Host and consumer integration
 must be validated separately; already queued/in-flight packets retain normal
 loss recovery.
 
+`TransportConfig::max_pto_interval` is an opt-in, sender-local cap on the
+backed-off probe timeout for application data once the handshake is confirmed.
+The capped interval never falls below the PTO without backoff (including the
+peer's maximum ACK delay); Initial and Handshake probes keep exponential
+backoff, and `pto_count` still counts every expiry. Enabling it departs from
+the doubling rule of RFC 9002 section 6.2.1. It changes no wire format, frame
+or transport parameter and has no interoperability effect. It is off (`None`)
+by default; EasyTier does not enable it.
+
 `Controller::on_packet_discarded` retires packet bookkeeping without creating a
 congestion event, delivery-rate sample or loss sample. BBR uses it when an ACK
 is intentionally ignored during path validation, when Retry or rejected
