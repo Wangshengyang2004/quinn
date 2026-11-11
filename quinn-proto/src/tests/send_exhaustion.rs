@@ -81,6 +81,9 @@ fn check_boundary(datagrams: bool, light: bool) {
     Arc::get_mut(&mut config.transport)
         .unwrap()
         .mtu_discovery_config(None)
+        // A randomly skipped packet number before the first write makes the server ACK that
+        // write immediately, leaving no ACK for the second one.
+        .deterministic_packet_numbers(true)
         .congestion_controller_factory(Arc::new(observations.clone()));
     let (client, _server) = pair.connect_with(config);
     pair.drive();
