@@ -609,6 +609,36 @@ mod test {
     }
 
     #[test]
+    fn unordered_after_ordered_read_drops_a_stale_duplicate() {
+        let mut x = Assembler::new();
+        x.insert(0, Bytes::from_static(b"abc"), 3).unwrap();
+        x.insert(0, Bytes::from_static(b"abc"), 3).unwrap();
+        assert_matches!(next(&mut x, 3), Some(y) if &y[..] == b"abc");
+        assert_eq!(x.bytes_read(), 3);
+        x.ensure_ordering(false).unwrap();
+        assert_eq!(x.read(usize::MAX, false), None);
+        assert_eq!(x.bytes_read(), 3);
+    }
+
+    #[test]
+    fn unordered_after_partial_ordered_read_keeps_only_unread_bytes() {
+        let mut x = Assembler::new();
+        x.insert(0, Bytes::from_static(b"abcdef"), 6).unwrap();
+        x.insert(0, Bytes::from_static(b"abc"), 3).unwrap();
+        assert_matches!(next(&mut x, 4), Some(y) if &y[..] == b"abcd");
+        x.ensure_ordering(false).unwrap();
+        // Only the unread suffix remains buffered and accounted for
+        assert_eq!(x.buffered, 2);
+        assert_eq!(
+            next_unordered(&mut x),
+            Chunk::new(4, Bytes::from_static(b"ef"))
+        );
+        assert_eq!(x.read(usize::MAX, false), None);
+        assert_eq!(x.buffered, 0);
+        assert_eq!(x.bytes_read(), 6);
+    }
+
+    #[test]
     fn unordered_happy_path() {
         let mut x = Assembler::new();
         x.ensure_ordering(false).unwrap();
