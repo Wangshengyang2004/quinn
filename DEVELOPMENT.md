@@ -221,6 +221,34 @@ the doubling rule of RFC 9002 section 6.2.1. It changes no wire format, frame
 or transport parameter and has no interoperability effect. It is off (`None`)
 by default; EasyTier does not enable it.
 
+`TransportConfig::max_unsent_stream_delay` is an opt-in, sender-local admission
+policy, off (`None`) by default. When set, a write on a stream is admitted only
+while that stream's unsent data (accepted but never transmitted; retransmissions
+and unacknowledged bytes do not count) fits within the delay at the current
+sending rate: the controller's explicit `pacing_rate`, otherwise the window
+pacer's 5/4 window per smoothed RTT, never less than ten maximum-size packets.
+For HY2 that rate is BBR's pacing rate, or with a negotiated Brutal rate the
+configured bandwidth with loss compensation. The Brutal rate is not measured from
+the path, so on a slower path the bound corresponds to a longer real wait. The
+allowance is recomputed when the application takes a send-stream handle or polls
+for events, and applies beside the existing credit limit. A writer it blocks joins
+the existing blocked list and is woken by the event poll that follows
+transmission from its own stream; no acknowledgement or credit update is needed,
+and a blocked writer is not woken again until its stream has room. The
+application-limited check still looks at credit only: a stream whose backlog was
+fully transmitted can write again, so exhaustion at that point is reported to
+the controller as the source running dry, and BBR marks the following samples
+application-limited instead of treating a refill gap as a path limit.
+
+Each stream has its own allowance, so one stream's backlog never delays admission
+on another; same-priority streams still rotate per packet (`send_fairness`,
+default on). The cost: n streams saturating together each hold their own
+allowance and share the rate, so each sees up to n times the delay. Unset,
+admission is unchanged. Tests compare digests of write admission (unset) and of
+every congestion-controller call for a writer keeping up with an unconstrained
+path (set and unset) against the tree without this policy. EasyTier HY2 enables
+it at 100 ms.
+
 `Controller::on_packet_discarded` retires packet bookkeeping without creating a
 congestion event, delivery-rate sample or loss sample. BBR uses it when an ACK
 is intentionally ignored during path validation, when Retry or rejected
