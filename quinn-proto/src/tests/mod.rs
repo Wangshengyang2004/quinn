@@ -3175,6 +3175,165 @@ fn datagram_recv_buffer_overflow() {
     assert_matches!(pair.server_datagrams(server_ch).recv(), None);
 }
 
+#[derive(Debug, PartialEq)]
+enum DatagramOutcome {
+    Delivered,
+    Dropped,
+    ProtocolViolation,
+}
+
+/// Connect to a server with the given transport configuration, then let the client send DATAGRAM
+/// frames of up to 1400 encoded bytes regardless of what the server advertised.
+///
+/// Returns the client's datagram size limit derived from the server's advertisement, before the
+/// override.
+fn datagram_limit_pair(
+    server_transport: TransportConfig,
+) -> (Pair, ConnectionHandle, ConnectionHandle, Option<usize>) {
+    let server = ServerConfig {
+        transport: Arc::new(server_transport),
+        ..server_config()
+    };
+    let mut pair = Pair::new(Default::default(), server);
+    let (client_ch, server_ch) = pair.connect();
+    pair.drive();
+    let advertised = pair.client_datagrams(client_ch).max_size();
+    pair.client_conn_mut(client_ch)
+        .override_peer_max_datagram_frame_size_for_test(VarInt::from_u32(1400));
+    assert_matches!(pair.server_conn_mut(server_ch).poll(), None);
+    (pair, client_ch, server_ch, advertised)
+}
+
+/// Send one DATAGRAM frame of exactly `frame_size` encoded bytes to the server
+fn send_datagram_frame(
+    pair: &mut Pair,
+    client_ch: ConnectionHandle,
+    server_ch: ConnectionHandle,
+    frame_size: usize,
+) -> DatagramOutcome {
+    // Type byte and a two-byte length
+    let data = Bytes::from(vec![0xab; frame_size - 3]);
+    assert_eq!(Datagram { data: data.clone() }.size(true), frame_size);
+    pair.client_datagrams(client_ch)
+        .send(data.clone(), false)
+        .unwrap();
+    pair.drive();
+    let mut outcome = DatagramOutcome::Dropped;
+    while let Some(event) = pair.server_conn_mut(server_ch).poll() {
+        match event {
+            Event::DatagramReceived => {
+                assert_eq!(pair.server_datagrams(server_ch).recv(), Some(data.clone()));
+                outcome = DatagramOutcome::Delivered;
+            }
+            Event::ConnectionLost {
+                reason: ConnectionError::TransportError(err),
+            } if err.code == TransportErrorCode::PROTOCOL_VIOLATION
+                && err.reason == "oversized datagram" =>
+            {
+                return DatagramOutcome::ProtocolViolation;
+            }
+            event => panic!("unexpected server event {event:?}"),
+        }
+    }
+    assert!(!pair.server_conn_mut(server_ch).is_closed());
+    outcome
+}
+
+#[test]
+fn datagram_wire_limit_defaults_to_receive_buffer() {
+    let _guard = subscribe();
+    // Fully default: the advertised limit is the receive buffer capped at u16::MAX
+    let (mut pair, client_ch, server_ch, _) = datagram_limit_pair(TransportConfig::default());
+    for frame_size in [100, 1300] {
+        assert_eq!(
+            send_datagram_frame(&mut pair, client_ch, server_ch, frame_size),
+            DatagramOutcome::Delivered
+        );
+    }
+
+    // A small receive buffer is advertised as the limit
+    let mut transport = TransportConfig::default();
+    transport.datagram_receive_buffer_size(Some(1000));
+    let (mut pair, client_ch, server_ch, advertised) = datagram_limit_pair(transport);
+    assert_eq!(advertised, Some(1000 - Datagram::SIZE_BOUND));
+    // A frame within the advertised limit whose payload and queue metadata exceed the memory
+    // budget is dropped
+    assert_eq!(
+        send_datagram_frame(&mut pair, client_ch, server_ch, 1000),
+        DatagramOutcome::Dropped
+    );
+    assert_eq!(
+        send_datagram_frame(&mut pair, client_ch, server_ch, 100),
+        DatagramOutcome::Delivered
+    );
+    assert_eq!(
+        send_datagram_frame(&mut pair, client_ch, server_ch, 1001),
+        DatagramOutcome::ProtocolViolation
+    );
+}
+
+#[test]
+fn datagram_wire_limit_follows_smaller_advertised_override() {
+    let _guard = subscribe();
+    let mut transport = TransportConfig::default();
+    transport.max_datagram_frame_size(Some(VarInt::from_u32(500)));
+    let (mut pair, client_ch, server_ch, advertised) = datagram_limit_pair(transport);
+    assert_eq!(advertised, Some(500 - Datagram::SIZE_BOUND));
+    assert_eq!(
+        send_datagram_frame(&mut pair, client_ch, server_ch, 500),
+        DatagramOutcome::Delivered
+    );
+    assert_eq!(
+        send_datagram_frame(&mut pair, client_ch, server_ch, 501),
+        DatagramOutcome::ProtocolViolation
+    );
+}
+
+#[test]
+fn datagram_over_memory_budget_within_larger_advertised_override_is_dropped() {
+    let _guard = subscribe();
+    let mut transport = TransportConfig::default();
+    transport
+        .datagram_receive_buffer_size(Some(600))
+        .max_datagram_frame_size(Some(VarInt::from_u32(1200)));
+    let (mut pair, client_ch, server_ch, _) = datagram_limit_pair(transport);
+    assert_eq!(
+        send_datagram_frame(&mut pair, client_ch, server_ch, 1000),
+        DatagramOutcome::Dropped
+    );
+    assert_eq!(
+        send_datagram_frame(&mut pair, client_ch, server_ch, 100),
+        DatagramOutcome::Delivered
+    );
+    assert_eq!(
+        send_datagram_frame(&mut pair, client_ch, server_ch, 1201),
+        DatagramOutcome::ProtocolViolation
+    );
+}
+
+#[test]
+fn datagram_with_omitted_parameter_is_bounded_only_by_memory_budget() {
+    let _guard = subscribe();
+    // Receiving stays enabled without an advertised limit, so there is no wire limit to violate:
+    // not even the one the receive buffer would otherwise have implied.
+    let mut transport = TransportConfig::default();
+    transport
+        .datagram_receive_buffer_size(Some(600))
+        .omit_max_datagram_frame_size(true);
+    let (mut pair, client_ch, server_ch, advertised) = datagram_limit_pair(transport);
+    assert_eq!(advertised, None);
+    for frame_size in [1000, 1300] {
+        assert_eq!(
+            send_datagram_frame(&mut pair, client_ch, server_ch, frame_size),
+            DatagramOutcome::Dropped
+        );
+    }
+    assert_eq!(
+        send_datagram_frame(&mut pair, client_ch, server_ch, 100),
+        DatagramOutcome::Delivered
+    );
+}
+
 #[test]
 fn datagram_send_buffer_overflow() {
     let _guard = subscribe();

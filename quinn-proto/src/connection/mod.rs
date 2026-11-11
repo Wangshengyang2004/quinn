@@ -3990,6 +3990,13 @@ impl Connection {
         self.peer_params.min_ack_delay = Some(VarInt::from_u32(1000));
     }
 
+    /// Model a peer that sends DATAGRAM frames up to `limit` regardless of what the receiver
+    /// advertised.
+    #[cfg(test)]
+    pub(crate) fn override_peer_max_datagram_frame_size_for_test(&mut self, limit: VarInt) {
+        self.peer_params.max_datagram_frame_size = Some(limit);
+    }
+
     /// The number of bytes of packets containing retransmittable frames that have not been
     /// acknowledged or declared lost.
     #[cfg(test)]
