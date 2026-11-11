@@ -1054,6 +1054,14 @@ impl StreamsState {
         self.send_window = send_window;
     }
 
+    #[cfg(test)]
+    pub(crate) fn unsent(&self, id: StreamId) -> u64 {
+        self.send
+            .get(&id)
+            .and_then(|stream| stream.as_ref())
+            .map_or(0, |stream| stream.pending.unsent())
+    }
+
     /// Set the receive_window and returns whether the receive_window has been
     /// expanded or shrunk: true if expanded, false if shrunk.
     pub(crate) fn set_receive_window(&mut self, receive_window: VarInt) -> bool {

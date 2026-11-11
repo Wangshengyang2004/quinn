@@ -190,6 +190,11 @@ impl SendBuffer {
         self.unacked_len == 0
     }
 
+    /// Bytes written by the application and never transmitted, excluding retransmissions
+    pub(super) fn unsent(&self) -> u64 {
+        self.offset - self.unsent
+    }
+
     /// Whether there's data to send
     ///
     /// There may be sent unacknowledged data even when this is false.

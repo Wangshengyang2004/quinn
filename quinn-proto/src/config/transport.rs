@@ -54,6 +54,7 @@ pub struct TransportConfig {
     pub(crate) send_fairness: bool,
     pub(crate) send_credit_reserve: Option<SendCreditReserve>,
     pub(crate) low_credit_updates: bool,
+    pub(crate) max_unsent_stream_delay: Option<Duration>,
 
     pub(crate) packet_threshold: u32,
     pub(crate) hy2_receive_history: bool,
@@ -128,6 +129,22 @@ impl TransportConfig {
     /// The memory bound and wire format are unchanged. Disabled by default.
     pub fn low_credit_updates(&mut self, enabled: bool) -> &mut Self {
         self.low_credit_updates = enabled;
+        self
+    }
+
+    /// Admit stream writes only while the stream's unsent data fits in this much sending time,
+    /// or `None` for no such limit
+    ///
+    /// Unsent data is accepted from the application but not yet transmitted; retransmissions and
+    /// unacknowledged data do not count. The time converts to bytes at the congestion
+    /// controller's pacing rate, or 5/4 of its window per smoothed RTT without one, and never
+    /// falls below ten maximum-size packets. Each stream has its own allowance, so a stream that
+    /// keeps its own backlog does not delay admission on other streams; several saturating
+    /// streams each hold their own allowance and share the sending rate. A blocked writer is
+    /// woken once transmission makes room. This is a local sending policy with no wire-format
+    /// effect. Defaults to `None`.
+    pub fn max_unsent_stream_delay(&mut self, value: Option<Duration>) -> &mut Self {
+        self.max_unsent_stream_delay = value;
         self
     }
 
@@ -600,6 +617,7 @@ impl Default for TransportConfig {
             send_fairness: true,
             send_credit_reserve: None,
             low_credit_updates: false,
+            max_unsent_stream_delay: None,
 
             packet_threshold: 3,
             hy2_receive_history: false,
@@ -654,6 +672,7 @@ impl fmt::Debug for TransportConfig {
             send_fairness,
             send_credit_reserve,
             low_credit_updates,
+            max_unsent_stream_delay,
             packet_threshold,
             hy2_receive_history,
             time_threshold,
@@ -699,6 +718,7 @@ impl fmt::Debug for TransportConfig {
             .field("send_fairness", send_fairness)
             .field("send_credit_reserve", send_credit_reserve)
             .field("low_credit_updates", low_credit_updates)
+            .field("max_unsent_stream_delay", max_unsent_stream_delay)
             .field("packet_threshold", packet_threshold)
             .field("hy2_receive_history", hy2_receive_history)
             .field("time_threshold", time_threshold)

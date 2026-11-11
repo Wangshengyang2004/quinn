@@ -1551,6 +1551,12 @@ impl Connection {
         self.streams.max_concurrent(dir)
     }
 
+    /// Bytes written to stream `id` and not yet transmitted
+    #[cfg(test)]
+    pub(crate) fn stream_unsent(&self, id: StreamId) -> u64 {
+        self.streams.unsent(id)
+    }
+
     /// See [`TransportConfig::send_window()`]
     pub fn set_send_window(&mut self, send_window: u64) {
         self.streams.set_send_window(send_window);
