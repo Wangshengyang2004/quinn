@@ -1717,18 +1717,21 @@ mod tests {
     fn illegal_ordered_read_preserves_receive_state() {
         let mut client = make(Side::Client);
         let id = StreamId::new(Side::Server, Dir::Uni, 0);
-        client
-            .received(
-                frame::Stream {
-                    id,
-                    offset: 0,
-                    fin: false,
-                    data: Bytes::from_static(b"abcdef"),
-                },
-                6,
-                crate::Instant::now(),
-            )
-            .unwrap();
+        assert_eq!(
+            client
+                .received(
+                    frame::Stream {
+                        id,
+                        offset: 0,
+                        fin: false,
+                        data: Bytes::from_static(b"abcdef"),
+                    },
+                    6,
+                    crate::Instant::now(),
+                )
+                .unwrap(),
+            ShouldTransmit(false)
+        );
 
         let mut pending = Retransmits::default();
         let mut recv = RecvStream {
