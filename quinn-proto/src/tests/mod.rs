@@ -1450,6 +1450,238 @@ fn alpn_after_hello_retry() {
     assert!(ready);
 }
 
+/// A server that only offers secp256r1, so a client leading with an X25519 key share receives a
+/// HelloRetryRequest
+fn hello_retry_server_crypto(alpn: Option<&[u8]>) -> rustls::ServerConfig {
+    let mut provider = default_provider();
+    provider
+        .kx_groups
+        .retain(|group| group.name() == rustls::NamedGroup::secp256r1);
+    let key = PrivatePkcs8KeyDer::from(CERTIFIED_KEY.signing_key.serialize_der());
+    let cert = CERTIFIED_KEY.cert.der().clone();
+    let mut crypto = rustls::ServerConfig::builder_with_provider(Arc::new(provider))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert], PrivateKeyDer::from(key))
+        .unwrap();
+    if let Some(alpn) = alpn {
+        crypto.alpn_protocols = vec![alpn.into()];
+    }
+    crypto
+}
+
+#[derive(Debug, PartialEq)]
+enum ServerHandshakeEvent {
+    DataReady {
+        protocol: Option<Vec<u8>>,
+        server_name: Option<String>,
+        /// Whether TLS was still handshaking when the event was observed
+        handshaking: bool,
+        /// Pair steps between the server accepting the connection and observing the event
+        steps_after_accept: usize,
+    },
+    Connected,
+}
+
+/// Drive `pair` to idle, recording the server's handshake data events in order
+fn drive_observing_server_handshake(pair: &mut Pair) -> Vec<ServerHandshakeEvent> {
+    let mut events = Vec::new();
+    let mut accepted_at = None;
+    for step in 0.. {
+        let more = pair.step();
+        if !pair.server.connections.is_empty() {
+            accepted_at.get_or_insert(step);
+        }
+        for conn in pair.server.connections.values_mut() {
+            while let Some(event) = conn.poll() {
+                match event {
+                    Event::HandshakeDataReady => {
+                        let session = conn.crypto_session();
+                        let hd = session
+                            .handshake_data()
+                            .unwrap()
+                            .downcast::<crypto::rustls::HandshakeData>()
+                            .unwrap();
+                        events.push(ServerHandshakeEvent::DataReady {
+                            protocol: hd.protocol,
+                            server_name: hd.server_name,
+                            handshaking: session.is_handshaking(),
+                            steps_after_accept: step - accepted_at.unwrap(),
+                        });
+                    }
+                    Event::Connected => events.push(ServerHandshakeEvent::Connected),
+                    _ => {}
+                }
+            }
+        }
+        if !more {
+            break;
+        }
+    }
+    events
+}
+
+#[test]
+fn hello_retry_without_server_alpn_reports_handshake_data_at_completion() {
+    let _guard = subscribe();
+    // Without ALPN there is no protocol to wait for after the retry, so the handshake data
+    // becomes available when the handshake completes.
+    let crypto = hello_retry_server_crypto(None);
+    let server_config =
+        ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(crypto).unwrap()));
+    let mut pair = Pair::new(Arc::new(EndpointConfig::default()), server_config);
+    let client_ch = pair.begin_connect(client_config());
+    let events = drive_observing_server_handshake(&mut pair);
+    assert_matches!(
+        &events[..],
+        [ServerHandshakeEvent::DataReady { protocol: None, server_name: Some(name), handshaking: false, .. }, ServerHandshakeEvent::Connected]
+            if name == "localhost"
+    );
+    assert!(!pair.client_conn_mut(client_ch).is_closed());
+}
+
+#[test]
+fn hello_retry_with_alpn_reports_handshake_data_before_completion() {
+    let _guard = subscribe();
+    const ALPN: &[u8] = b"foo";
+    let crypto = hello_retry_server_crypto(Some(ALPN));
+    let server_config =
+        ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(crypto).unwrap()));
+    let mut pair = Pair::new(Arc::new(EndpointConfig::default()), server_config);
+    pair.begin_connect(ClientConfig::new(Arc::new(client_crypto_with_alpn(vec![
+        ALPN.into(),
+    ]))));
+    let events = drive_observing_server_handshake(&mut pair);
+    assert_matches!(
+        &events[..],
+        [ServerHandshakeEvent::DataReady { protocol: Some(protocol), server_name: Some(name), handshaking: true, .. }, ServerHandshakeEvent::Connected]
+            if protocol == ALPN && name == "localhost"
+    );
+    // Ready from the second ClientHello, not the first
+    assert_matches!(&events[0], ServerHandshakeEvent::DataReady { steps_after_accept, .. } if *steps_after_accept > 0);
+}
+
+#[test]
+fn server_handshake_data_ready_from_first_client_hello_without_retry() {
+    let _guard = subscribe();
+    const ALPN: &[u8] = b"foo";
+    for alpn in [None, Some(ALPN)] {
+        let (server_crypto, client_crypto) = match alpn {
+            Some(alpn) => (
+                server_crypto_with_alpn(vec![alpn.into()]),
+                client_crypto_with_alpn(vec![alpn.into()]),
+            ),
+            None => (server_crypto(), client_crypto()),
+        };
+        let mut pair = Pair::new(
+            Arc::new(EndpointConfig::default()),
+            ServerConfig::with_crypto(Arc::new(server_crypto)),
+        );
+        pair.begin_connect(ClientConfig::new(Arc::new(client_crypto)));
+        let events = drive_observing_server_handshake(&mut pair);
+        assert_eq!(
+            events,
+            vec![
+                ServerHandshakeEvent::DataReady {
+                    protocol: alpn.map(Vec::from),
+                    server_name: Some("localhost".into()),
+                    handshaking: true,
+                    steps_after_accept: 0,
+                },
+                ServerHandshakeEvent::Connected,
+            ],
+            "ALPN {alpn:?}"
+        );
+    }
+}
+
+/// HelloRetryRequest combined with an accepted Encrypted ClientHello, using the server-side ECH
+/// support of the patched rustls
+#[cfg(all(feature = "hy2-rustls", feature = "rustls-aws-lc-rs"))]
+#[test]
+fn alpn_after_hello_retry_with_ech() {
+    use rustls::crypto::aws_lc_rs::hpke::ALL_SUPPORTED_SUITES;
+
+    let _guard = subscribe();
+    const ALPN: &[u8] = b"foo";
+    let suite = ALL_SUPPORTED_SUITES[0];
+    let (public_key, private_key) = suite.generate_key_pair().unwrap();
+    let id = suite.suite();
+
+    // ECHConfig (RFC 9849 section 4), version 0xfe0d
+    let mut contents = vec![7]; // config_id
+    contents.extend_from_slice(&u16::from(id.kem).to_be_bytes());
+    contents.extend_from_slice(&(public_key.0.len() as u16).to_be_bytes());
+    contents.extend_from_slice(&public_key.0);
+    contents.extend_from_slice(&4u16.to_be_bytes());
+    contents.extend_from_slice(&u16::from(id.sym.kdf_id).to_be_bytes());
+    contents.extend_from_slice(&u16::from(id.sym.aead_id).to_be_bytes());
+    contents.push(0); // maximum_name_length
+    const PUBLIC_NAME: &[u8] = b"public.example";
+    contents.push(PUBLIC_NAME.len() as u8);
+    contents.extend_from_slice(PUBLIC_NAME);
+    contents.extend_from_slice(&0u16.to_be_bytes()); // extensions
+    let mut config = 0xfe0du16.to_be_bytes().to_vec();
+    config.extend_from_slice(&(contents.len() as u16).to_be_bytes());
+    config.extend_from_slice(&contents);
+    let mut config_list = (config.len() as u16).to_be_bytes().to_vec();
+    config_list.extend_from_slice(&config);
+
+    let mut server_crypto = hello_retry_server_crypto(Some(ALPN));
+    server_crypto.ech_keys = Arc::new(rustls::server::FixedEchKeys::new(vec![
+        rustls::server::EchServerKey::from_raw(
+            &config,
+            private_key.secret_bytes().to_vec(),
+            ALL_SUPPORTED_SUITES,
+        )
+        .unwrap(),
+    ]));
+    let server_config =
+        ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(server_crypto).unwrap()));
+
+    let mut roots = RootCertStore::empty();
+    roots.add(CERTIFIED_KEY.cert.der().clone()).unwrap();
+    let ech = rustls::client::EchConfig::new(config_list.into(), ALL_SUPPORTED_SUITES).unwrap();
+    let mut client_crypto =
+        rustls::ClientConfig::builder_with_provider(Arc::new(default_provider()))
+            .with_ech(rustls::client::EchMode::Enable(ech))
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+    client_crypto.alpn_protocols = vec![ALPN.into()];
+    let client_config = ClientConfig::new(Arc::new(
+        crypto::rustls::QuicClientConfig::try_from(client_crypto).unwrap(),
+    ));
+
+    let mut pair = Pair::new(Arc::new(EndpointConfig::default()), server_config);
+    let client_ch = pair.begin_connect(client_config);
+    let events = drive_observing_server_handshake(&mut pair);
+    assert_matches!(
+        &events[..],
+        [ServerHandshakeEvent::DataReady { protocol: Some(protocol), server_name: Some(name), handshaking: true, .. }, ServerHandshakeEvent::Connected]
+            if protocol == ALPN && name == "localhost"
+    );
+    assert_matches!(&events[0], ServerHandshakeEvent::DataReady { steps_after_accept, .. } if *steps_after_accept > 0);
+
+    let server_ch = pair.server.assert_accept();
+    for hd in [
+        pair.server_conn_mut(server_ch)
+            .crypto_session()
+            .handshake_data(),
+        pair.client_conn_mut(client_ch)
+            .crypto_session()
+            .handshake_data(),
+    ] {
+        let hd = hd
+            .unwrap()
+            .downcast::<crypto::rustls::HandshakeData>()
+            .unwrap();
+        assert!(hd.ech_accepted);
+        assert_eq!(hd.protocol.as_deref(), Some(ALPN));
+    }
+}
+
 #[test]
 fn server_alpn_unset() {
     let _guard = subscribe();
