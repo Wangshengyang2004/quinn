@@ -1714,6 +1714,44 @@ mod tests {
     }
 
     #[test]
+    fn illegal_ordered_read_preserves_receive_state() {
+        let mut client = make(Side::Client);
+        let id = StreamId::new(Side::Server, Dir::Uni, 0);
+        client
+            .received(
+                frame::Stream {
+                    id,
+                    offset: 0,
+                    fin: false,
+                    data: Bytes::from_static(b"abcdef"),
+                },
+                6,
+                crate::Instant::now(),
+            )
+            .unwrap();
+
+        let mut pending = Retransmits::default();
+        let mut recv = RecvStream {
+            id,
+            state: &mut client,
+            pending: &mut pending,
+        };
+        let mut chunks = recv.read(false).unwrap();
+        assert_eq!(&chunks.next(3).unwrap().unwrap().bytes[..], b"abc");
+        let _ = chunks.finalize();
+
+        // Switching back to ordered reads is illegal, but must not discard the stream.
+        assert_eq!(
+            recv.read(true).err(),
+            Some(ReadableError::IllegalOrderedRead)
+        );
+        let mut chunks = recv.read(false).unwrap();
+        assert_eq!(&chunks.next(usize::MAX).unwrap().unwrap().bytes[..], b"def");
+        let _ = chunks.finalize();
+        assert!(client.recv.contains_key(&id));
+    }
+
+    #[test]
     fn stopped_reset() {
         for final_offset in [32u32, 48] {
             let mut client = make(Side::Client);
