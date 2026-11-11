@@ -413,6 +413,7 @@ impl Connection {
             return Some(x);
         }
 
+        self.streams.set_max_unsent(self.max_unsent_stream_bytes());
         if let Some(event) = self.streams.poll() {
             return Some(Event::Stream(event));
         }
@@ -454,12 +455,30 @@ impl Connection {
     #[must_use]
     pub fn send_stream(&mut self, id: StreamId) -> SendStream<'_> {
         assert!(id.dir() == Dir::Bi || id.initiator() == self.side.side());
+        self.streams.set_max_unsent(self.max_unsent_stream_bytes());
         SendStream {
             id,
             state: &mut self.streams,
             pending: &mut self.spaces[SpaceId::Data].pending,
             conn_state: &self.state,
         }
+    }
+
+    /// Unsent bytes a stream may hold: `max_unsent_stream_delay` of sending at the controller's
+    /// pacing rate, or at the window pacer's rate of 5/4 window per smoothed RTT
+    fn max_unsent_stream_bytes(&self) -> Option<u64> {
+        let delay = self.config.max_unsent_stream_delay?;
+        // Bytes per second
+        let rate = match self.path.congestion.pacing_rate().filter(|&rate| rate > 0) {
+            Some(rate) => u128::from(rate),
+            None => {
+                u128::from(self.path.congestion.window()) * 5 * 1_000_000_000
+                    / (4 * self.path.rtt.get().as_nanos().max(1))
+            }
+        };
+        let bytes =
+            u64::try_from(rate.saturating_mul(delay.as_nanos()) / 1_000_000_000).unwrap_or(u64::MAX);
+        Some(bytes.max(MIN_UNSENT_STREAM_PACKETS * u64::from(self.path.current_mtu())))
     }
 
     /// Returns packets to transmit
@@ -4791,6 +4810,11 @@ fn get_max_ack_delay(params: &TransportParameters) -> Duration {
 
 // Prevents overflow and improves behavior in extreme circumstances
 const MAX_BACKOFF_EXPONENT: u32 = 16;
+
+/// Minimum per-stream unsent allowance under `max_unsent_stream_delay`, in maximum-size packets
+///
+/// Matches the pacer's minimum burst, so a slow or new connection can still fill one burst.
+const MIN_UNSENT_STREAM_PACKETS: u64 = 10;
 
 /// Minimal remaining size to allow packet coalescing, excluding cryptographic tag
 ///

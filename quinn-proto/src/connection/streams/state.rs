@@ -114,6 +114,8 @@ pub struct StreamsState {
     initial_send_credit: u64,
     send_credit_reserve: Option<crate::config::SendCreditReserve>,
     low_credit_updates: bool,
+    /// Unsent bytes each stream may hold, from `TransportConfig::max_unsent_stream_delay`
+    max_unsent: Option<u64>,
     /// The initial receive window
     receive_window: u64,
     receive_autotune: Option<AutoTune>,
@@ -154,6 +156,8 @@ impl StreamsState {
     /// An application attempted another write, and its stream still lacks credit.
     /// Keep this distinct from an empty pending queue: accepted bytes can all
     /// have been transmitted while the caller waits to supply the next chunk.
+    /// The unsent-backlog bound is not credit: once transmission has emptied a
+    /// stream's backlog, that stream may write again.
     pub(crate) fn has_blocked_stream_writer(&self) -> bool {
         self.send.iter().any(|(&id, stream)| {
             let Some(stream) = stream else {
@@ -161,7 +165,7 @@ impl StreamsState {
             };
             stream.is_writable()
                 && stream.stop_reason.is_none()
-                && ((stream.connection_blocked && self.stream_write_limit(id) == 0)
+                && ((stream.connection_blocked && self.stream_credit_limit(id) == 0)
                     || (stream.data_blocked_limit == Some(stream.max_data)
                         && stream.pending.offset() == stream.max_data))
         })
@@ -199,6 +203,7 @@ impl StreamsState {
             initial_send_credit: 0,
             send_credit_reserve: None,
             low_credit_updates: false,
+            max_unsent: None,
             receive_window: receive_window.into(),
             receive_autotune: None,
             stream_receive_maximum: None,
@@ -939,9 +944,24 @@ impl StreamsState {
             .min(self.send_window.saturating_sub(self.buffered_data))
     }
 
+    /// Bytes that may be written on stream `id` now: its credit, further bounded by the room
+    /// `max_unsent` leaves beside the stream's own unsent data
+    pub(super) fn stream_write_limit(&self, id: StreamId) -> u64 {
+        let limit = self.stream_credit_limit(id);
+        let Some(max_unsent) = self.max_unsent else {
+            return limit;
+        };
+        let unsent = self
+            .send
+            .get(&id)
+            .and_then(|stream| stream.as_ref())
+            .map_or(0, |stream| stream.pending.unsent());
+        limit.min(max_unsent.saturating_sub(unsent))
+    }
+
     /// Write admission must preserve credit before data enters send buffers. Packet scheduling
     /// priority alone cannot recover MAX_DATA already consumed by an unread bulk stream.
-    pub(super) fn stream_write_limit(&self, id: StreamId) -> u64 {
+    fn stream_credit_limit(&self, id: StreamId) -> u64 {
         let available = self.write_limit();
         let Some(policy) = self.send_credit_reserve else {
             return available;
@@ -971,8 +991,8 @@ impl StreamsState {
 
         for index in (0..self.connection_blocked.len()).rev() {
             let id = self.connection_blocked[index];
-            // Keep streams whose reserve still blocks them asleep. Waking them merely because
-            // the critical reserve is nonzero creates a write/poll busy loop.
+            // Keep streams whose reserve or unsent backlog still blocks them asleep. Waking them
+            // merely because the critical reserve is nonzero creates a write/poll busy loop.
             let limit = self.stream_write_limit(id);
             let Some(stream) = self.send.get_mut(&id).and_then(|s| s.as_mut()) else {
                 self.connection_blocked.swap_remove(index);
@@ -1052,6 +1072,10 @@ impl StreamsState {
 
     pub(crate) fn set_send_window(&mut self, send_window: u64) {
         self.send_window = send_window;
+    }
+
+    pub(crate) fn set_max_unsent(&mut self, max_unsent: Option<u64>) {
+        self.max_unsent = max_unsent;
     }
 
     #[cfg(test)]

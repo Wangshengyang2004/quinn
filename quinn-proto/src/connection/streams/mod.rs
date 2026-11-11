@@ -255,7 +255,7 @@ impl<'a> SendStream<'a> {
         if limit == 0 {
             trace!(
                 stream = %self.id, max_data = self.state.max_data, data_sent = self.state.data_sent,
-                "write blocked by connection-level flow control or send window"
+                "write blocked by connection-level flow control, send window or unsent backlog"
             );
             if !stream.connection_blocked {
                 stream.connection_blocked = true;
