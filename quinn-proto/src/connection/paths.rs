@@ -192,6 +192,11 @@ impl PathData {
         }
     }
 
+    /// Whether `packet` counts toward this path's bytes in flight
+    pub(super) fn is_in_flight(&self, packet: &SentPacket) -> bool {
+        packet.size != 0 && packet.path_generation == self.generation
+    }
+
     /// Remove `packet` with number `pn` from this path's congestion control counters, or return
     /// `false` if `pn` was sent before this path was established.
     pub(super) fn remove_in_flight(&mut self, packet: &SentPacket) -> bool {

@@ -72,7 +72,9 @@ mod spaces;
 pub use spaces::Retransmits;
 #[cfg(not(fuzzing))]
 use spaces::Retransmits;
-use spaces::{PacketNumberFilter, PacketSpace, SendableFrames, SentPacket, ThinRetransmits};
+use spaces::{
+    LostPacket, PacketNumberFilter, PacketSpace, SendableFrames, SentPacket, ThinRetransmits,
+};
 
 mod stats;
 pub use stats::{ConnectionStats, FrameStats, PathStats, UdpStats};
@@ -1593,6 +1595,11 @@ impl Connection {
             }
         };
 
+        if self.detect_spurious_loss(&ack, space) {
+            self.stats.path.spurious_congestion_events += 1;
+            self.path.congestion.on_spurious_congestion_event();
+        }
+
         // Avoid DoS from unreasonably huge ack ranges by filtering out just the new acks.
         let mut newly_acked = ArrayRangeSet::new();
         for range in ack.iter() {
@@ -1712,6 +1719,43 @@ impl Connection {
 
         self.set_loss_detection_timer(now);
         Ok(())
+    }
+
+    fn detect_spurious_loss(&mut self, ack: &frame::Ack, space: SpaceId) -> bool {
+        let lost_packets = &mut self.spaces[space].lost_packets;
+
+        if lost_packets.is_empty() {
+            return false;
+        }
+
+        for range in ack.iter() {
+            let spurious_losses: Vec<u64> = lost_packets
+                .range(range.clone())
+                .map(|(pn, _info)| pn)
+                .copied()
+                .collect();
+
+            for pn in spurious_losses {
+                lost_packets.remove(&pn);
+            }
+        }
+
+        // If this ACK frame acknowledged all deemed lost packets,
+        // then we have raised a spurious congestion event in the past.
+        // We cannot conclude when there are remaining packets,
+        // but future ACK frames might indicate a spurious loss detection.
+        lost_packets.is_empty()
+    }
+
+    /// Drain lost packets that we reasonably think will never arrive
+    ///
+    /// The current criterion is copied from `msquic`:
+    /// discard packets that were sent earlier than 2 probe timeouts ago.
+    fn drain_lost_packets(&mut self, now: Instant, space: SpaceId) {
+        let two_pto = 2 * self.path.rtt.pto_base();
+
+        let lost_packets = &mut self.spaces[space].lost_packets;
+        lost_packets.retain(|_pn, info| now.saturating_duration_since(info.time_sent) <= two_pto);
     }
 
     /// Process a new ECN block from an in-order ACK
@@ -1909,9 +1953,12 @@ impl Connection {
             prev_packet = Some(packet);
         }
 
+        self.drain_lost_packets(now, pn_space);
+
         // OnPacketsLost
         if let Some(largest_lost) = lost_packets.last().cloned() {
             let old_bytes_in_flight = self.path.in_flight.bytes;
+            let mut lost_ack_eliciting = false;
             let largest_lost_info = &self.spaces[pn_space].sent_packets[&largest_lost];
             let largest_lost_sent = largest_lost_info.time_sent;
             let largest_lost_congestion_sequence = largest_lost_info.congestion_sequence;
@@ -1951,12 +1998,24 @@ impl Connection {
                     now,
                     self.orig_rem_cid,
                 );
+
+                let in_flight = self.path.is_in_flight(&info);
+                lost_ack_eliciting |= in_flight;
                 self.remove_in_flight(&info);
                 for frame in info.stream_frames {
                     self.streams.retransmit(frame);
                 }
                 self.spaces[pn_space].pending |= info.retransmits;
                 self.path.mtud.on_non_probe_lost(packet, info.size);
+
+                if in_flight {
+                    self.spaces[pn_space].lost_packets.insert(
+                        packet,
+                        LostPacket {
+                            time_sent: info.time_sent,
+                        },
+                    );
+                }
             }
 
             if self.path.mtud.black_hole_detected(now) {
@@ -1968,8 +2027,6 @@ impl Connection {
             }
 
             // Don't apply congestion penalty for lost ack-only packets
-            let lost_ack_eliciting = old_bytes_in_flight != self.path.in_flight.bytes;
-
             if lost_ack_eliciting {
                 if !due_to_ack {
                     self.path
@@ -2438,6 +2495,8 @@ impl Connection {
         space.crypto = None;
         space.time_of_last_ack_eliciting_packet = None;
         space.loss_time = None;
+        // No further ACK can arrive for this space to report a spurious loss.
+        space.lost_packets.clear();
         let sent_packets = mem::take(&mut space.sent_packets);
         for packet in sent_packets.into_values() {
             self.path
