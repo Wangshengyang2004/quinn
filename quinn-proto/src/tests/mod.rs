@@ -5628,7 +5628,9 @@ fn ack_frequency_policy_server_immediate_unilateral() {
 
 mod bbr_app_limited;
 mod pto_ceiling;
+mod reordering_calls;
 mod send_exhaustion;
+mod spurious_loss;
 
 mod hy2_receive_history;
 

@@ -1722,12 +1722,18 @@ impl Connection {
     }
 
     fn detect_spurious_loss(&mut self, ack: &frame::Ack, space: SpaceId) -> bool {
-        let lost_packets = &mut self.spaces[space].lost_packets;
+        let space = &mut self.spaces[space];
+        let lost_packets = &mut space.lost_packets;
 
         if lost_packets.is_empty() {
             return false;
         }
 
+        // Newer packets acknowledged before or together with a late one measure how far it
+        // was reordered, in packet numbers and in transmission time.
+        let largest_acked = space.largest_acked_packet.unwrap_or(0);
+        let largest_acked_sent = space.largest_acked_packet_sent;
+        let stats = &mut self.stats.path;
         for range in ack.iter() {
             let spurious_losses: Vec<u64> = lost_packets
                 .range(range.clone())
@@ -1736,7 +1742,15 @@ impl Connection {
                 .collect();
 
             for pn in spurious_losses {
-                lost_packets.remove(&pn);
+                let info = lost_packets.remove(&pn).unwrap(); // safe: pn was just found
+                stats.spurious_lost_packets += 1;
+                stats.spurious_lost_bytes += u64::from(info.size);
+                stats.spurious_loss_max_packet_reordering = stats
+                    .spurious_loss_max_packet_reordering
+                    .max(largest_acked.saturating_sub(pn));
+                stats.spurious_loss_max_time_reordering = stats
+                    .spurious_loss_max_time_reordering
+                    .max(largest_acked_sent.saturating_duration_since(info.time_sent));
             }
         }
 
@@ -2013,6 +2027,7 @@ impl Connection {
                         packet,
                         LostPacket {
                             time_sent: info.time_sent,
+                            size: info.size,
                         },
                     );
                 }
@@ -4075,6 +4090,15 @@ impl Connection {
     #[cfg(test)]
     pub(crate) fn override_peer_max_datagram_frame_size_for_test(&mut self, limit: VarInt) {
         self.peer_params.max_datagram_frame_size = Some(limit);
+    }
+
+    /// Deemed-lost packets still awaiting a possible late acknowledgement, in all spaces
+    #[cfg(test)]
+    pub(crate) fn lost_packet_records_for_test(&self) -> usize {
+        self.spaces
+            .iter()
+            .map(|space| space.lost_packets.len())
+            .sum()
     }
 
     /// The number of bytes of packets containing retransmittable frames that have not been

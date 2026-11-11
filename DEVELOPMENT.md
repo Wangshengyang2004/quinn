@@ -91,6 +91,24 @@ This corrects feedback admission; it does not change PTO, congestion algorithms,
 or their parameters. Product recovery and real-path throughput require separate
 consumer verification.
 
+Spurious loss detection follows upstream development commits `531ca90e`,
+`459c3471` and `aa61ce99`. Packets declared lost while in flight on the current
+path are recorded per packet-number space until a later loss detection finds
+them sent more than two base PTOs earlier, or until that space's keys are
+discarded. An ACK frame covering the last remaining record counts
+`spurious_congestion_events` and calls `Controller::on_spurious_congestion_event`.
+No controller in this fork implements that hook; upstream's Cubic undo is not
+taken. Fork-only `PathStats` fields count each recorded packet once when its
+acknowledgement arrives: `spurious_lost_packets` and `spurious_lost_bytes`
+(also included in `lost_packets` / `lost_bytes`), plus the maxima
+`spurious_loss_max_packet_reordering` (newer packets acknowledged before or with
+it) and `spurious_loss_max_time_reordering` (how much earlier it was sent than
+the newest acknowledged packet). A record holds the send time and size; records
+are bounded by the in-flight packets declared lost within the drain window. An
+acknowledgement arriving after its record expired is not counted, so the
+counters are lower bounds. Nothing reacts to them: loss detection,
+retransmission and congestion-controller inputs are unchanged.
+
 With qlog enabled, packet-loss events classify the time threshold using the
 elapsed time since transmission, matching the existing loss detector. The
 serialized-event regression covers the threshold boundary and all three packet

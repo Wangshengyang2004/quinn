@@ -148,6 +148,16 @@ pub struct PathStats {
     pub lost_packets: u64,
     /// The amount of bytes lost on this path
     pub lost_bytes: u64,
+    /// The amount of in-flight packets deemed lost on this path and acknowledged afterwards
+    /// (also counted by `lost_packets`)
+    pub spurious_lost_packets: u64,
+    /// The amount of bytes in `spurious_lost_packets` (also counted by `lost_bytes`)
+    pub spurious_lost_bytes: u64,
+    /// The largest number of newer packets acknowledged before or with a spurious loss
+    pub spurious_loss_max_packet_reordering: u64,
+    /// The largest time by which a spurious loss was sent before the newest packet acknowledged
+    /// before or with it
+    pub spurious_loss_max_time_reordering: Duration,
     /// The amount of packets sent on this path
     pub sent_packets: u64,
     /// The amount of PLPMTUD probe packets sent on this path (also counted by `sent_packets`)

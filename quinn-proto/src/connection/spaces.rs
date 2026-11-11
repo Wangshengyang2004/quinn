@@ -319,6 +319,8 @@ pub(super) struct SentPacket {
 pub(super) struct LostPacket {
     /// The time the packet was sent.
     pub(super) time_sent: Instant,
+    /// The congestion-controlled size of the packet, as in [`SentPacket::size`]
+    pub(super) size: u16,
 }
 
 /// Retransmittable data queue
