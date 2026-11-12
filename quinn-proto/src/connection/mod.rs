@@ -1412,6 +1412,7 @@ impl Connection {
         stats.path.min_rtt = self.path.rtt.min();
         stats.path.cwnd = self.path.congestion.window();
         stats.path.current_mtu = self.path.mtud.current_mtu();
+        stats.path.reordering_window = self.path.reordering_window();
 
         stats
     }
@@ -1768,14 +1769,17 @@ impl Connection {
 
             for pn in spurious_losses {
                 let info = lost_packets.remove(&pn).unwrap(); // safe: pn was just found
+                let reordering = largest_acked_sent.saturating_duration_since(info.time_sent);
                 stats.spurious_lost_packets += 1;
                 stats.spurious_lost_bytes += u64::from(info.size);
                 stats.spurious_loss_max_packet_reordering = stats
                     .spurious_loss_max_packet_reordering
                     .max(largest_acked.saturating_sub(pn));
-                stats.spurious_loss_max_time_reordering = stats
-                    .spurious_loss_max_time_reordering
-                    .max(largest_acked_sent.saturating_duration_since(info.time_sent));
+                stats.spurious_loss_max_time_reordering =
+                    stats.spurious_loss_max_time_reordering.max(reordering);
+                if self.config.adaptive_loss_thresholds {
+                    self.path.on_spurious_loss(reordering);
+                }
             }
         }
 
@@ -1922,7 +1926,13 @@ impl Connection {
         let mut lost_mtu_probe = None;
         let in_flight_mtu_probe = self.path.mtud.in_flight_mtu_probe();
         let rtt = self.path.rtt.conservative();
-        let loss_delay = cmp::max(rtt.mul_f32(self.config.time_threshold), TIMER_GRANULARITY);
+        let mut loss_delay = cmp::max(rtt.mul_f32(self.config.time_threshold), TIMER_GRANULARITY);
+        // On a path known to reorder, only the time threshold declares loss, widened by the
+        // reordering seen
+        let reordering_window = self.path.reordering_window();
+        if let Some(window) = reordering_window {
+            loss_delay = loss_delay.max(rtt + window);
+        }
 
         let largest_acked_packet = self.spaces[pn_space].largest_acked_packet.unwrap();
         let packet_threshold = self.config.packet_threshold as u64;
@@ -1951,7 +1961,9 @@ impl Connection {
             // However, we avoid this subtraction as it can panic and there's no
             // saturating equivalent of this substraction operation with a Duration.
             let packet_too_old = now.saturating_duration_since(info.time_sent) >= loss_delay;
-            if packet_too_old || largest_acked_packet >= packet + packet_threshold {
+            if packet_too_old
+                || reordering_window.is_none() && largest_acked_packet >= packet + packet_threshold
+            {
                 if Some(packet) == in_flight_mtu_probe {
                     // Lost MTU probes are not included in `lost_packets`, because they should not
                     // trigger a congestion control response
@@ -2068,6 +2080,7 @@ impl Connection {
 
             // Don't apply congestion penalty for lost ack-only packets
             if lost_ack_eliciting {
+                self.path.on_packets_lost(now, largest_lost_sent);
                 if !due_to_ack {
                     self.path
                         .congestion

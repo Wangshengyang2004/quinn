@@ -40,6 +40,8 @@ pub(super) struct PathData {
     /// Used in persistent congestion determination.
     pub(super) first_packet_after_rtt_sample: Option<(SpaceId, u64)>,
     pub(super) in_flight: InFlight,
+    /// Reordering learned from spurious losses, see [`TransportConfig::adaptive_loss_thresholds`]
+    loss_reordering: LossReordering,
     next_congestion_sequence: u64,
     /// Number of the first packet sent on this path
     ///
@@ -105,6 +107,7 @@ impl PathData {
                 ),
             first_packet_after_rtt_sample: None,
             in_flight: InFlight::new(),
+            loss_reordering: LossReordering::default(),
             next_congestion_sequence: 0,
             first_packet: None,
             #[cfg(feature = "qlog")]
@@ -135,6 +138,7 @@ impl PathData {
             mtud: prev.mtud.clone(),
             first_packet_after_rtt_sample: prev.first_packet_after_rtt_sample,
             in_flight: InFlight::new(),
+            loss_reordering: prev.loss_reordering,
             next_congestion_sequence: prev.next_congestion_sequence,
             first_packet: None,
             #[cfg(feature = "qlog")]
@@ -143,11 +147,12 @@ impl PathData {
         }
     }
 
-    /// Resets RTT, congestion control, pacing and MTU states.
+    /// Resets RTT, congestion control, pacing, MTU and loss reordering states.
     ///
     /// This is useful when it is known the underlying path has changed.
     pub(super) fn reset(&mut self, now: Instant, config: &TransportConfig) {
         self.rtt = RttEstimator::new(config.initial_rtt);
+        self.loss_reordering = LossReordering::default();
         self.congestion = config.congestion_controller_factory.clone().build_for_path(
             now,
             config.get_initial_mtu(),
@@ -233,6 +238,58 @@ impl PathData {
     pub(super) fn generation(&self) -> u64 {
         self.generation
     }
+
+    /// Reordering window for time threshold loss detection, or `None` while the default loss
+    /// thresholds apply
+    pub(super) fn reordering_window(&self) -> Option<Duration> {
+        self.loss_reordering
+            .window
+            .map(|window| window.min(self.rtt.get()))
+    }
+
+    /// Account for a spurious loss sent `reordering` before the newest packet acknowledged with it
+    pub(super) fn on_spurious_loss(&mut self, reordering: Duration) {
+        let window = reordering + reordering / 4;
+        let state = &mut self.loss_reordering;
+        state.window = Some(state.window.map_or(window, |w| w.max(window)));
+        state.episodes_left = REORDERING_PERSISTENCE;
+    }
+
+    /// Account for packets declared lost, the newest of them sent at `largest_lost_sent`
+    ///
+    /// A loss of a packet sent after the current loss recovery episode began starts another
+    /// episode; the default loss thresholds return after enough episodes without spurious losses.
+    pub(super) fn on_packets_lost(&mut self, now: Instant, largest_lost_sent: Instant) {
+        let state = &mut self.loss_reordering;
+        if state.window.is_none()
+            || state
+                .episode_start
+                .is_some_and(|start| largest_lost_sent <= start)
+        {
+            return;
+        }
+        state.episode_start = Some(now);
+        state.episodes_left -= 1;
+        if state.episodes_left == 0 {
+            state.window = None;
+        }
+    }
+}
+
+/// Loss recovery episodes without a spurious loss after which the default loss thresholds return,
+/// as RACK's reordering window persistence (RFC 8985 section 7.2)
+const REORDERING_PERSISTENCE: u32 = 16;
+
+/// Reordering learned from spurious losses on a path
+#[derive(Copy, Clone, Default)]
+struct LossReordering {
+    /// Largest reordering of a spurious loss plus a margin, or `None` while the default loss
+    /// thresholds apply
+    window: Option<Duration>,
+    /// Loss recovery episodes left before `window` is cleared
+    episodes_left: u32,
+    /// When the current loss recovery episode began
+    episode_start: Option<Instant>,
 }
 
 /// Congestion metrics as described in [`recovery_metrics_updated`].
