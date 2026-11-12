@@ -9,7 +9,8 @@ pacing, and adds the scoped HY2 alignment described in
 Chrome wire shaping and HY2 window/profile options are explicit. The `hy2-rustls`
 feature requires EasyTier's TLS patch; builds without that feature use official
 rustls. Other fork changes also apply to ordinary Quinn consumers. Adaptive loss
-thresholds remain archived.
+thresholds are opt-in (see below); the earlier learned-threshold experiments
+remain archived.
 
 ## Fork compatibility boundary
 
@@ -106,8 +107,41 @@ it) and `spurious_loss_max_time_reordering` (how much earlier it was sent than
 the newest acknowledged packet). A record holds the send time and size; records
 are bounded by the in-flight packets declared lost within the drain window. An
 acknowledgement arriving after its record expired is not counted, so the
-counters are lower bounds. Nothing reacts to them: loss detection,
-retransmission and congestion-controller inputs are unchanged.
+counters are lower bounds. Unless `adaptive_loss_thresholds` is enabled,
+nothing reacts to them: loss detection, retransmission and congestion-controller
+inputs are unchanged.
+
+`TransportConfig::adaptive_loss_thresholds(true)` is an opt-in, sender-local
+loss-detection policy, off by default. Nothing changes on a path until a record
+above is acknowledged (a spurious loss). From then on the path is
+reordering-aware: the packet threshold no longer declares loss, and a packet is
+declared lost once it was sent longer ago than the larger of `time_threshold`
+RTTs and one RTT plus a reordering window (the RTT is the larger of the latest
+and smoothed samples, as for the time threshold). The window is the largest send
+time distance of a spurious loss behind the newest packet acknowledged with it,
+plus a quarter, and never more than the smoothed RTT. A spurious loss renews the
+window for 16 loss recovery episodes (RACK's figure); an episode starts with a
+congestion event whose newest lost packet was sent after the previous episode
+began, as the built-in controllers count recovery. After 16 episodes without one,
+the window is cleared and the packet threshold applies again. Path reset and
+migration to another address start without learned reordering; a same-IPv4 port
+rebinding keeps it, like the RTT and controller state. `PathStats::reordering_window`
+reports the window applied, `None` while the default thresholds apply.
+
+What it trades: on a reordering-aware path, real loss is declared up to one
+smoothed RTT later than by the time threshold alone, and later than the packet
+threshold would have declared it; recovery and the controller's response wait
+that long. The window learns only from spurious losses whose records are still
+held (two base PTOs, which is at least one smoothed RTT beyond the RTT, so every
+window up to the cap can be learned), and it measures send-time distance, which
+underestimates the lateness when the sender is sparse; the window then grows over
+a few more spurious losses. Reordering beyond the smoothed RTT is still declared
+lost. Congestion responses already taken for spurious losses are not undone.
+Off, no state is kept and every decision is unchanged. It changes no wire format,
+frame or transport parameter. Deterministic bottleneck tests cover the trigger,
+convergence, the detection bound for real loss, the cap, the decay, BBR startup
+under reordering, and identical controller calls with the option on and off on
+paths without spurious losses.
 
 With qlog enabled, packet-loss events classify the time threshold using the
 elapsed time since transmission, matching the existing loss detector. The
