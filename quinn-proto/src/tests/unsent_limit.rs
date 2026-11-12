@@ -7,12 +7,12 @@ use super::*;
 use crate::congestion::{BbrConfig, Controller, ControllerFactory, ControllerMetrics};
 use std::hash::{DefaultHasher, Hash, Hasher};
 
-type Log = Arc<Mutex<Vec<(&'static str, u64, u64)>>>;
+pub(super) type Log = Arc<Mutex<Vec<(&'static str, u64, u64)>>>;
 
 /// The fork's BBR with HY2's explicit pacing rate, reporting every call to `log`
-struct Recorded {
-    inner: Box<dyn Controller>,
-    log: Log,
+pub(super) struct Recorded {
+    pub(super) inner: Box<dyn Controller>,
+    pub(super) log: Log,
 }
 
 impl Recorded {
@@ -22,7 +22,7 @@ impl Recorded {
 }
 
 #[derive(Default)]
-struct RecordedFactory(Log);
+pub(super) struct RecordedFactory(pub(super) Log);
 
 impl ControllerFactory for RecordedFactory {
     fn build(self: Arc<Self>, now: Instant, mtu: u16) -> Box<dyn Controller> {
@@ -135,7 +135,7 @@ impl Controller for Recorded {
     }
 }
 
-fn read_all(pair: &mut Pair, server: ConnectionHandle, stream: StreamId) -> usize {
+pub(super) fn read_all(pair: &mut Pair, server: ConnectionHandle, stream: StreamId) -> usize {
     let mut recv = pair.server_recv(server, stream);
     let Ok(mut chunks) = recv.read(true) else {
         return 0;

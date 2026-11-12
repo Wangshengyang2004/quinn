@@ -5626,6 +5626,7 @@ fn ack_frequency_policy_server_immediate_unilateral() {
     check_ack_frequency_receive_policy(false, true, true, false);
 }
 
+mod adaptive_loss;
 mod bbr_app_limited;
 mod pto_ceiling;
 mod reordering_calls;
