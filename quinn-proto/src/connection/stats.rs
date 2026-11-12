@@ -158,6 +158,11 @@ pub struct PathStats {
     /// The largest time by which a spurious loss was sent before the newest packet acknowledged
     /// before or with it
     pub spurious_loss_max_time_reordering: Duration,
+    /// The reordering window applied by [`TransportConfig::adaptive_loss_thresholds`], or `None`
+    /// while the default loss thresholds apply
+    ///
+    /// [`TransportConfig::adaptive_loss_thresholds`]: crate::TransportConfig::adaptive_loss_thresholds
+    pub reordering_window: Option<Duration>,
     /// The amount of packets sent on this path
     pub sent_packets: u64,
     /// The amount of PLPMTUD probe packets sent on this path (also counted by `sent_packets`)

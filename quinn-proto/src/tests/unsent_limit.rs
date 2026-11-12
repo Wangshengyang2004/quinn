@@ -150,12 +150,12 @@ pub(super) fn read_all(pair: &mut Pair, server: ConnectionHandle, stream: Stream
 
 const BULK_BYTES: usize = 8 << 20;
 
-type Bulk = (Vec<(&'static str, u64, u64)>, u64, u64, u64, Duration);
+pub(super) type Bulk = (Vec<(&'static str, u64, u64)>, u64, u64, u64, Duration);
 
 /// A writer that refills its stream every millisecond moves `BULK_BYTES` over a 50 ms round trip
 /// with no rate limit, and flow control credit for all of it. Returns every controller call, the
 /// stats that summarise them and the elapsed time, plus the number of blocked writes.
-fn bulk_calls(configure: impl FnOnce(&mut TransportConfig)) -> (Bulk, usize) {
+pub(super) fn bulk_calls(configure: impl FnOnce(&mut TransportConfig)) -> (Bulk, usize) {
     let mut server = server_config();
     let mut server_transport = TransportConfig::default();
     server_transport

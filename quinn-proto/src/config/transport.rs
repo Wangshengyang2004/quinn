@@ -59,6 +59,7 @@ pub struct TransportConfig {
     pub(crate) packet_threshold: u32,
     pub(crate) hy2_receive_history: bool,
     pub(crate) time_threshold: f32,
+    pub(crate) adaptive_loss_thresholds: bool,
     pub(crate) initial_rtt: Duration,
     pub(crate) max_pto_interval: Option<Duration>,
     pub(crate) initial_mtu: u16,
@@ -288,6 +289,21 @@ impl TransportConfig {
     /// as a factor of RTT
     pub fn time_threshold(&mut self, value: f32) -> &mut Self {
         self.time_threshold = value;
+        self
+    }
+
+    /// Adapt both loss thresholds to reordering observed on each path
+    ///
+    /// Once a packet declared lost on a path is acknowledged afterwards, the packet threshold no
+    /// longer applies there, and a packet is declared lost only when it was sent longer ago than
+    /// the larger of the time threshold and one RTT plus a reordering window. The window is the
+    /// largest time by which such a packet was sent before the newest packet acknowledged with
+    /// it, plus a quarter, and never more than the smoothed RTT, so loss is detected at most one
+    /// smoothed RTT later than the time threshold alone would. After 16 loss recovery episodes
+    /// without another such packet, both default thresholds apply again. This is a local policy
+    /// with no wire-format effect. Defaults to false.
+    pub fn adaptive_loss_thresholds(&mut self, enabled: bool) -> &mut Self {
+        self.adaptive_loss_thresholds = enabled;
         self
     }
 
@@ -622,6 +638,7 @@ impl Default for TransportConfig {
             packet_threshold: 3,
             hy2_receive_history: false,
             time_threshold: 9.0 / 8.0,
+            adaptive_loss_thresholds: false,
             initial_rtt: Duration::from_millis(333), // per spec, intentionally distinct from EXPECTED_RTT
             max_pto_interval: None,
             initial_mtu: INITIAL_MTU,
@@ -676,6 +693,7 @@ impl fmt::Debug for TransportConfig {
             packet_threshold,
             hy2_receive_history,
             time_threshold,
+            adaptive_loss_thresholds,
             initial_rtt,
             max_pto_interval,
             initial_mtu,
@@ -722,6 +740,7 @@ impl fmt::Debug for TransportConfig {
             .field("packet_threshold", packet_threshold)
             .field("hy2_receive_history", hy2_receive_history)
             .field("time_threshold", time_threshold)
+            .field("adaptive_loss_thresholds", adaptive_loss_thresholds)
             .field("initial_rtt", initial_rtt)
             .field("max_pto_interval", max_pto_interval)
             .field("initial_mtu", initial_mtu)
