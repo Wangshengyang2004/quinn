@@ -4282,12 +4282,14 @@ impl Connection {
     /// Update counters to account for a packet becoming acknowledged, lost, or abandoned
     fn remove_in_flight(&mut self, packet: &SentPacket) {
         // Visit known paths from newest to oldest to find the one `packet` was sent on
-        for path in [&mut self.path]
-            .into_iter()
-            .chain(self.prev_path.as_mut().map(|(_, data)| data))
-        {
-            if path.remove_in_flight(packet) {
-                return;
+        if self.path.remove_in_flight(packet) {
+            return;
+        }
+        if let Some((_, prev)) = self.prev_path.as_mut() {
+            if prev.remove_in_flight(packet) {
+                // Congestion events go to the current path's controller. Release this packet's
+                // state in the previous one too, which is restored if validation fails.
+                prev.congestion.on_packet_discarded(packet.congestion_sequence);
             }
         }
     }
