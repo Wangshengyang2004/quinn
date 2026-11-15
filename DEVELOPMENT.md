@@ -356,10 +356,33 @@ at that boundary only when no known stream writer is still blocked on stream,
 connection, or local send-window credit. Credit exhaustion alone does not imply
 continued source demand: a preceding failed write is required. Closed, reset,
 stopped, or recredited streams do not retain that blocker. The historical ACK-time
-hint is unchanged for Reno/Cubic and does not renew the BBR sampler's marker. Merely queuing a small write does not
-establish a saturated source. The BDP heuristic and historical packet send
-states are unchanged; light-to-bulk and continuous-backlog regressions remain
-required alongside consumer and throughput validation.
+hint is unchanged for Reno/Cubic and does not renew the BBR sampler's marker.
+Merely queuing a small write does not establish a saturated source. Recorded
+packet send states are not rewritten. The BDP heuristic's loss override is
+described below; light-to-bulk and continuous-backlog regressions remain required
+alongside consumer and throughput validation.
+
+As a deliberate policy, BBR lets STARTUP's existing excessive-loss criterion
+override in-flight inference of application limits: at least eight loss events in
+a round and lost bytes above 2% of the in-flight bytes recorded at send. An
+application-limited round still counts no bandwidth plateau, but meeting the
+criterion ends STARTUP. After a round that meets it, the in-flight BDP heuristic
+marks no packets until a later round completes without meeting it. Quinn's explicit
+transmit-exhaustion notification and ProbeRTT still mark, send states already
+recorded are not rewritten, and a marker still ends only at the first
+acknowledgement beyond it. The criterion does not prove a policer or capacity
+change; random loss can meet it too. The Hysteria reference read here (local source
+`3b64f669`) skips the loss exit on application-limited rounds and always applies
+its heuristic. Under that rule, after a rate cut recovery kept a backlogged flight
+below the old model's target, the heuristic marked its samples application-limited
+and the old maximum never expired; a light source kept STARTUP indefinitely. A
+genuinely exhausted source keeps a learned estimate under isolated or sustained
+random loss, and a later bulk transfer starts from it. A source whose flights are
+short without reporting exhaustion (for example, blocked on flow-control credit) loses
+the heuristic's protection while the criterion holds. Controller models and
+Connection-level policer regressions cover the native and window-limited cases,
+isolated and sustained random loss, idle-to-bulk and loss-free capacity. They
+establish no field throughput or fairness result.
 
 Stream assembly retains a fixed allowance of 1024 metadata nodes plus one node
 per 128 buffered bytes, capped by the unread offset span before compaction and

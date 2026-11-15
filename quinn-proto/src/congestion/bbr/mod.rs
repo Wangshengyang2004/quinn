@@ -63,6 +63,7 @@ pub struct Bbr {
     last_sample_is_app_limited: bool,
     loss_events_in_round: u64,
     bytes_lost_in_round: u64,
+    excessive_loss_in_last_round: bool,
     random_number_generator: Pcg32,
 }
 
@@ -75,6 +76,11 @@ impl Bbr {
     #[cfg(test)]
     pub(crate) fn reached_full_bandwidth(&self) -> bool {
         self.is_at_full_bandwidth
+    }
+
+    #[cfg(test)]
+    pub(crate) fn bandwidth_estimate(&self) -> u64 {
+        self.max_bandwidth.get_estimate()
     }
 
     /// Construct a state using the given `config` and current time `now`
@@ -140,6 +146,7 @@ impl Bbr {
             last_sample_is_app_limited: false,
             loss_events_in_round: 0,
             bytes_lost_in_round: 0,
+            excessive_loss_in_last_round: false,
             random_number_generator: Pcg32::from_rng(&mut rand::rng()),
         }
     }
@@ -456,7 +463,12 @@ impl Bbr {
 
     /// <https://datatracker.ietf.org/doc/html/draft-cardwell-iccrg-bbr-congestion-control#section-4.3.2.2>
     fn check_if_full_bw_reached(&mut self, send_state: Option<PacketSendState>) {
+        // An application-limited round cannot show a bandwidth plateau; the
+        // excessive-loss exit applies regardless of supply.
         if self.last_sample_is_app_limited {
+            if self.should_exit_startup_due_to_loss(send_state) {
+                self.is_at_full_bandwidth = true;
+            }
             return;
         }
         let target = (self.bw_at_last_round as f64 * K_STARTUP_GROWTH_TARGET as f64) as u64;
@@ -517,14 +529,17 @@ impl Controller for Bbr {
 
     fn on_begin_congestion_event(&mut self, prior_bytes_in_flight: u64) {
         self.prior_in_flight = prior_bytes_in_flight;
-        if prior_bytes_in_flight < self.get_target_cwnd(1.0) {
+        // The in-flight heuristic is not trusted after a round that met the STARTUP
+        // excessive-loss criterion; explicit transmit exhaustion still marks.
+        if !self.excessive_loss_in_last_round && prior_bytes_in_flight < self.get_target_cwnd(1.0) {
             self.max_bandwidth
                 .on_app_limited(self.max_sent_packet_number);
         }
     }
 
     fn on_app_limited(&mut self) {
-        self.max_bandwidth.on_app_limited(self.max_sent_packet_number);
+        self.max_bandwidth
+            .on_app_limited(self.max_sent_packet_number);
     }
 
     fn on_packet_discarded(&mut self, packet_number: u64) {
@@ -625,6 +640,7 @@ impl Controller for Bbr {
 
         self.loss_state.reset();
         if is_round_start {
+            self.excessive_loss_in_last_round = self.should_exit_startup_due_to_loss(send_state);
             self.loss_events_in_round = 0;
             self.bytes_lost_in_round = 0;
         }
@@ -2173,5 +2189,580 @@ mod app_limited_marker_boundary_tests {
             // Historical ACK-time state must not create a new send marker.
             bbr.on_end_acks(acked, 80_000, true, Some(packet));
         }
+    }
+}
+
+#[cfg(test)]
+mod limited_flight_tests {
+    use super::*;
+
+    /// In recovery after leaving STARTUP, with a 120 kB target flight
+    fn recovering(excessive_loss_in_last_round: bool) -> Bbr {
+        let start = Instant::now();
+        let mut bbr = Bbr::new(Arc::new(BbrConfig::default()), 1200);
+        bbr.max_bandwidth.on_sent(start, 1, 12_000, 0);
+        bbr.max_bandwidth
+            .on_ack(start + Duration::from_millis(10), 1);
+        bbr.max_bandwidth.update_estimate(0);
+        bbr.max_bandwidth.end_acks(0, false, false);
+        bbr.max_sent_packet_number = 1;
+        bbr.min_rtt = Duration::from_millis(100);
+        bbr.is_at_full_bandwidth = true;
+        bbr.enter_probe_bandwidth_mode(start);
+        bbr.recovery_state = RecoveryState::Conservation;
+        bbr.recovery_window = 24_000;
+        bbr.excessive_loss_in_last_round = excessive_loss_in_last_round;
+        assert_eq!(bbr.get_target_cwnd(1.0), 120_000);
+        bbr
+    }
+
+    /// Whether the packet sent after `event` is application-limited
+    fn marks_next_send(mut bbr: Bbr, event: impl FnOnce(&mut Bbr)) -> bool {
+        let now = Instant::now();
+        event(&mut bbr);
+        bbr.on_sent(now, 1200, 2, 12_000);
+        bbr.max_bandwidth
+            .on_ack(now + Duration::from_millis(100), 2)
+            .unwrap()
+    }
+
+    #[test]
+    fn excessive_loss_suppresses_the_in_flight_heuristic() {
+        assert!(!marks_next_send(recovering(true), |bbr| {
+            bbr.on_begin_congestion_event(12_000)
+        }));
+    }
+
+    #[test]
+    fn explicit_exhaustion_marks_despite_excessive_loss() {
+        assert!(marks_next_send(recovering(true), |bbr| bbr.on_app_limited()));
+    }
+
+    #[test]
+    fn isolated_loss_keeps_application_limited_marks() {
+        assert!(marks_next_send(recovering(false), |bbr| {
+            bbr.on_begin_congestion_event(12_000)
+        }));
+        assert!(marks_next_send(recovering(false), |bbr| bbr.on_app_limited()));
+    }
+
+    #[test]
+    fn probe_rtt_marks_despite_excessive_loss() {
+        assert!(marks_next_send(recovering(true), |bbr| {
+            bbr.mode = Mode::ProbeRtt;
+            bbr.maybe_enter_or_exit_probe_rtt(Instant::now(), false, 12_000, false);
+        }));
+    }
+
+    #[test]
+    fn application_limited_round_with_excessive_loss_leaves_startup() {
+        let mut bbr = Bbr::new(Arc::new(BbrConfig::default()), 1200);
+        let rtt = RttEstimator::new(Duration::from_millis(100));
+        bbr.loss_events_in_round = 8;
+        bbr.bytes_lost_in_round = 1000;
+        let sent = Instant::now();
+        bbr.max_bandwidth.on_app_limited(0);
+        bbr.on_sent(sent, 1200, 1, 0);
+        bbr.on_sent(sent, 1200, 2, 48_800);
+        let now = sent + Duration::from_millis(100);
+        // Above the heuristic's target: no marker outlives this event.
+        assert!(bbr.get_target_cwnd(1.0) <= 240_000);
+        bbr.on_begin_congestion_event(240_000);
+        bbr.on_packet_lost(2, 1200);
+        bbr.on_congestion_event(now, sent, false, 1200, 1, Some(2), Some(50_000));
+        bbr.on_ack(now, sent, 1, 1200, 1200, false, &rtt);
+        bbr.on_end_acks(now, 0, false, Some(1));
+        assert!(bbr.last_sample_is_app_limited);
+        assert!(
+            bbr.is_at_full_bandwidth,
+            "2200 bytes over nine loss events exceed 2% of the 50000-byte flight"
+        );
+        assert!(bbr.excessive_loss_in_last_round);
+
+        // The in-flight heuristic does not mark while the criterion holds.
+        bbr.on_begin_congestion_event(1200);
+        bbr.on_end_acks(now, 1200, false, None);
+        bbr.on_sent(now, 1200, 3, 0);
+        // The next round without loss trusts the heuristic again, and the send
+        // state recorded under the criterion is not rewritten.
+        let later = now + Duration::from_millis(100);
+        bbr.on_begin_congestion_event(1200);
+        bbr.on_ack(later, now, 3, 1200, 1200, true, &rtt);
+        bbr.on_end_acks(later, 0, true, Some(3));
+        assert!(!bbr.excessive_loss_in_last_round);
+        assert!(!bbr.last_sample_is_app_limited);
+        bbr.on_app_limited();
+        bbr.on_sent(later, 1200, 4, 0);
+        let last = later + Duration::from_millis(100);
+        bbr.on_begin_congestion_event(1200);
+        bbr.on_ack(last, later, 4, 1200, 1200, true, &rtt);
+        bbr.on_end_acks(last, 0, true, Some(4));
+        assert!(bbr.last_sample_is_app_limited);
+    }
+}
+
+#[cfg(test)]
+mod policed_path_tests {
+    //! A path that is fast and then clamped by a token-bucket policer. The model replays the
+    //! connection's callback order: begin(prior in flight), per-packet ACKs, packet- and
+    //! time-threshold losses, then end of ACKs. Like `poll_transmit`, the sender reports
+    //! `on_app_limited` when its source has nothing to send, unless that source is blocked
+    //! on credit. Probe timeouts are simplified to declaring the whole tail lost.
+    use super::*;
+    use std::collections::{BTreeMap, VecDeque};
+
+    const MTU: u64 = 1200;
+    const TICK: Duration = Duration::from_micros(250);
+
+    /// What the application offers the sender
+    #[derive(Clone, Copy)]
+    enum Source {
+        Backlogged,
+        /// Keeps at most this many bytes in flight, like a window-limited inner transport
+        Window(u64),
+        /// Bytes per second
+        Rate(f64),
+        /// Has data, but at most this many bytes in flight are credited
+        Credit(u64),
+    }
+
+    struct Policer {
+        rate: f64,
+        burst: f64,
+        from: Duration,
+        tokens: f64,
+        last: Duration,
+    }
+
+    impl Policer {
+        fn new(rate: f64, from: Duration) -> Self {
+            Self {
+                rate,
+                burst: 16_384.0,
+                from,
+                tokens: 16_384.0,
+                last: from,
+            }
+        }
+
+        fn pass(&mut self, at: Duration) -> bool {
+            if at < self.from {
+                return true;
+            }
+            self.tokens =
+                (self.tokens + (at - self.last).as_secs_f64() * self.rate).min(self.burst);
+            self.last = at;
+            if self.tokens < MTU as f64 {
+                return false;
+            }
+            self.tokens -= MTU as f64;
+            true
+        }
+    }
+
+    #[derive(Default, Clone, Copy, Debug)]
+    struct Totals {
+        sent: u64,
+        delivered: u64,
+        lost: u64,
+    }
+
+    impl Totals {
+        fn loss(&self) -> f64 {
+            self.lost as f64 / self.sent.max(1) as f64
+        }
+    }
+
+    struct Sim {
+        bbr: Bbr,
+        rtt: RttEstimator,
+        start: Instant,
+        clock: Instant,
+        one_way: Duration,
+        line_rate: f64,
+        line_free: Duration,
+        policer: Option<Policer>,
+        /// Drops every n-th packet before the policer
+        drop_every: Option<u64>,
+        source: Source,
+        produced: f64,
+        next_pn: u64,
+        /// Packet number -> (sent at, bytes in flight after send)
+        outstanding: BTreeMap<u64, (Instant, u64)>,
+        in_flight: u64,
+        next_send: Instant,
+        acks: VecDeque<(Instant, u64)>,
+        /// Whether the last transmit attempt found nothing to send, as `Connection::app_limited`
+        exhausted: bool,
+        last_sent: Instant,
+        totals: Totals,
+        startup_exit: Option<Duration>,
+        entered_recovery: bool,
+    }
+
+    impl Sim {
+        fn new(rtt_ms: u64, line_rate: f64, source: Source) -> Self {
+            // EasyTier HY2 standard profile
+            let mut config = BbrConfig::default();
+            config
+                .initial_window_packets(32)
+                .max_window_packets(20_000)
+                .high_gain(2.885)
+                .high_cwnd_gain(2.0)
+                .congestion_window_gain(2.0)
+                .startup_rounds_without_growth(3)
+                .drain_to_target(false)
+                .enable_ack_aggregation_during_startup(false)
+                .expire_ack_aggregation_in_startup(false);
+            let start = Instant::now();
+            Self {
+                bbr: Bbr::new(Arc::new(config), MTU as u16),
+                rtt: RttEstimator::new(Duration::from_millis(rtt_ms)),
+                start,
+                clock: start,
+                one_way: Duration::from_millis(rtt_ms) / 2,
+                line_rate,
+                line_free: Duration::ZERO,
+                policer: None,
+                drop_every: None,
+                source,
+                produced: 0.0,
+                next_pn: 0,
+                outstanding: BTreeMap::new(),
+                in_flight: 0,
+                next_send: start,
+                acks: VecDeque::new(),
+                exhausted: false,
+                last_sent: start,
+                totals: Totals::default(),
+                startup_exit: None,
+                entered_recovery: false,
+            }
+        }
+
+        fn pacing_rate(&self) -> f64 {
+            match self.bbr.pacing_rate {
+                0 => self.bbr.window() as f64 / self.rtt.get().as_secs_f64(),
+                rate => rate as f64,
+            }
+        }
+
+        fn estimate(&self) -> f64 {
+            self.bbr.max_bandwidth.get_estimate() as f64
+        }
+
+        fn send(&mut self, now: Instant) {
+            if self.next_send + TICK < now {
+                self.next_send = now - TICK;
+            }
+            if let Source::Rate(rate) = self.source {
+                self.produced = (self.produced + rate * TICK.as_secs_f64()).min(4.0 * MTU as f64);
+            }
+            loop {
+                let sendable = match self.source {
+                    Source::Backlogged => true,
+                    Source::Window(limit) | Source::Credit(limit) => self.in_flight + MTU <= limit,
+                    Source::Rate(_) => self.produced >= MTU as f64,
+                };
+                if !sendable {
+                    self.exhausted = true;
+                    if !matches!(self.source, Source::Credit(_)) {
+                        self.bbr.on_app_limited();
+                    }
+                    return;
+                }
+                if self.in_flight >= self.bbr.window() || self.next_send > now {
+                    self.exhausted = false;
+                    return;
+                }
+                if let Source::Rate(_) = self.source {
+                    self.produced -= MTU as f64;
+                }
+                let pn = self.next_pn;
+                self.next_pn += 1;
+                self.bbr.on_sent(now, MTU, pn, self.in_flight);
+                self.last_sent = now;
+                self.in_flight += MTU;
+                self.outstanding.insert(pn, (now, self.in_flight));
+                self.totals.sent += MTU;
+                self.next_send += Duration::from_secs_f64(MTU as f64 / self.pacing_rate());
+                let departure = self.line_free.max(now - self.start)
+                    + Duration::from_secs_f64(MTU as f64 / self.line_rate);
+                self.line_free = departure;
+                let arrival = departure + self.one_way;
+                if self.drop_every.is_some_and(|n| pn % n == n - 1)
+                    || self.policer.as_mut().is_some_and(|p| !p.pass(arrival))
+                {
+                    continue;
+                }
+                self.acks
+                    .push_back((self.start + arrival + self.one_way, pn));
+            }
+        }
+
+        fn receive_acks(&mut self, now: Instant) {
+            let mut acked = Vec::new();
+            while self.acks.front().is_some_and(|(at, _)| *at <= now) {
+                acked.push(self.acks.pop_front().unwrap().1);
+            }
+            let Some(&largest) = acked.iter().max() else {
+                return;
+            };
+            self.bbr.on_begin_congestion_event(self.in_flight);
+            if let Some(&(sent, _)) = self.outstanding.get(&largest) {
+                self.rtt.update(Duration::ZERO, now - sent);
+            }
+            for pn in acked {
+                if let Some((sent, flight)) = self.outstanding.remove(&pn) {
+                    self.bbr
+                        .on_ack(now, sent, pn, MTU, flight, self.exhausted, &self.rtt);
+                    self.in_flight -= MTU;
+                    self.totals.delivered += MTU;
+                }
+            }
+            // RFC 9002 packet (3) and time (9/8 RTT) thresholds
+            let threshold = self.rtt.conservative() * 9 / 8;
+            let lost = self
+                .outstanding
+                .range(..largest)
+                .filter(|(pn, (sent, _))| **pn + 3 <= largest || *sent + threshold <= now)
+                .map(|(pn, v)| (*pn, *v))
+                .collect::<Vec<_>>();
+            self.declare_lost(now, &lost);
+            self.bbr
+                .on_end_acks(now, self.in_flight, self.exhausted, Some(largest));
+        }
+
+        fn declare_lost(&mut self, now: Instant, lost: &[(u64, (Instant, u64))]) {
+            let Some(&(last_pn, (last_sent, last_flight))) = lost.last() else {
+                return;
+            };
+            for (pn, _) in lost {
+                self.outstanding.remove(pn);
+                self.bbr.on_packet_lost(*pn, MTU);
+                self.in_flight -= MTU;
+                self.totals.lost += MTU;
+            }
+            self.bbr.on_congestion_event(
+                now,
+                last_sent,
+                false,
+                MTU * lost.len() as u64,
+                lost.len() as u64,
+                Some(last_pn),
+                Some(last_flight),
+            );
+        }
+
+        fn probe_timeout(&mut self, now: Instant) {
+            // Armed from the newest send, including the peer's default 25 ms maximum ACK delay
+            let pto = self.rtt.pto_base() + Duration::from_millis(25);
+            if self.outstanding.is_empty() || now < self.last_sent + pto {
+                return;
+            }
+            let lost = self
+                .outstanding
+                .iter()
+                .map(|(pn, v)| (*pn, *v))
+                .collect::<Vec<_>>();
+            self.bbr.on_begin_congestion_event(self.in_flight);
+            self.declare_lost(now, &lost);
+            self.bbr
+                .on_end_acks(now, self.in_flight, self.exhausted, None);
+        }
+
+        /// Runs until `until` after the start; returns the totals of that interval
+        fn run_until(&mut self, until: Duration) -> Totals {
+            let before = self.totals;
+            while self.clock < self.start + until {
+                let now = self.clock;
+                self.receive_acks(now);
+                self.probe_timeout(now);
+                self.send(now);
+                if self.startup_exit.is_none() && self.bbr.is_at_full_bandwidth {
+                    self.startup_exit = Some(now - self.start);
+                }
+                self.entered_recovery |= self.bbr.recovery_state.in_recovery();
+                self.clock += TICK;
+            }
+            let t = Totals {
+                sent: self.totals.sent - before.sent,
+                delivered: self.totals.delivered - before.delivered,
+                lost: self.totals.lost - before.lost,
+            };
+            println!(
+                "until {until:?}: {t:?} loss={:.1}% estimate={} pacing={} window={} mode={:?} recovery={:?} startup_exit={:?}",
+                100.0 * t.loss(),
+                self.estimate(),
+                self.bbr.pacing_rate,
+                self.bbr.window(),
+                self.bbr.mode,
+                self.bbr.recovery_state,
+                self.startup_exit,
+            );
+            t
+        }
+    }
+
+    /// 1 Mbit/s
+    const POLICED: f64 = 125_000.0;
+    /// 20 Mbit/s
+    const LINE: f64 = 2_500_000.0;
+
+    #[test]
+    fn policed_bulk_sender_estimate_follows_policer() {
+        let mut sim = Sim::new(225, 10_000_000.0, Source::Backlogged);
+        sim.policer = Some(Policer::new(POLICED, Duration::from_secs(5)));
+        sim.run_until(Duration::from_secs(5));
+        assert!(sim.bbr.is_at_full_bandwidth);
+        sim.run_until(Duration::from_secs(15));
+        let late = sim.run_until(Duration::from_secs(25));
+        assert!(
+            sim.estimate() <= 2.0 * POLICED,
+            "estimate stays {:.1}x the policed rate after 20 s",
+            sim.estimate() / POLICED
+        );
+        assert!(late.loss() <= 0.5, "late loss {:.1}%", 100.0 * late.loss());
+    }
+
+    #[test]
+    fn policed_from_start_estimate_follows_policer() {
+        let mut sim = Sim::new(225, 10_000_000.0, Source::Backlogged);
+        sim.policer = Some(Policer::new(POLICED, Duration::ZERO));
+        sim.run_until(Duration::from_secs(10));
+        let late = sim.run_until(Duration::from_secs(20));
+        assert!(sim.estimate() <= 2.0 * POLICED);
+        assert!(late.loss() <= 0.5, "late loss {:.1}%", 100.0 * late.loss());
+    }
+
+    #[test]
+    fn policed_window_limited_source_leaves_startup_on_loss() {
+        let mut sim = Sim::new(225, 10_000_000.0, Source::Window(64 * 1024));
+        sim.policer = Some(Policer::new(POLICED, Duration::from_secs(10)));
+        sim.run_until(Duration::from_secs(10));
+        assert_eq!(
+            sim.bbr.mode,
+            Mode::Startup,
+            "a window-limited source cannot show a plateau"
+        );
+        sim.run_until(Duration::from_secs(15));
+        assert!(
+            sim.startup_exit
+                .is_some_and(|exit| exit < Duration::from_secs(15)),
+            "STARTUP continued for 5 s of policed loss"
+        );
+        let late = sim.run_until(Duration::from_secs(40));
+        assert!(late.loss() <= 0.5, "late loss {:.1}%", 100.0 * late.loss());
+    }
+
+    #[test]
+    fn unpoliced_bulk_sender_learns_line_rate() {
+        let mut sim = Sim::new(50, LINE, Source::Backlogged);
+        let total = sim.run_until(Duration::from_secs(5));
+        assert!(sim.bbr.is_at_full_bandwidth);
+        assert_eq!(total.lost, 0);
+        assert!((0.9 * LINE..=1.1 * LINE).contains(&sim.estimate()));
+    }
+
+    /// Learns the line rate, then offers `source` with every 20th packet dropped
+    fn learned_then(source: Source) -> (Sim, f64) {
+        let mut sim = Sim::new(50, LINE, Source::Backlogged);
+        sim.run_until(Duration::from_secs(3));
+        let learned = sim.estimate();
+        assert!(learned >= 0.9 * LINE);
+        sim.source = source;
+        sim.drop_every = Some(20);
+        let limited = sim.run_until(Duration::from_secs(13));
+        assert!(limited.lost > 0 && sim.entered_recovery);
+        (sim, learned)
+    }
+
+    #[test]
+    fn trickle_with_isolated_loss_keeps_learned_estimate() {
+        let (mut sim, learned) = learned_then(Source::Rate(LINE / 100.0));
+        assert!(
+            sim.estimate() >= 0.9 * learned,
+            "a trickle cannot measure the path: {} of {learned}",
+            sim.estimate()
+        );
+        sim.source = Source::Backlogged;
+        sim.drop_every = None;
+        let bulk = sim.run_until(Duration::from_secs(14));
+        assert!(
+            bulk.delivered as f64 >= 0.6 * LINE,
+            "bulk after the trickle delivered {} in 1 s",
+            bulk.delivered
+        );
+    }
+
+    #[test]
+    fn credit_limited_flight_with_isolated_loss_keeps_learned_estimate() {
+        let (sim, learned) = learned_then(Source::Credit(8 * MTU));
+        assert!(
+            sim.estimate() >= 0.9 * learned,
+            "a credit-limited flight cannot measure the path: {} of {learned}",
+            sim.estimate()
+        );
+    }
+
+    #[test]
+    fn application_limited_startup_with_isolated_loss_stays_in_startup() {
+        let mut sim = Sim::new(50, LINE, Source::Rate(LINE / 10.0));
+        sim.drop_every = Some(50);
+        let total = sim.run_until(Duration::from_secs(10));
+        assert!(total.lost > 0);
+        assert_eq!(sim.bbr.mode, Mode::Startup);
+        assert!(!sim.bbr.is_at_full_bandwidth);
+    }
+
+    #[test]
+    fn trickle_after_excessive_loss_keeps_estimate_and_bulk_resumes() {
+        let mut sim = Sim::new(50, LINE, Source::Backlogged);
+        sim.run_until(Duration::from_secs(3));
+        sim.drop_every = Some(5);
+        sim.run_until(Duration::from_secs(5));
+        assert!(sim.bbr.excessive_loss_in_last_round);
+        let after_loss = sim.estimate();
+        sim.drop_every = None;
+        sim.source = Source::Rate(LINE / 100.0);
+        sim.run_until(Duration::from_secs(5) + Duration::from_millis(200));
+        assert!(!sim.bbr.excessive_loss_in_last_round);
+        sim.run_until(Duration::from_secs(15));
+        assert!(
+            sim.estimate() >= 0.9 * after_loss,
+            "the trickle replaced {after_loss} with {}",
+            sim.estimate()
+        );
+        sim.source = Source::Backlogged;
+        let bulk = sim.run_until(Duration::from_secs(16));
+        assert!(bulk.delivered as f64 >= 0.6 * LINE);
+    }
+
+    /// Sustained random loss that meets the excessive-loss criterion under a genuinely
+    /// application-limited source, then a bulk transfer on the same path
+    #[test]
+    fn sustained_random_loss_keeps_application_limited_estimate() {
+        let mut sim = Sim::new(225, LINE, Source::Backlogged);
+        sim.run_until(Duration::from_secs(5));
+        let learned = sim.estimate();
+        assert!(learned >= 0.9 * LINE);
+        sim.source = Source::Rate(LINE / 2.0);
+        sim.drop_every = Some(20);
+        let limited = sim.run_until(Duration::from_secs(25));
+        let limited_estimate = sim.estimate();
+        sim.source = Source::Backlogged;
+        let first = sim.run_until(Duration::from_secs(27));
+        sim.run_until(Duration::from_secs(33));
+        let late = sim.run_until(Duration::from_secs(35));
+        println!(
+            "learned={learned} limited_estimate={limited_estimate} limited_delivered={} bulk_first_2s={} bulk_8_10s={}",
+            limited.delivered, first.delivered, late.delivered
+        );
+        assert!(
+            limited_estimate >= 0.9 * learned,
+            "an application-limited source replaced {learned} with {limited_estimate}"
+        );
+        assert!(first.delivered as f64 >= 2.0 * 0.8 * LINE);
+        assert!(late.delivered as f64 >= 2.0 * 0.8 * LINE);
     }
 }
