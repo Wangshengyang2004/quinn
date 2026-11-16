@@ -1201,107 +1201,84 @@ mod tests {
         } else {
             target / 2
         };
-        assert!(current_flight > 1200);
+        assert!(
+            current_flight > 1200,
+            "previous_above_target={previous_above_target}, current_above_target={current_above_target}"
+        );
         bbr.on_sent(now, 1200, pn, current_flight - 1200);
         bbr.on_begin_congestion_event(current_flight);
         let ack = now + Duration::from_millis(50);
         bbr.on_ack(ack, now, pn, 1200, current_flight - 1200, false, &rtt);
         bbr.on_end_acks(ack, current_flight - 1200, false, Some(pn));
-        assert_eq!(bbr.mode, Mode::ProbeBw);
+        assert_eq!(
+            bbr.mode,
+            Mode::ProbeBw,
+            "previous_above_target={previous_above_target}, current_above_target={current_above_target}"
+        );
         bbr
     }
 
     #[test]
-    fn probe_bw_uses_current_event_flight_after_refill() {
-        let bbr = probe_bw_event(false, true);
-        assert_eq!(
-            bbr.pacing_gain, 0.75,
-            "refilled flight reached the probe target before this ACK"
-        );
+    fn probe_bw_uses_current_event_flight() {
+        for (previous_above_target, current_above_target, expected_gain) in [
+            (false, true, 0.75),
+            (true, false, 1.25),
+            (true, true, 0.75),
+            (false, false, 1.25),
+        ] {
+            let bbr = probe_bw_event(previous_above_target, current_above_target);
+            assert_eq!(
+                bbr.pacing_gain, expected_gain,
+                "previous_above_target={previous_above_target}, current_above_target={current_above_target}"
+            );
+        }
     }
 
     #[test]
-    fn probe_bw_uses_current_event_flight_after_drain() {
-        let bbr = probe_bw_event(true, false);
-        assert_eq!(
-            bbr.pacing_gain, 1.25,
-            "an earlier large flight cannot prove this probe reached its target"
-        );
+    fn mixed_ack_batch_preserves_send_state_and_startup() {
+        for reverse in [false, true] {
+            let bbr = mixed_ack_batch(reverse);
+            assert!(
+                bbr.last_sample_is_app_limited,
+                "reverse={reverse}: largest ACKed packet is app-limited although its rate sample is smaller"
+            );
+            assert!(
+                !bbr.is_at_full_bandwidth,
+                "reverse={reverse}: app-limited send state cannot prove a bandwidth plateau"
+            );
+            assert_eq!(bbr.mode, Mode::Startup, "reverse={reverse}");
+        }
     }
 
     #[test]
-    fn probe_bw_current_and_previous_flight_agree_control() {
-        assert_eq!(probe_bw_event(true, true).pacing_gain, 0.75);
-        assert_eq!(probe_bw_event(false, false).pacing_gain, 1.25);
-    }
-
-    #[test]
-    fn upstream_mixed_ack_batch_uses_largest_packet_app_state() {
-        let bbr = mixed_ack_batch(false);
-        assert!(
-            bbr.last_sample_is_app_limited,
-            "largest ACKed packet is app-limited although the larger rate sample is not"
-        );
-    }
-
-    #[test]
-    fn upstream_mixed_ack_batch_app_state_ignores_callback_order() {
-        let bbr = mixed_ack_batch(true);
-        assert!(
-            bbr.last_sample_is_app_limited,
-            "largest packet send state must survive reverse ACK callback order"
-        );
-    }
-
-    #[test]
-    fn upstream_mixed_ack_batch_does_not_end_app_limited_startup() {
-        let bbr = mixed_ack_batch(false);
-        assert!(
-            !bbr.is_at_full_bandwidth,
-            "an app-limited last send state cannot prove the path bandwidth plateaued"
-        );
-        assert_eq!(bbr.mode, Mode::Startup);
-    }
-
-    #[test]
-    fn upstream_first_rtt_keeps_startup() {
-        let start = Instant::now();
-        let mut bbr = Bbr::new(Arc::new(BbrConfig::default()), 1200);
-        let rtt = RttEstimator::new(Duration::from_millis(20));
-        bbr.on_sent(start, 1200, 1, 0);
-        bbr.on_begin_congestion_event(1200);
-        bbr.on_ack(
-            start + Duration::from_millis(20),
-            start,
-            1,
-            1200,
-            1200,
-            false,
-            &rtt,
-        );
-        bbr.on_end_acks(start + Duration::from_millis(20), 0, false, Some(1));
-        assert_eq!(bbr.min_rtt, Duration::from_millis(20));
-        assert_eq!(bbr.mode, Mode::Startup);
-    }
-
-    #[test]
-    fn upstream_first_app_limited_rtt_is_still_a_sample() {
-        let start = Instant::now();
-        let mut bbr = Bbr::new(Arc::new(BbrConfig::default()), 1200);
-        let rtt = RttEstimator::new(Duration::from_millis(20));
-        bbr.on_sent(start, 1200, 1, 0);
-        bbr.on_begin_congestion_event(1200);
-        bbr.on_ack(
-            start + Duration::from_millis(20),
-            start,
-            1,
-            1200,
-            1200,
-            true,
-            &rtt,
-        );
-        bbr.on_end_acks(start + Duration::from_millis(20), 0, true, Some(1));
-        assert_eq!(bbr.min_rtt, Duration::from_millis(20));
+    fn first_rtt_samples_both_source_states() {
+        for app_limited in [false, true] {
+            let start = Instant::now();
+            let mut bbr = Bbr::new(Arc::new(BbrConfig::default()), 1200);
+            let rtt = RttEstimator::new(Duration::from_millis(20));
+            if app_limited {
+                bbr.on_app_limited();
+            }
+            bbr.on_sent(start, 1200, 1, 0);
+            bbr.on_begin_congestion_event(1200);
+            let ack = start + Duration::from_millis(20);
+            bbr.on_ack(ack, start, 1, 1200, 1200, app_limited, &rtt);
+            assert_eq!(
+                bbr.max_bandwidth
+                    .last_event_packet_send_state()
+                    .unwrap()
+                    .app_limited,
+                app_limited,
+                "app_limited={app_limited}: fixture must mark the actual send sample"
+            );
+            bbr.on_end_acks(ack, 0, app_limited, Some(1));
+            assert_eq!(
+                bbr.min_rtt,
+                Duration::from_millis(20),
+                "app_limited={app_limited}"
+            );
+            assert_eq!(bbr.mode, Mode::Startup, "app_limited={app_limited}");
+        }
     }
 
     #[test]
@@ -2227,23 +2204,20 @@ mod limited_flight_tests {
     }
 
     #[test]
-    fn excessive_loss_suppresses_the_in_flight_heuristic() {
-        assert!(!marks_next_send(recovering(true), |bbr| {
-            bbr.on_begin_congestion_event(12_000)
-        }));
-    }
-
-    #[test]
-    fn explicit_exhaustion_marks_despite_excessive_loss() {
-        assert!(marks_next_send(recovering(true), |bbr| bbr.on_app_limited()));
-    }
-
-    #[test]
-    fn isolated_loss_keeps_application_limited_marks() {
-        assert!(marks_next_send(recovering(false), |bbr| {
-            bbr.on_begin_congestion_event(12_000)
-        }));
-        assert!(marks_next_send(recovering(false), |bbr| bbr.on_app_limited()));
+    fn loss_controls_application_limited_marks() {
+        for (excessive_loss, expected_heuristic) in [(false, true), (true, false)] {
+            assert_eq!(
+                marks_next_send(recovering(excessive_loss), |bbr| {
+                    bbr.on_begin_congestion_event(12_000)
+                }),
+                expected_heuristic,
+                "excessive_loss={excessive_loss}: in-flight heuristic"
+            );
+            assert!(
+                marks_next_send(recovering(excessive_loss), |bbr| bbr.on_app_limited()),
+                "excessive_loss={excessive_loss}: explicit exhaustion must mark the next send"
+            );
+        }
     }
 
     #[test]
