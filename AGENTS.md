@@ -11,8 +11,9 @@
 - Transport changes can affect ordinary QUIC as well as HY2. Verify the affected
   protocol tests and consumer paths; do not infer production benefit from an
   isolated congestion-control benchmark.
-- Use optimized release builds, task-specific target directories outside the
-  repository and the dedicated build node. Preserve other tasks' build caches.
+- Use optimized release builds and task-specific target directories outside the
+  repository on authorized Linux build hosts. Follow the current host lock,
+  job and memory budget in the private build runbook. Preserve other tasks' caches.
 - Keep machine-specific build recipes, credentials and rollout evidence outside
   the source repository. Retain a restorable backup before removing worktrees or
   duplicate repositories.
