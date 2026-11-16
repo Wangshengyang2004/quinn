@@ -19,6 +19,7 @@ pub(crate) enum ConnectionEventInner {
 /// Variant of [`ConnectionEventInner`].
 #[derive(Debug)]
 pub(crate) struct DatagramConnectionEvent {
+    pub(crate) wire_framing: Option<crate::WireFraming>,
     pub(crate) now: Instant,
     pub(crate) remote: SocketAddr,
     pub(crate) ecn: Option<EcnCodepoint>,

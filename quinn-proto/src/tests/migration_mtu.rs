@@ -28,7 +28,9 @@ fn migration_mtu_validation(budget: Option<Arc<LocalBudget>>) {
         .unwrap()
         .local_udp_payload_limit(budget.clone().map(|x| x as Arc<dyn LocalUdpPayloadLimit>));
     let mut pair = Pair::new(Default::default(), config);
+    pair.server.recv_framing = Some(WireFraming::Prefixed);
     let (client_ch, server_ch) = pair.connect();
+    pair.client_conn_mut(client_ch).ping();
     pair.drive();
     assert_eq!(
         usize::from(pair.server_conn_mut(server_ch).path_mtu()),
@@ -52,6 +54,7 @@ fn migration_mtu_validation(budget: Option<Arc<LocalBudget>>) {
     // The client shows up at a new IP address, as after a NAT rebinding that changed its public
     // address. The server starts MTU discovery from scratch for the new path.
     let old_address = pair.client.addr;
+    pair.server.recv_framing = Some(WireFraming::Bare);
     if let Some(budget) = &budget {
         budget.0.store(1300, std::sync::atomic::Ordering::Relaxed);
     }
@@ -69,12 +72,28 @@ fn migration_mtu_validation(budget: Option<Arc<LocalBudget>>) {
 
     // Delivering the client's data from its new address migrates the server onto the new path,
     // where MTU discovery starts over from `INITIAL_MTU`
-    assert!(step_losing_server_datagrams(&mut pair, lose));
+    assert!(step_losing_server_datagrams(
+        &mut pair,
+        lose,
+        Some(WireFraming::Prefixed)
+    ));
     assert_eq!(
         pair.server_conn_mut(server_ch).remote_address(),
         pair.client.addr
     );
     assert_eq!(pair.server_conn_mut(server_ch).path_mtu(), INITIAL_MTU);
+    assert_eq!(
+        pair.server_conn_mut(server_ch).confirmed_framing_for_test(),
+        None
+    );
+
+    // The budget variant also rebinds the local socket while remote migration is pending.
+    let previous_framing = if budget.is_some() {
+        pair.server_conn_mut(server_ch).local_address_changed();
+        None
+    } else {
+        Some(WireFraming::Prefixed)
+    };
 
     // Hold the path unvalidated for as long as the server keeps trying to validate it, which ends
     // when its path validation timer expires, because every PATH_CHALLENGE is lost
@@ -100,7 +119,7 @@ fn migration_mtu_validation(budget: Option<Arc<LocalBudget>>) {
             "server sent an MTU probe to an unvalidated address"
         );
         assert_eq!(pair.server_conn_mut(server_ch).path_mtu(), INITIAL_MTU);
-        if !step_losing_server_datagrams(&mut pair, lose) {
+        if !step_losing_server_datagrams(&mut pair, lose, previous_framing) {
             break;
         }
     }
@@ -109,6 +128,25 @@ fn migration_mtu_validation(budget: Option<Arc<LocalBudget>>) {
         old_address,
         "path validation timeout must restore the old validated path"
     );
+    assert_eq!(
+        pair.server_conn_mut(server_ch).confirmed_framing_for_test(),
+        previous_framing
+    );
+    if budget.is_some() {
+        pair.server_conn_mut(server_ch).ping();
+        pair.time += Duration::from_secs(1);
+        let now = pair.time;
+        let mut buffer = Vec::new();
+        let transmit = pair
+            .server_conn_mut(server_ch)
+            .poll_transmit(now, 1, &mut buffer)
+            .expect("restored path must permit a fresh packet after local rebind");
+        assert_eq!(transmit.destination, old_address);
+        assert_eq!(
+            transmit.wire_framing, None,
+            "fallback restored framing from the retired local socket"
+        );
+    }
     println!(
         "QH2_PHASE timeout_fallback probes={} initial_probes={}",
         server_stats(&mut pair).path.sent_plpmtud_probes,
@@ -129,6 +167,10 @@ fn migration_mtu_validation(budget: Option<Arc<LocalBudget>>) {
         pair.client.addr
     );
     assert!(path_responses(&mut pair) > path_responses_before);
+    assert_eq!(
+        pair.server_conn_mut(server_ch).confirmed_framing_for_test(),
+        Some(WireFraming::Bare)
+    );
     assert!(server_stats(&mut pair).path.sent_plpmtud_probes > before.path.sent_plpmtud_probes);
     let mtu = pair.server_conn_mut(server_ch).path_mtu();
     if let Some(budget) = &budget {
@@ -153,11 +195,23 @@ fn migration_mtu_validation(budget: Option<Arc<LocalBudget>>) {
 /// `lose` returns true, and all of its datagrams to any other address
 ///
 /// Returns false once neither endpoint has anything scheduled.
-fn step_losing_server_datagrams(pair: &mut Pair, lose: impl Fn(&[u8]) -> bool) -> bool {
+fn step_losing_server_datagrams(
+    pair: &mut Pair,
+    lose: impl Fn(&[u8]) -> bool,
+    previous_framing: Option<WireFraming>,
+) -> bool {
     pair.drive_client();
 
     pair.server.drive(pair.time, pair.client.addr);
     for (transmit, datagram) in pair.server.outbound.drain(..) {
+        if transmit.destination == pair.client.addr {
+            assert!(
+                transmit.wire_framing == Some(WireFraming::Bare)
+                    || (previous_framing.is_none() && transmit.wire_framing.is_none())
+            );
+        } else {
+            assert_eq!(transmit.wire_framing, previous_framing);
+        }
         if transmit.destination != pair.client.addr || lose(&datagram) || datagram.len() > pair.mtu
         {
             continue;

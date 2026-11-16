@@ -94,6 +94,8 @@ pub const BATCH_SIZE: usize = 1;
 /// [`stride`]: RecvMeta::stride
 #[derive(Debug, Copy, Clone)]
 pub struct RecvMeta {
+    /// Observed local UDP envelope for every datagram in this buffer.
+    pub wire_framing: Option<WireFraming>,
     /// The source address of the datagram(s) contained in the buffer
     pub addr: SocketAddr,
     /// The number of bytes the associated buffer has
@@ -126,13 +128,25 @@ impl Default for RecvMeta {
             stride: 0,
             ecn: None,
             dst_ip: None,
+            wire_framing: None,
         }
     }
+}
+
+/// Local UDP envelope metadata; never encoded into QUIC packets.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum WireFraming {
+    /// The datagram has no outer UDP prefix.
+    Bare,
+    /// The datagram carries the outer UDP prefix.
+    Prefixed,
 }
 
 /// An outgoing packet
 #[derive(Debug, Clone)]
 pub struct Transmit<'a> {
+    /// Requested local UDP envelope.
+    pub wire_framing: Option<WireFraming>,
     /// The socket this datagram should be sent to
     pub destination: SocketAddr,
     /// Explicit congestion notification bits to set on the packet

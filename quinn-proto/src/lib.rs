@@ -303,10 +303,21 @@ impl coding::Codec for StreamId {
     }
 }
 
+/// Local UDP envelope metadata; never encoded into QUIC packets.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum WireFraming {
+    /// The datagram has no outer UDP prefix.
+    Bare,
+    /// The datagram carries the outer UDP prefix.
+    Prefixed,
+}
+
 /// An outgoing packet
 #[derive(Debug)]
 #[must_use]
 pub struct Transmit {
+    /// Requested local UDP envelope.
+    pub wire_framing: Option<WireFraming>,
     /// The socket this datagram should be sent to
     pub destination: SocketAddr,
     /// Explicit congestion notification bits to set on the packet

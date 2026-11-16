@@ -2521,6 +2521,149 @@ fn migration() {
     );
 }
 
+#[test]
+fn wire_framing_requires_fresh_1rtt_and_validated_path() {
+    let _guard = subscribe();
+    let mut pair = Pair::default();
+    pair.server.recv_framing = Some(WireFraming::Prefixed);
+    let client = pair.begin_connect(client_config());
+    pair.drive_client();
+    let initial = pair.server.inbound.clone();
+    pair.server.drive_incoming(pair.time, pair.client.addr);
+    let server = pair.server.assert_accept();
+    assert_eq!(
+        pair.server_conn_mut(server).confirmed_framing_for_test(),
+        None
+    );
+    pair.server.drive_outgoing(pair.time);
+    assert!(!pair.server.outbound.is_empty());
+    assert!(
+        pair.server
+            .outbound
+            .iter()
+            .all(|(transmit, _)| transmit.wire_framing == Some(WireFraming::Prefixed))
+    );
+    pair.drive();
+    pair.finish_connect(client, server);
+
+    pair.server.recv_framing = Some(WireFraming::Bare);
+    pair.client_conn_mut(client).ping();
+    pair.drive_client();
+    let replay = pair.server.inbound.clone();
+    assert!(!replay.is_empty());
+    pair.drive_server();
+    assert_eq!(
+        pair.server_conn_mut(server).confirmed_framing_for_test(),
+        Some(WireFraming::Bare)
+    );
+
+    pair.server.recv_framing = Some(WireFraming::Prefixed);
+    pair.server.inbound.extend(replay);
+    pair.drive_server();
+    assert_eq!(
+        pair.server_conn_mut(server).confirmed_framing_for_test(),
+        Some(WireFraming::Bare)
+    );
+
+    pair.server_conn_mut(server).ping();
+    pair.server.drive_outgoing(pair.time);
+    assert!(!pair.server.outbound.is_empty());
+    assert!(
+        pair.server
+            .outbound
+            .iter()
+            .all(|(transmit, _)| transmit.wire_framing == Some(WireFraming::Bare))
+    );
+
+    pair.client_conn_mut(client).ping();
+    pair.drive_client();
+    let fresh = pair.server.inbound.clone();
+    assert!(!fresh.is_empty());
+    for (_, _, packet) in &mut pair.server.inbound {
+        let last = packet.len() - 1;
+        packet[last] ^= 1;
+    }
+    pair.drive_server();
+    assert_eq!(
+        pair.server_conn_mut(server).confirmed_framing_for_test(),
+        Some(WireFraming::Bare)
+    );
+    pair.server.inbound.extend(fresh);
+    pair.drive_server();
+    assert_eq!(
+        pair.server_conn_mut(server).confirmed_framing_for_test(),
+        Some(WireFraming::Prefixed)
+    );
+    pair.drive();
+
+    pair.server.recv_framing = Some(WireFraming::Bare);
+    pair.server.inbound.extend(initial);
+    pair.drive_server();
+    assert_eq!(
+        pair.server_conn_mut(server).confirmed_framing_for_test(),
+        Some(WireFraming::Prefixed)
+    );
+
+    // Another CID on the same remote address owns independent state.
+    pair.server.recv_framing = Some(WireFraming::Bare);
+    let second_client = pair.begin_connect(client_config());
+    pair.drive();
+    let second_server = pair.server.assert_accept();
+    pair.finish_connect(second_client, second_server);
+    pair.client_conn_mut(second_client).ping();
+    pair.drive();
+    assert_eq!(
+        pair.server_conn_mut(second_server)
+            .confirmed_framing_for_test(),
+        Some(WireFraming::Bare)
+    );
+    assert_eq!(
+        pair.server_conn_mut(server).confirmed_framing_for_test(),
+        Some(WireFraming::Prefixed)
+    );
+
+    // A fresh migration packet is only a candidate until PATH_RESPONSE arrives.
+    pair.client
+        .addr
+        .set_port(CLIENT_PORTS.lock().unwrap().next().unwrap());
+    pair.server.recv_framing = Some(WireFraming::Bare);
+    pair.client_conn_mut(client).ping();
+    pair.drive_client();
+    pair.drive_server();
+    assert_eq!(
+        pair.server_conn_mut(server).confirmed_framing_for_test(),
+        None
+    );
+    assert_eq!(
+        pair.server_conn_mut(second_server)
+            .confirmed_framing_for_test(),
+        Some(WireFraming::Bare)
+    );
+    pair.drive();
+    assert_eq!(
+        pair.server_conn_mut(server).confirmed_framing_for_test(),
+        Some(WireFraming::Bare)
+    );
+    pair.server_conn_mut(server).ping();
+    pair.server.drive_outgoing(pair.time);
+    assert!(
+        pair.server
+            .outbound
+            .iter()
+            .any(|(transmit, _)| transmit.destination == pair.client.addr
+                && transmit.wire_framing == Some(WireFraming::Bare))
+    );
+    pair.client_conn_mut(client)
+        .datagrams()
+        .send(Bytes::from_static(b"after migration"), false)
+        .unwrap();
+    pair.drive();
+    assert_eq!(
+        pair.server_conn_mut(server).datagrams().recv(),
+        Some(Bytes::from_static(b"after migration"))
+    );
+}
+
 fn test_flow_control(config: TransportConfig, window_size: usize) {
     let _guard = subscribe();
     let mut pair = Pair::new(

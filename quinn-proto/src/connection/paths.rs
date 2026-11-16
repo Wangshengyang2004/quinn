@@ -14,6 +14,10 @@ use qlog::events::quic::MetricsUpdated;
 
 /// Description of a particular network path
 pub(super) struct PathData {
+    /// Fresh authenticated 1-RTT evidence on this validated path.
+    pub(super) confirmed_framing: Option<crate::WireFraming>,
+    /// Initial replies and unvalidated migration traffic may use a tentative envelope.
+    pub(super) framing_hint: Option<crate::WireFraming>,
     pub(super) remote: SocketAddr,
     pub(super) rtt: RttEstimator,
     /// Whether we're enabling ECN on outgoing packets
@@ -75,6 +79,8 @@ impl PathData {
             None => factory.build(now, config.get_initial_mtu()),
         };
         Self {
+            confirmed_framing: None,
+            framing_hint: None,
             remote,
             rtt: RttEstimator::new(config.initial_rtt),
             sending_ecn: true,
@@ -125,6 +131,8 @@ impl PathData {
         let congestion = prev.congestion.clone_box();
         let smoothed_rtt = prev.rtt.get();
         Self {
+            confirmed_framing: None,
+            framing_hint: None,
             remote,
             rtt: prev.rtt,
             pacing: Pacer::new(smoothed_rtt, congestion.window(), prev.current_mtu(), now),
@@ -447,10 +455,17 @@ pub(crate) struct PathResponses {
 }
 
 impl PathResponses {
-    pub(crate) fn push(&mut self, packet: u64, token: u64, remote: SocketAddr) {
+    pub(crate) fn push(
+        &mut self,
+        packet: u64,
+        token: u64,
+        remote: SocketAddr,
+        wire_framing: Option<crate::WireFraming>,
+    ) {
         /// Arbitrary permissive limit to prevent abuse
         const MAX_PATH_RESPONSES: usize = 16;
         let response = PathResponse {
+            wire_framing,
             packet,
             token,
             remote,
@@ -472,7 +487,10 @@ impl PathResponses {
         }
     }
 
-    pub(crate) fn pop_off_path(&mut self, remote: SocketAddr) -> Option<(u64, SocketAddr)> {
+    pub(crate) fn pop_off_path(
+        &mut self,
+        remote: SocketAddr,
+    ) -> Option<(u64, SocketAddr, Option<crate::WireFraming>)> {
         let response = *self.pending.last()?;
         if response.remote == remote {
             // We don't bother searching further because we expect that the on-path response will
@@ -480,7 +498,7 @@ impl PathResponses {
             return None;
         }
         self.pending.pop();
-        Some((response.token, response.remote))
+        Some((response.token, response.remote, response.wire_framing))
     }
 
     pub(crate) fn pop_on_path(&mut self, remote: SocketAddr) -> Option<u64> {
@@ -494,6 +512,12 @@ impl PathResponses {
         Some(response.token)
     }
 
+    pub(crate) fn clear_framing(&mut self) {
+        for response in &mut self.pending {
+            response.wire_framing = None;
+        }
+    }
+
     pub(crate) fn is_empty(&self) -> bool {
         self.pending.is_empty()
     }
@@ -501,6 +525,7 @@ impl PathResponses {
 
 #[derive(Copy, Clone)]
 struct PathResponse {
+    wire_framing: Option<crate::WireFraming>,
     /// The packet number the corresponding PATH_CHALLENGE was received in
     packet: u64,
     token: u64,

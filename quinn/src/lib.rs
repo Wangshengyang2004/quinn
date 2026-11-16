@@ -66,7 +66,7 @@ pub use proto::{
     MtuDiscoveryConfig, NoneTokenLog, NoneTokenStore, PathStats, ServerConfig, Side, StdSystemTime,
     StreamId, TimeSource, TokenLog, TokenMemoryCache, TokenReuseError, TokenStore, Transmit,
     TransportConfig, TransportErrorCode, UdpStats, ValidationTokenConfig, VarInt,
-    VarIntBoundsExceeded, Written, congestion, crypto,
+    VarIntBoundsExceeded, WireFraming, Written, congestion, crypto,
 };
 #[cfg(feature = "qlog")]
 pub use proto::{QlogConfig, QlogStream};
@@ -105,6 +105,10 @@ enum ConnectionEvent {
 
 fn udp_transmit<'a>(t: &proto::Transmit, buffer: &'a [u8]) -> udp::Transmit<'a> {
     udp::Transmit {
+        wire_framing: t.wire_framing.map(|framing| match framing {
+            proto::WireFraming::Bare => udp::WireFraming::Bare,
+            proto::WireFraming::Prefixed => udp::WireFraming::Prefixed,
+        }),
         destination: t.destination,
         ecn: t.ecn.map(udp_ecn),
         contents: buffer,

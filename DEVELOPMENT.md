@@ -1,8 +1,8 @@
 # Maintained EasyTier dependency
 
-This fork extends the maintained `quinn-proto` 0.11.19 checkpoint
-`061829d212090b87e471d94cba890acd5cffa933`, paired with crates.io Quinn 0.11.12
-and quinn-udp 0.5.16, retaining bounded explicit-rate pacing.
+This fork maintains `quinn-proto` 0.11.19, Quinn 0.11.12 and quinn-udp 0.5.16.
+The proto extends checkpoint `061829d212090b87e471d94cba890acd5cffa933`,
+retaining bounded explicit-rate pacing.
 [HY2-RUST-UPSTREAM.md](HY2-RUST-UPSTREAM.md) describes
 Chrome wire shaping, receive-window tuning, HY2 BBR profiles and the TLS boundary.
 The optional `hy2-rustls` feature requires EasyTier's rustls patch; other builds
@@ -35,8 +35,17 @@ The maintained 0.11.x fixes cover receive-state preservation after illegal order
 reads, duplicate removal when switching to unordered reads, nonminimal integer
 transport parameters, zero idle timeout, APPLICATION_CLOSE reason budgeting,
 and server handshake-data availability after HelloRetryRequest/ALPN. The new
-connection-acceptance API is omitted because the locked Quinn 0.11.12 wrapper has
-no consumer; Quinn and quinn-udp remain crates.io dependencies.
+connection-acceptance API is omitted because the Quinn 0.11.12 wrapper has no
+consumer. UDP envelope metadata now crosses quinn-udp, the wrapper and proto;
+consumers using it must select all three fork crates at the same revision.
+`Endpoint::handle` remains the ordinary metadata-free entry point; the wrapper
+uses `handle_with_framing`. Fresh authenticated 1-RTT packets confirm framing
+only on validated paths. On a candidate path, fresh AEAD- and dedup-accepted
+1-RTT evidence may select its outgoing envelope and payload budget; the matching
+PATH_RESPONSE confirms the path. Initial replies retain a separate tentative
+hint. Local socket rebinding clears envelope evidence on current and retained
+paths and queued path responses. Framing is local metadata and does not alter
+QUIC packets.
 
 DATAGRAM wire size and receive memory have separate limits. A valid-size frame
 that exceeds the receive buffer is dropped; a frame larger than the advertised

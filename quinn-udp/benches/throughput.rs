@@ -58,6 +58,7 @@ pub fn criterion_benchmark(c: &mut Criterion) {
         };
         let msg = vec![0xAB; min(MAX_DATAGRAM_SIZE, SEGMENT_SIZE * gso_segments)];
         let transmit = Transmit {
+            wire_framing: None,
             destination: dst_addr,
             ecn: None,
             contents: &msg,

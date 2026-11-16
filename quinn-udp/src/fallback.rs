@@ -67,6 +67,7 @@ impl UdpSocketState {
         };
         let (len, _flags, addr) = socket.0.recv_from_vectored(bufs)?;
         meta[0] = RecvMeta {
+            wire_framing: None,
             len,
             stride: len,
             addr: addr.as_socket().unwrap(),

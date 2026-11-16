@@ -263,6 +263,7 @@ impl UdpSocketState {
         }
 
         meta[0] = RecvMeta {
+            wire_framing: None,
             len: len as usize,
             stride: stride as usize,
             addr: addr.unwrap(),

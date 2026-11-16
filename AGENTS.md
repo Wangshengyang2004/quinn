@@ -5,9 +5,10 @@
 - Read `DEVELOPMENT.md` for the maintained dependency checkpoint and archived
   experiments. Resume experiments in a scoped branch/worktree; archive tags are
   not instructions to merge their changes.
-- EasyTier selects this fork through an exact `quinn-proto` Git revision in its
-  Cargo.toml and Cargo.lock. A local branch change does not update that consumer.
-  Validate consumer changes explicitly when advancing the dependency revision.
+- EasyTier selects this fork through exact Git revisions in Cargo.toml and
+  Cargo.lock. Shared UDP metadata requires wrapper, proto and UDP crates at the
+  same revision. A branch change does not update the consumer; validate it
+  explicitly when advancing the dependency revision.
 - Transport changes can affect ordinary QUIC as well as HY2. Verify the affected
   protocol tests and consumer paths; do not infer production benefit from an
   isolated congestion-control benchmark.

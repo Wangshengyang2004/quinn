@@ -803,11 +803,15 @@ impl RecvState {
                         while !data.is_empty() {
                             let buf = data.split_to(meta.stride.min(data.len()));
                             let mut response_buffer = Vec::new();
-                            match endpoint.handle(
+                            match endpoint.handle_with_framing(
                                 now,
                                 meta.addr,
                                 meta.dst_ip,
                                 meta.ecn.map(proto_ecn),
+                                meta.wire_framing.map(|framing| match framing {
+                                    udp::WireFraming::Bare => proto::WireFraming::Bare,
+                                    udp::WireFraming::Prefixed => proto::WireFraming::Prefixed,
+                                }),
                                 buf,
                                 &mut response_buffer,
                             ) {

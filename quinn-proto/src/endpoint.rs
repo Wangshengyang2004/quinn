@@ -154,6 +154,20 @@ impl Endpoint {
         data: BytesMut,
         buf: &mut Vec<u8>,
     ) -> Option<DatagramEvent> {
+        self.handle_with_framing(now, remote, local_ip, ecn, None, data, buf)
+    }
+
+    /// Handle a datagram with its local UDP envelope observation.
+    pub fn handle_with_framing(
+        &mut self,
+        now: Instant,
+        remote: SocketAddr,
+        local_ip: Option<IpAddr>,
+        ecn: Option<EcnCodepoint>,
+        wire_framing: Option<crate::WireFraming>,
+        data: BytesMut,
+        buf: &mut Vec<u8>,
+    ) -> Option<DatagramEvent> {
         // Partially decode packet or short-circuit if unable
         let datagram_len = data.len();
         let event = match PartialDecode::new(
@@ -163,6 +177,7 @@ impl Endpoint {
             self.config.grease_quic_bit,
         ) {
             Ok((first_decode, remaining)) => DatagramConnectionEvent {
+                wire_framing,
                 now,
                 remote,
                 ecn,
@@ -202,6 +217,7 @@ impl Endpoint {
                     buf.write(version);
                 }
                 return Some(DatagramEvent::Response(Transmit {
+                    wire_framing,
                     destination: remote,
                     ecn: None,
                     size: buf.len(),
@@ -267,7 +283,7 @@ impl Endpoint {
         } else {
             // If we got this far, we're receiving a seemingly valid packet for an unknown
             // connection. Send a stateless reset if possible.
-            self.stateless_reset(now, datagram_len, addresses, *dst_cid, buf)
+            self.stateless_reset(now, datagram_len, addresses, *dst_cid, wire_framing, buf)
                 .map(DatagramEvent::Response)
         }
     }
@@ -278,6 +294,7 @@ impl Endpoint {
         inciting_dgram_len: usize,
         addresses: FourTuple,
         dst_cid: ConnectionId,
+        wire_framing: Option<crate::WireFraming>,
         buf: &mut Vec<u8>,
     ) -> Option<Transmit> {
         if self
@@ -333,6 +350,7 @@ impl Endpoint {
         debug_assert!(buf.len() < inciting_dgram_len);
 
         Some(Transmit {
+            wire_framing,
             destination: addresses.remote,
             ecn: None,
             size: buf.len(),
@@ -452,7 +470,14 @@ impl Endpoint {
         let Some(server_config) = &self.server_config else {
             debug!("packet for unrecognized connection {}", dst_cid);
             return self
-                .stateless_reset(event.now, datagram_len, addresses, *dst_cid, buf)
+                .stateless_reset(
+                    event.now,
+                    datagram_len,
+                    addresses,
+                    *dst_cid,
+                    event.wire_framing,
+                    buf,
+                )
                 .map(DatagramEvent::Response);
         };
 
@@ -486,6 +511,7 @@ impl Endpoint {
 
         if let Err(reason) = self.early_validate_first_packet(header) {
             return Some(DatagramEvent::Response(self.initial_close(
+                event.wire_framing,
                 header.version,
                 addresses,
                 &crypto,
@@ -519,6 +545,7 @@ impl Endpoint {
             Err(InvalidRetryTokenError) => {
                 debug!("rejecting invalid retry token");
                 return Some(DatagramEvent::Response(self.initial_close(
+                    event.wire_framing,
                     header.version,
                     addresses,
                     &crypto,
@@ -538,6 +565,7 @@ impl Endpoint {
             .insert_initial_incoming(header.dst_cid, incoming_idx);
 
         Some(DatagramEvent::NewConnection(Incoming {
+            wire_framing: event.wire_framing,
             received_at: event.now,
             addresses,
             ecn: event.ecn,
@@ -600,6 +628,7 @@ impl Endpoint {
             return Err(AcceptError {
                 cause: ConnectionError::CidsExhausted,
                 response: Some(self.initial_close(
+                    incoming.wire_framing,
                     version,
                     incoming.addresses,
                     &incoming.crypto,
@@ -674,6 +703,7 @@ impl Endpoint {
         );
         self.index.insert_initial(dst_cid, ch);
 
+        conn.set_initial_framing(incoming.wire_framing);
         match conn.handle_first_packet(
             incoming.received_at,
             incoming.addresses.remote,
@@ -696,6 +726,7 @@ impl Endpoint {
                 self.handle_event(ch, EndpointEvent(EndpointEventInner::Drained));
                 let response = match e {
                     ConnectionError::TransportError(ref e) => Some(self.initial_close(
+                        incoming.wire_framing,
                         version,
                         incoming.addresses,
                         &incoming.crypto,
@@ -741,6 +772,7 @@ impl Endpoint {
         incoming.improper_drop_warner.dismiss();
 
         self.initial_close(
+            incoming.wire_framing,
             incoming.packet.header.version,
             incoming.addresses,
             &incoming.crypto,
@@ -795,6 +827,7 @@ impl Endpoint {
         encode.finish(buf, &*incoming.crypto.header.local, None);
 
         Ok(Transmit {
+            wire_framing: incoming.wire_framing,
             destination: incoming.addresses.remote,
             ecn: None,
             size: buf.len(),
@@ -882,6 +915,7 @@ impl Endpoint {
 
     fn initial_close(
         &mut self,
+        wire_framing: Option<crate::WireFraming>,
         version: u32,
         addresses: FourTuple,
         crypto: &Keys,
@@ -909,6 +943,7 @@ impl Endpoint {
         buf.resize(buf.len() + crypto.packet.local.tag_len(), 0);
         partial_encode.finish(buf, &*crypto.header.local, Some((0, &*crypto.packet.local)));
         Transmit {
+            wire_framing,
             destination: addresses.remote,
             ecn: None,
             size: buf.len(),
@@ -1186,6 +1221,7 @@ pub enum DatagramEvent {
 
 /// An incoming connection for which the server has not yet begun its part of the handshake.
 pub struct Incoming {
+    wire_framing: Option<crate::WireFraming>,
     received_at: Instant,
     addresses: FourTuple,
     ecn: Option<EcnCodepoint>,

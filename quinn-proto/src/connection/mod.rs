@@ -505,9 +505,11 @@ impl Connection {
 
         if let Some(provider) = &self.config.local_udp_payload_limit {
             let old_mtu = self.path.current_mtu();
-            self.path
-                .mtud
-                .set_local_max_udp_payload_size(provider.max_udp_payload_size(self.path.remote));
+            let limit = provider.max_udp_payload_size_with_framing(
+                self.path.remote,
+                self.path.confirmed_framing.or(self.path.framing_hint),
+            );
+            self.path.mtud.set_local_max_udp_payload_size(limit);
             let new_mtu = self.path.current_mtu();
             if new_mtu != old_mtu {
                 self.path.congestion.on_mtu_update(new_mtu);
@@ -947,7 +949,9 @@ impl Connection {
             // Send an off-path PATH_RESPONSE. Prioritized over on-path data to ensure that path
             // validation can occur while the link is saturated.
             if space_id == SpaceId::Data && num_datagrams == 1 && !ack_only {
-                if let Some((token, remote)) = self.path_responses.pop_off_path(self.path.remote) {
+                if let Some((token, remote, wire_framing)) =
+                    self.path_responses.pop_off_path(self.path.remote)
+                {
                     // `unwrap` guaranteed to succeed because `builder_storage` was populated just
                     // above.
                     let mut builder = builder_storage.take().unwrap();
@@ -967,6 +971,7 @@ impl Connection {
                     );
                     self.stats.udp_tx.on_sent(1, buf.len());
                     return Some(Transmit {
+                        wire_framing,
                         destination: remote,
                         size: buf.len(),
                         ecn: None,
@@ -1121,6 +1126,7 @@ impl Connection {
         self.stats.udp_tx.on_sent(num_datagrams as u64, buf.len());
 
         Some(Transmit {
+            wire_framing: self.path.confirmed_framing.or(self.path.framing_hint),
             destination: self.path.remote,
             size: buf.len(),
             ecn: if self.path.sending_ecn {
@@ -1147,6 +1153,7 @@ impl Connection {
             .challenge
             .expect("previous path challenge pending without token");
         let destination = prev_path.remote;
+        let wire_framing = prev_path.confirmed_framing.or(prev_path.framing_hint);
         debug_assert_eq!(
             self.highest_space,
             SpaceId::Data,
@@ -1186,6 +1193,7 @@ impl Connection {
         self.stats.udp_tx.on_sent(1, buf.len());
 
         Some(Transmit {
+            wire_framing,
             destination,
             size: buf.len(),
             ecn: None,
@@ -1242,6 +1250,7 @@ impl Connection {
                 now,
                 remote,
                 ecn,
+                wire_framing,
                 first_decode,
                 remaining,
             }) => {
@@ -1259,7 +1268,7 @@ impl Connection {
                 self.stats.udp_rx.bytes += first_decode.len() as u64;
                 let data_len = first_decode.len();
 
-                self.handle_decode(now, remote, ecn, first_decode);
+                self.handle_decode(now, remote, wire_framing, ecn, first_decode);
                 // The current `path` might have changed inside `handle_decode`,
                 // since the packet could have triggered a migration. Make sure
                 // the data received is accounted for the most recent path by accessing
@@ -1268,7 +1277,7 @@ impl Connection {
 
                 if let Some(data) = remaining {
                     self.stats.udp_rx.bytes += data.len() as u64;
-                    self.handle_coalesced(now, remote, ecn, data);
+                    self.handle_coalesced(now, remote, wire_framing, ecn, data);
                 }
 
                 self.config.qlog_sink.emit_recovery_metrics(
@@ -2325,6 +2334,10 @@ impl Connection {
     ///
     /// Decrypting the first packet in the `Endpoint` allows stateless packet handling to be more
     /// efficient.
+    pub(crate) fn set_initial_framing(&mut self, wire_framing: Option<crate::WireFraming>) {
+        self.path.framing_hint = wire_framing;
+    }
+
     pub(crate) fn handle_first_packet(
         &mut self,
         now: Instant,
@@ -2334,6 +2347,7 @@ impl Connection {
         packet: InitialPacket,
         remaining: Option<BytesMut>,
     ) -> Result<(), ConnectionError> {
+        let wire_framing = self.path.framing_hint;
         let span = trace_span!("first recv");
         let _guard = span.enter();
         debug_assert!(self.side.is_server());
@@ -2356,9 +2370,15 @@ impl Connection {
             false,
         );
 
-        self.process_decrypted_packet(now, remote, Some(packet_number), packet.into())?;
+        self.process_decrypted_packet(
+            now,
+            remote,
+            wire_framing,
+            Some(packet_number),
+            packet.into(),
+        )?;
         if let Some(data) = remaining {
-            self.handle_coalesced(now, remote, ecn, data);
+            self.handle_coalesced(now, remote, wire_framing, ecn, data);
         }
 
         self.config.qlog_sink.emit_recovery_metrics(
@@ -2567,6 +2587,7 @@ impl Connection {
         &mut self,
         now: Instant,
         remote: SocketAddr,
+        wire_framing: Option<crate::WireFraming>,
         ecn: Option<EcnCodepoint>,
         data: BytesMut,
     ) {
@@ -2581,7 +2602,7 @@ impl Connection {
             ) {
                 Ok((partial_decode, rest)) => {
                     remaining = rest;
-                    self.handle_decode(now, remote, ecn, partial_decode);
+                    self.handle_decode(now, remote, wire_framing, ecn, partial_decode);
                 }
                 Err(e) => {
                     trace!("malformed header: {}", e);
@@ -2595,6 +2616,7 @@ impl Connection {
         &mut self,
         now: Instant,
         remote: SocketAddr,
+        wire_framing: Option<crate::WireFraming>,
         ecn: Option<EcnCodepoint>,
         partial_decode: PartialDecode,
     ) {
@@ -2604,7 +2626,14 @@ impl Connection {
             self.zero_rtt_crypto.as_ref(),
             self.peer_params.stateless_reset_token,
         ) {
-            self.handle_packet(now, remote, ecn, decoded.packet, decoded.stateless_reset);
+            self.handle_packet(
+                now,
+                remote,
+                wire_framing,
+                ecn,
+                decoded.packet,
+                decoded.stateless_reset,
+            );
         }
     }
 
@@ -2612,6 +2641,7 @@ impl Connection {
         &mut self,
         now: Instant,
         remote: SocketAddr,
+        wire_framing: Option<crate::WireFraming>,
         ecn: Option<EcnCodepoint>,
         packet: Option<Packet>,
         stateless_reset: bool,
@@ -2709,7 +2739,19 @@ impl Connection {
                         );
                     }
 
-                    self.process_decrypted_packet(now, remote, number, packet)
+                    let confirms_framing = packet.header.is_1rtt() && !self.state.is_closed();
+                    let result =
+                        self.process_decrypted_packet(now, remote, wire_framing, number, packet);
+                    if result.is_ok() && confirms_framing && remote == self.path.remote {
+                        if let Some(framing) = wire_framing {
+                            if self.path.validated {
+                                self.path.confirmed_framing = Some(framing);
+                            } else {
+                                self.path.framing_hint = Some(framing);
+                            }
+                        }
+                    }
+                    result
                 }
             }
         };
@@ -2765,13 +2807,16 @@ impl Connection {
         &mut self,
         now: Instant,
         remote: SocketAddr,
+        wire_framing: Option<crate::WireFraming>,
         number: Option<u64>,
         packet: Packet,
     ) -> Result<(), ConnectionError> {
         let state = match self.state {
             State::Established => {
                 match packet.header.space() {
-                    SpaceId::Data => self.process_payload(now, remote, number.unwrap(), packet)?,
+                    SpaceId::Data => {
+                        self.process_payload(now, remote, wire_framing, number.unwrap(), packet)?
+                    }
                     _ if packet.header.has_frames() => self.process_early_payload(now, packet)?,
                     _ => {
                         trace!("discarding unexpected pre-handshake packet");
@@ -3011,7 +3056,7 @@ impl Connection {
                 ty: LongType::ZeroRtt,
                 ..
             } => {
-                self.process_payload(now, remote, number.unwrap(), packet)?;
+                self.process_payload(now, remote, wire_framing, number.unwrap(), packet)?;
                 Ok(())
             }
             Header::VersionNegotiate { .. } => {
@@ -3111,6 +3156,7 @@ impl Connection {
         &mut self,
         now: Instant,
         remote: SocketAddr,
+        wire_framing: Option<crate::WireFraming>,
         number: u64,
         packet: Packet,
     ) -> Result<(), TransportError> {
@@ -3189,7 +3235,8 @@ impl Connection {
                     close = Some(reason);
                 }
                 Frame::PathChallenge(token) => {
-                    self.path_responses.push(number, token, remote);
+                    self.path_responses
+                        .push(number, token, remote, wire_framing);
                     if remote == self.path.remote {
                         // PATH_CHALLENGE on active path, possible off-path packet forwarding
                         // attack. Send a non-probing packet to recover the active path.
@@ -3439,7 +3486,7 @@ impl Connection {
                 server_config.migration,
                 "migration-initiating packets should have been dropped immediately"
             );
-            self.migrate(now, remote);
+            self.migrate(now, remote, wire_framing);
             // Break linkability, if possible
             self.update_rem_cid();
             self.spin = false;
@@ -3448,7 +3495,12 @@ impl Connection {
         Ok(())
     }
 
-    fn migrate(&mut self, now: Instant, remote: SocketAddr) {
+    fn migrate(
+        &mut self,
+        now: Instant,
+        remote: SocketAddr,
+        wire_framing: Option<crate::WireFraming>,
+    ) {
         trace!(%remote, "migration initiated");
         self.path_counter = self.path_counter.wrapping_add(1);
         // Reset rtt/congestion state for new path unless it looks like a NAT rebinding.
@@ -3470,6 +3522,7 @@ impl Connection {
                 Some(&self.path),
             )
         };
+        new_path.framing_hint = wire_framing;
         new_path.challenge = Some(self.rng.random());
         new_path.challenge_pending = true;
         let prev_pto = self.pto(SpaceId::Data);
@@ -3493,6 +3546,13 @@ impl Connection {
 
     /// Handle a change in the local address, i.e. an active migration
     pub fn local_address_changed(&mut self) {
+        self.path.confirmed_framing = None;
+        self.path.framing_hint = None;
+        if let Some((_, previous)) = &mut self.prev_path {
+            previous.confirmed_framing = None;
+            previous.framing_hint = None;
+        }
+        self.path_responses.clear_framing();
         self.update_rem_cid();
         self.ping();
     }
@@ -4063,6 +4123,11 @@ impl Connection {
     /// the Acknowledgement Frequency extension
     pub(crate) fn immediate_ack(&mut self) {
         self.spaces[self.highest_space].immediate_ack_pending = true;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn confirmed_framing_for_test(&self) -> Option<crate::WireFraming> {
+        self.path.confirmed_framing
     }
 
     #[cfg(test)]

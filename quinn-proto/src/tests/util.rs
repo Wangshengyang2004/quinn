@@ -289,6 +289,7 @@ impl Default for Pair {
 }
 
 pub(super) struct TestEndpoint {
+    pub(super) recv_framing: Option<WireFraming>,
     pub(super) endpoint: Endpoint,
     pub(super) addr: SocketAddr,
     socket: Option<UdpSocket>,
@@ -333,6 +334,7 @@ impl TestEndpoint {
             None
         };
         Self {
+            recv_framing: None,
             endpoint,
             addr,
             socket,
@@ -369,10 +371,15 @@ impl TestEndpoint {
 
         while self.inbound.front().is_some_and(|x| x.0 <= now) {
             let (recv_time, ecn, packet) = self.inbound.pop_front().unwrap();
-            if let Some(event) = self
-                .endpoint
-                .handle(recv_time, remote, None, ecn, packet, &mut buf)
-            {
+            if let Some(event) = self.endpoint.handle_with_framing(
+                recv_time,
+                remote,
+                None,
+                ecn,
+                self.recv_framing,
+                packet,
+                &mut buf,
+            ) {
                 match event {
                     DatagramEvent::NewConnection(incoming) => {
                         match (self.handle_incoming)(&incoming) {
@@ -414,13 +421,13 @@ impl TestEndpoint {
 
         loop {
             let mut endpoint_events: Vec<(ConnectionHandle, EndpointEvent)> = vec![];
+            self.timeout = None;
             for (ch, conn) in self.connections.iter_mut() {
-                if self.timeout.is_some_and(|x| x <= now) {
-                    self.timeout = None;
+                if conn.poll_timeout().is_some_and(|x| x <= now) {
                     conn.handle_timeout(now);
                 }
 
-                for (_, mut events) in self.conn_events.drain() {
+                if let Some(mut events) = self.conn_events.remove(ch) {
                     for event in events.drain(..) {
                         conn.handle_event(event);
                     }
@@ -434,7 +441,7 @@ impl TestEndpoint {
                     self.outbound.extend(split_transmit(transmit, &buf[..size]));
                     buf.clear();
                 }
-                self.timeout = conn.poll_timeout();
+                self.timeout = min_opt(self.timeout, conn.poll_timeout());
             }
 
             if endpoint_events.is_empty() {
@@ -692,6 +699,7 @@ fn split_transmit(transmit: Transmit, buffer: &[u8]) -> Vec<(Transmit, Bytes)> {
         let contents = buffer.split_to(end);
         transmits.push((
             Transmit {
+                wire_framing: transmit.wire_framing,
                 destination: transmit.destination,
                 size: contents.len(),
                 ecn: transmit.ecn,

@@ -398,6 +398,7 @@ fn send(state: &UdpSocketState, io: SockRef<'_>, transmit: &Transmit<'_>) -> io:
     {
         prepare_msg(
             &Transmit {
+                wire_framing: transmit.wire_framing,
                 destination: transmit.destination,
                 ecn: transmit.ecn,
                 contents: chunk,
@@ -793,6 +794,7 @@ fn decode_recv(
     };
 
     RecvMeta {
+        wire_framing: None,
         len,
         stride,
         addr,

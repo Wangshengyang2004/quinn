@@ -29,6 +29,15 @@ pub(crate) struct SendCreditReserve {
 pub trait LocalUdpPayloadLimit: fmt::Debug + Send + Sync {
     /// Current maximum UDP payload size for this destination, before host encapsulation.
     fn max_udp_payload_size(&self, remote: SocketAddr) -> Option<u16>;
+
+    /// Payload budget for the envelope selected by this connection's path.
+    fn max_udp_payload_size_with_framing(
+        &self,
+        remote: SocketAddr,
+        _wire_framing: Option<crate::WireFraming>,
+    ) -> Option<u16> {
+        self.max_udp_payload_size(remote)
+    }
 }
 
 /// Parameters governing the core QUIC state machine

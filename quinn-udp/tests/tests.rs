@@ -22,6 +22,7 @@ fn basic() {
         &send.into(),
         &recv.into(),
         Transmit {
+            wire_framing: None,
             destination: dst_addr,
             ecn: None,
             contents: b"hello",
@@ -45,6 +46,7 @@ fn basic_src_ip() {
         &send.into(),
         &recv.into(),
         Transmit {
+            wire_framing: None,
             destination: dst_addr,
             ecn: None,
             contents: b"hello",
@@ -63,6 +65,7 @@ fn ecn_v6() {
             &send,
             &recv,
             Transmit {
+                wire_framing: None,
                 destination: recv.local_addr().unwrap().as_socket().unwrap(),
                 ecn: Some(codepoint),
                 contents: b"hello",
@@ -83,6 +86,7 @@ fn ecn_v4() {
             &send,
             &recv,
             Transmit {
+                wire_framing: None,
                 destination: recv.local_addr().unwrap().as_socket().unwrap(),
                 ecn: Some(codepoint),
                 contents: b"hello",
@@ -128,6 +132,7 @@ fn ecn_v6_dualstack() {
                 &send,
                 &recv,
                 Transmit {
+                    wire_framing: None,
                     destination: dst,
                     ecn: Some(codepoint),
                     contents: b"hello",
@@ -168,6 +173,7 @@ fn ecn_v4_mapped_v6() {
             &send,
             &recv,
             Transmit {
+                wire_framing: None,
                 destination: recv_v4_mapped_v6,
                 ecn: Some(codepoint),
                 contents: b"hello",
@@ -200,6 +206,7 @@ fn gso() {
         &send.into(),
         &recv.into(),
         Transmit {
+            wire_framing: None,
             destination: dst_addr,
             ecn: None,
             contents: &msg,
@@ -273,6 +280,7 @@ fn socket_buffers() {
         &send,
         &recv,
         Transmit {
+            wire_framing: None,
             destination: recv.local_addr().unwrap().as_socket().unwrap(),
             ecn: None,
             contents: b"hello",
