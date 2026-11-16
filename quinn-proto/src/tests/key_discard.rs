@@ -74,34 +74,27 @@ fn key_discard_loss_free_handshake_reports_retirement_without_packet_loss() {
 }
 
 #[test]
-fn key_retirement_pto_after_one_lost_initial() {
-    check_retired_initial_pto(1);
-}
-
-#[test]
-fn key_retirement_pto_after_two_lost_initials() {
-    check_retired_initial_pto(2);
-}
-
-#[test]
-fn key_retirement_pto_without_initial_loss() {
-    check_retired_initial_pto(0);
+fn key_retirement_pto() {
+    for dropped_initial_flights in 0..=2 {
+        check_retired_initial_pto(dropped_initial_flights);
+    }
 }
 
 fn check_retired_initial_pto(dropped_initial_flights: u32) {
+    let case = format!("dropped_initial_flights={dropped_initial_flights}");
     let mut pair = Pair::default();
     pair.latency = Duration::from_millis(50);
     let client = pair.begin_connect(client_config());
     for expected_backoff in 0..dropped_initial_flights {
         pair.drive_client();
-        assert!(!pair.server.inbound.is_empty());
+        assert!(!pair.server.inbound.is_empty(), "{case}");
         pair.server.inbound.clear();
         let now = pair.time;
         let state = pair
             .client_conn_mut(client)
             .handshake_pto_state_for_test(now);
-        assert_eq!(state.0, expected_backoff);
-        assert!(state.1);
+        assert_eq!(state.0, expected_backoff, "{case}");
+        assert!(state.1, "{case}");
         pair.time = pair.client.next_wakeup().unwrap();
     }
     pair.drive_client();
@@ -109,11 +102,11 @@ fn check_retired_initial_pto(dropped_initial_flights: u32) {
     let before = pair
         .client_conn_mut(client)
         .handshake_pto_state_for_test(now);
-    assert_eq!(before.0, dropped_initial_flights);
-    assert!(before.1);
+    assert_eq!(before.0, dropped_initial_flights, "{case}");
+    assert!(before.1, "{case}");
     pair.time += pair.latency;
     pair.drive_server();
-    assert!(!pair.client.inbound.is_empty());
+    assert!(!pair.client.inbound.is_empty(), "{case}");
     pair.time += pair.latency;
     pair.drive_client();
     let now = pair.time;
@@ -122,16 +115,15 @@ fn check_retired_initial_pto(dropped_initial_flights: u32) {
         .handshake_pto_state_for_test(now);
     assert!(
         !after.1,
-        "client must have retired Initial keys by sending Handshake"
+        "{case}: client must have retired Initial keys by sending Handshake"
     );
-    assert!(after.2, "Handshake keys remain until confirmation");
+    assert!(after.2, "{case}: Handshake keys remain until confirmation");
     let next_pto = after.4.unwrap() - pair.time;
-    eprintln!(
-        "retirement dropped={dropped_initial_flights} backoff={} base={:?} next={next_pto:?}",
-        after.0, after.3
+    assert_eq!(
+        after.0, 0,
+        "{case}: Initial key retirement must reset PTO backoff"
     );
-    assert_eq!(after.0, 0, "Initial key retirement must reset PTO backoff");
-    assert_eq!(next_pto, after.3);
+    assert_eq!(next_pto, after.3, "{case}");
     // Lose the first client Finished flight, then verify the actual
     // retransmission occurs at the unbacked-off Handshake PTO.
     pair.server.inbound.clear();
@@ -140,11 +132,15 @@ fn check_retired_initial_pto(dropped_initial_flights: u32) {
     pair.drive_client();
     assert_eq!(
         pair.client_conn_mut(client).stats().frame_tx.crypto,
-        crypto_sent
+        crypto_sent,
+        "{case}"
     );
     pair.time += Duration::from_millis(1);
     pair.drive_client();
-    assert!(pair.client_conn_mut(client).stats().frame_tx.crypto > crypto_sent);
+    assert!(
+        pair.client_conn_mut(client).stats().frame_tx.crypto > crypto_sent,
+        "{case}"
+    );
     pair.drive();
     let server = pair.server.assert_accept();
     pair.finish_connect(client, server);

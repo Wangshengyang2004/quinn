@@ -37,10 +37,10 @@ mod util;
 use util::*;
 
 mod ack_congestion;
+mod hy2_packet_numbers;
 pub(crate) mod key_discard;
 mod migration_mtu;
 mod migration_sampling;
-mod hy2_packet_numbers;
 mod token;
 
 #[test]
@@ -5499,6 +5499,9 @@ fn check_ack_frequency_receive_policy(
     enabled: bool,
     sender_advertises: bool,
 ) {
+    let case = format!(
+        "receiver_is_client={receiver_is_client}, immediate={immediate}, enabled={enabled}, sender_advertises={sender_advertises}"
+    );
     let mut client = client_config_with_deterministic_pns();
     let mut server = server_config();
     let mut frequency = AckFrequencyConfig::default();
@@ -5542,11 +5545,14 @@ fn check_ack_frequency_receive_policy(
         pair.server_conn_mut(server_ch)
     };
     let stats = receiver.stats();
-    assert!(if immediate {
-        stats.frame_rx.immediate_ack > 0
-    } else {
-        stats.frame_rx.ack_frequency > 0
-    });
+    assert!(
+        if immediate {
+            stats.frame_rx.immediate_ack > 0
+        } else {
+            stats.frame_rx.ack_frequency > 0
+        },
+        "{case}: expected policy frame was not received"
+    );
     let mut lost = None;
     while let Some(event) = receiver.poll() {
         if let Event::ConnectionLost { reason } = event {
@@ -5554,77 +5560,39 @@ fn check_ack_frequency_receive_policy(
         }
     }
     if enabled {
-        assert!(lost.is_none(), "advertised extension rejected: {lost:?}");
+        assert!(
+            lost.is_none(),
+            "{case}: advertised extension rejected: {lost:?}"
+        );
     } else {
         let expected_frame = if immediate {
             frame::FrameType::IMMEDIATE_ACK
         } else {
             frame::FrameType::ACK_FREQUENCY
         };
-        assert_matches!(lost, Some(ConnectionError::TransportError(ref error))
-            if error.code == TransportErrorCode::PROTOCOL_VIOLATION
-                && error.frame == Some(expected_frame));
+        assert!(
+            matches!(&lost, Some(ConnectionError::TransportError(error))
+                if error.code == TransportErrorCode::PROTOCOL_VIOLATION
+                    && error.frame == Some(expected_frame)),
+            "{case}: expected {expected_frame:?} protocol violation, got {lost:?}"
+        );
     }
 }
 
 #[test]
-fn ack_frequency_policy_client_frequency_disabled() {
-    check_ack_frequency_receive_policy(true, false, false, true);
-}
-
-#[test]
-fn ack_frequency_policy_client_frequency_enabled() {
-    check_ack_frequency_receive_policy(true, false, true, true);
-}
-
-#[test]
-fn ack_frequency_policy_client_immediate_disabled() {
-    check_ack_frequency_receive_policy(true, true, false, true);
-}
-
-#[test]
-fn ack_frequency_policy_client_immediate_enabled() {
-    check_ack_frequency_receive_policy(true, true, true, true);
-}
-
-#[test]
-fn ack_frequency_policy_server_frequency_disabled() {
-    check_ack_frequency_receive_policy(false, false, false, true);
-}
-
-#[test]
-fn ack_frequency_policy_server_frequency_enabled() {
-    check_ack_frequency_receive_policy(false, false, true, true);
-}
-
-#[test]
-fn ack_frequency_policy_server_immediate_disabled() {
-    check_ack_frequency_receive_policy(false, true, false, true);
-}
-
-#[test]
-fn ack_frequency_policy_server_immediate_enabled() {
-    check_ack_frequency_receive_policy(false, true, true, true);
-}
-
-#[test]
-fn ack_frequency_policy_client_frequency_unilateral() {
-    check_ack_frequency_receive_policy(true, false, true, false);
-}
-
-#[test]
-fn ack_frequency_policy_client_immediate_unilateral() {
-    check_ack_frequency_receive_policy(true, true, true, false);
-}
-
-#[test]
-fn ack_frequency_policy_server_frequency_unilateral() {
-    check_ack_frequency_receive_policy(false, false, true, false);
-}
-
-#[test]
-fn ack_frequency_policy_server_immediate_unilateral() {
-    check_ack_frequency_receive_policy(false, true, true, false);
+fn ack_frequency_policy() {
+    for receiver_is_client in [false, true] {
+        for immediate in [false, true] {
+            for (enabled, sender_advertises) in [(false, true), (true, true), (true, false)] {
+                check_ack_frequency_receive_policy(
+                    receiver_is_client,
+                    immediate,
+                    enabled,
+                    sender_advertises,
+                );
+            }
+        }
+    }
 }
 
 mod adaptive_loss;

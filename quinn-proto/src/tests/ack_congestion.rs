@@ -1,6 +1,7 @@
 use super::*;
 
 fn acknowledge_while_congested(queued_data: bool, bbr: bool, pad: bool, gso: bool) {
+    let case = format!("queued_data={queued_data}, bbr={bbr}, pad={pad}, gso={gso}");
     let mut pair = Pair::default();
     let mut config = client_config();
     if bbr {
@@ -25,7 +26,8 @@ fn acknowledge_while_congested(queued_data: bool, bbr: bool, pad: bool, gso: boo
             pair.client_send(client, upstream)
                 .write(&[7; 1024])
                 .unwrap(),
-            1024
+            1024,
+            "{case}"
         );
         pair.time += Duration::from_micros(100);
         pair.client.drive_outgoing(pair.time);
@@ -33,16 +35,20 @@ fn acknowledge_while_congested(queued_data: bool, bbr: bool, pad: bool, gso: boo
         assert_eq!(
             pair.client_conn_mut(client).stats().frame_tx.stream,
             previous + 1,
-            "fixture write must drain before the window fills"
+            "{case}: fixture write must drain before the window fills"
         );
     }
-    assert!(pair.client_conn_mut(client).congestion_window() < DEFAULT_MTU as u64);
+    assert!(
+        pair.client_conn_mut(client).congestion_window() < DEFAULT_MTU as u64,
+        "{case}"
+    );
     if queued_data {
         assert_eq!(
             pair.client_send(client, upstream)
                 .write(&[9; 1024])
                 .unwrap(),
-            1024
+            1024,
+            "{case}"
         );
     }
     let downstream = pair.server_streams(server).open(Dir::Uni).unwrap();
@@ -55,51 +61,47 @@ fn acknowledge_while_congested(queued_data: bool, bbr: bool, pad: bool, gso: boo
     for byte in [1, 2] {
         assert_eq!(
             pair.server_send(server, downstream).write(&[byte]).unwrap(),
-            1
+            1,
+            "{case}"
         );
         pair.drive_server();
     }
     pair.drive_client();
     let connection = pair.client_conn_mut(client);
-    assert_eq!(connection.stats().frame_rx.stream, received_before + 2);
+    assert_eq!(
+        connection.stats().frame_rx.stream,
+        received_before + 2,
+        "{case}"
+    );
     assert!(
         connection.stats().frame_tx.acks > acknowledgments_before,
-        "a due ACK must leave even with queued data and a full congestion window"
+        "{case}: a due ACK must leave even with queued data and a full congestion window"
     );
-    assert_eq!(connection.stats().frame_tx.stream, streams_before);
+    assert_eq!(connection.stats().frame_tx.stream, streams_before, "{case}");
     assert_eq!(
         connection.bytes_in_flight(),
         bytes_before,
-        "ACK-only output must not consume congestion credit"
+        "{case}: ACK-only output must not consume congestion credit"
     );
 }
 
 #[test]
-fn due_ack_with_queued_data_and_full_cwnd_cubic() {
-    for pad in [false, true] {
-        for gso in [false, true] {
-            acknowledge_while_congested(true, false, pad, gso);
+fn due_ack_with_full_cwnd() {
+    for bbr in [false, true] {
+        for (queued_data, pad, gso) in [
+            (false, false, true),
+            (true, false, false),
+            (true, false, true),
+            (true, true, false),
+            (true, true, true),
+        ] {
+            acknowledge_while_congested(queued_data, bbr, pad, gso);
         }
     }
-}
-#[test]
-fn due_ack_without_queued_data_and_full_cwnd_cubic() {
-    acknowledge_while_congested(false, false, false, true);
-}
-#[test]
-fn due_ack_with_queued_data_and_full_cwnd_bbr() {
-    for pad in [false, true] {
-        for gso in [false, true] {
-            acknowledge_while_congested(true, true, pad, gso);
-        }
-    }
-}
-#[test]
-fn due_ack_without_queued_data_and_full_cwnd_bbr() {
-    acknowledge_while_congested(false, true, false, true);
 }
 
 fn acknowledge_while_paced(bbr: bool, pad: bool, gso: bool) {
+    let case = format!("bbr={bbr}, pad={pad}, gso={gso}");
     let mut pair = Pair::default();
     pair.latency = Duration::from_millis(5);
     let mut config = client_config();
@@ -120,16 +122,20 @@ fn acknowledge_while_paced(bbr: bool, pad: bool, gso: bool) {
         pair.client_send(client, upstream)
             .write(&[7; 128 * 1024])
             .unwrap(),
-        128 * 1024
+        128 * 1024,
+        "{case}"
     );
     pair.client.drive_outgoing(pair.time);
-    assert!(!pair.client.outbound.is_empty());
+    assert!(!pair.client.outbound.is_empty(), "{case}");
     pair.client.outbound.clear();
-    assert!(pair.client_conn_mut(client).congestion_window() > DEFAULT_MTU as u64);
+    assert!(
+        pair.client_conn_mut(client).congestion_window() > DEFAULT_MTU as u64,
+        "{case}"
+    );
     pair.client.drive_outgoing(pair.time);
     assert!(
         pair.client.outbound.is_empty(),
-        "the pacer must stop pending data with credit still available"
+        "{case}: the pacer must stop pending data with credit still available"
     );
     let before = pair.client_conn_mut(client).stats();
     let bytes_before = pair.client_conn_mut(client).bytes_in_flight();
@@ -137,7 +143,8 @@ fn acknowledge_while_paced(bbr: bool, pad: bool, gso: bool) {
     for byte in [1, 2] {
         assert_eq!(
             pair.server_send(server, downstream).write(&[byte]).unwrap(),
-            1
+            1,
+            "{case}"
         );
         pair.drive_server();
     }
@@ -145,28 +152,27 @@ fn acknowledge_while_paced(bbr: bool, pad: bool, gso: bool) {
     let connection = pair.client_conn_mut(client);
     assert_eq!(
         connection.stats().frame_rx.stream,
-        before.frame_rx.stream + 2
+        before.frame_rx.stream + 2,
+        "{case}"
     );
     assert!(
         connection.stats().frame_tx.acks > before.frame_tx.acks,
-        "the pacer must allow a due ACK"
+        "{case}: the pacer must allow a due ACK"
     );
-    assert_eq!(connection.stats().frame_tx.stream, before.frame_tx.stream);
-    assert_eq!(connection.bytes_in_flight(), bytes_before);
+    assert_eq!(
+        connection.stats().frame_tx.stream,
+        before.frame_tx.stream,
+        "{case}"
+    );
+    assert_eq!(connection.bytes_in_flight(), bytes_before, "{case}");
 }
 #[test]
-fn due_ack_with_paced_data_cubic() {
-    for pad in [false, true] {
-        for gso in [false, true] {
-            acknowledge_while_paced(false, pad, gso);
-        }
-    }
-}
-#[test]
-fn due_ack_with_paced_data_bbr() {
-    for pad in [false, true] {
-        for gso in [false, true] {
-            acknowledge_while_paced(true, pad, gso);
+fn due_ack_with_paced_data() {
+    for bbr in [false, true] {
+        for pad in [false, true] {
+            for gso in [false, true] {
+                acknowledge_while_paced(bbr, pad, gso);
+            }
         }
     }
 }
