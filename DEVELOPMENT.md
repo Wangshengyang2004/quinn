@@ -253,7 +253,10 @@ peer's maximum ACK delay); Initial and Handshake probes keep exponential
 backoff, and `pto_count` still counts every expiry. Enabling it departs from
 the doubling rule of RFC 9002 section 6.2.1. It changes no wire format, frame
 or transport parameter and has no interoperability effect. It is off (`None`)
-by default; EasyTier does not enable it.
+by default. EasyTier leaves it unset unless explicitly configured through its
+HY2 URL parameter. The existing recovery fixture fills the congestion window,
+retains queued data, and checks complete byte delivery and FIN after a five-second
+blackhole, with and without NAT rebinding.
 
 `TransportConfig::max_unsent_stream_delay` is an opt-in, sender-local admission
 policy, off (`None`) by default. When set, a write on a stream is admitted only

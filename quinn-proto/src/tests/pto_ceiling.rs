@@ -34,7 +34,10 @@ fn blackhole(pair: &mut Pair, until: Instant) -> Vec<Instant> {
         pair.server.outbound.clear();
         match min_opt(pair.client.next_wakeup(), pair.server.next_wakeup()) {
             Some(t) if t <= until => pair.time = pair.time.max(t),
-            _ => return sent,
+            _ => {
+                pair.time = until;
+                return sent;
+            }
         }
     }
 }
@@ -146,9 +149,8 @@ struct RecoveryTimes {
     first: Instant,
 }
 
-/// Fill the congestion window, lose everything in both directions for 5 s while the client's
-/// address is rebound, restore the path, and check that the connection recovers
-fn rebound_blackhole(max_pto_interval: Option<Duration>) -> RecoveryTimes {
+/// Fill the congestion window, lose both directions for 5 s, and recover with or without NAT rebinding.
+fn blackhole_recovery(max_pto_interval: Option<Duration>, rebind: bool) -> RecoveryTimes {
     let _guard = subscribe();
     let (server, client) = configs(max_pto_interval);
     let mut pair = Pair::new(Default::default(), server);
@@ -162,17 +164,43 @@ fn rebound_blackhole(max_pto_interval: Option<Duration>) -> RecoveryTimes {
         pair.client_send(client_ch, s).write(&[0xab; LEN]).unwrap(),
         LEN
     );
+    pair.client_send(client_ch, s).finish().unwrap();
+    let started = pair.time;
+    for step in 0..1000 {
+        pair.client.drive(pair.time, pair.server.addr);
+        pair.client.outbound.clear();
+        let conn = pair.client_conn_mut(client_ch);
+        if !conn
+            .congestion_state()
+            .can_send(conn.bytes_in_flight(), u64::from(conn.path_mtu()))
+        {
+            break;
+        }
+        assert!(step < 999, "sender never filled its congestion window");
+        pair.time = pair.time.max(pair.client.next_wakeup().unwrap());
+        assert!(
+            pair.time - started < Duration::from_secs(1),
+            "fixture waited for PTO instead of filling cwnd"
+        );
+    }
+    let now = pair.time;
+    let conn = pair.client_conn_mut(client_ch);
+    let unsent = conn.stream_unsent(s);
+    assert!(unsent >= u64::from(conn.path_mtu()));
+    assert!(conn.poll_transmit(now, 1, &mut Vec::new()).is_none());
+    assert_eq!(conn.stream_unsent(s), unsent);
+
     let restored = pair.time + Duration::from_secs(5);
     let blackholed = blackhole(&mut pair, restored);
     assert!(pair.client_conn_mut(client_ch).bytes_in_flight() > 0);
     info!(?blackholed, "client sends while blackholed");
 
-    // The client's NAT mapping was rebuilt: the server's datagrams to the old address are lost,
-    // so only a client datagram can restart the path.
-    pair.client.addr = SocketAddr::new(
-        Ipv4Addr::new(127, 0, 0, 1).into(),
-        CLIENT_PORTS.lock().unwrap().next().unwrap(),
-    );
+    if rebind {
+        // Datagrams to the old mapping are lost; only the client can restart this path.
+        pair.client
+            .addr
+            .set_port(CLIENT_PORTS.lock().unwrap().next().unwrap());
+    }
     let first = loop {
         pair.client.drive(pair.time, pair.server.addr);
         if !pair.client.outbound.is_empty() {
@@ -193,7 +221,8 @@ fn rebound_blackhole(max_pto_interval: Option<Duration>) -> RecoveryTimes {
     let mut recv = pair.server_recv(server_ch, s);
     let mut chunks = recv.read(true).unwrap();
     let mut received = 0;
-    while let Ok(Some(chunk)) = chunks.next(usize::MAX) {
+    while let Some(chunk) = chunks.next(usize::MAX).unwrap() {
+        assert!(chunk.bytes.iter().all(|&byte| byte == 0xab));
         received += chunk.bytes.len();
     }
     let _ = chunks.finalize();
@@ -206,33 +235,21 @@ fn rebound_blackhole(max_pto_interval: Option<Duration>) -> RecoveryTimes {
 }
 
 #[test]
-fn max_pto_interval_bounds_recovery_after_rebound_blackhole() {
-    // Probes bypass congestion control and pacing, and the simulated clock fires the PTO timer
-    // exactly, so the first datagram follows the last blackholed probe by exactly one capped
-    // interval, which ends no later than one cap after restoration. No extra bound is needed.
-    let capped = rebound_blackhole(Some(SCENARIO_CAP));
-    let last = *capped.blackholed.last().unwrap();
-    println!(
-        "PTO_CEILING capped wait_ms={} interval_ms={}",
-        (capped.first - capped.restored).as_millis(),
-        (capped.first - last).as_millis()
-    );
-    assert_eq!(capped.first - last, SCENARIO_CAP);
-    assert!(capped.first - capped.restored <= SCENARIO_CAP);
+fn max_pto_interval_bounds_blackhole_recovery() {
+    for rebind in [false, true] {
+        // Probes bypass congestion control and pacing. With the cap, the next probe
+        // follows the last lost probe by exactly one capped interval.
+        let capped = blackhole_recovery(Some(SCENARIO_CAP), rebind);
+        let last = *capped.blackholed.last().unwrap();
+        assert_eq!(capped.first - last, SCENARIO_CAP, "rebind={rebind}");
+        assert!(capped.first - capped.restored <= SCENARIO_CAP);
 
-    // Without the option the backoff keeps doubling through the blackhole, and the next probe is
-    // twice the previous interval after the last one. In this simulation (50 ms one-way latency)
-    // that interval is 3.8 s and the first datagram leaves 2.362 s after restoration; with the
-    // 1 s cap it leaves after 0.662 s.
-    let uncapped = rebound_blackhole(None);
-    let [.., before_last, last] = uncapped.blackholed[..] else {
-        panic!("{:?}", uncapped.blackholed);
-    };
-    println!(
-        "PTO_CEILING uncapped wait_ms={} interval_ms={}",
-        (uncapped.first - uncapped.restored).as_millis(),
-        (uncapped.first - last).as_millis()
-    );
-    assert_eq!(uncapped.first - last, (last - before_last) * 2);
-    assert!(uncapped.first - last > SCENARIO_CAP);
+        // The default backoff continues doubling through the blackhole.
+        let uncapped = blackhole_recovery(None, rebind);
+        let [.., before_last, last] = uncapped.blackholed[..] else {
+            panic!("{:?}", uncapped.blackholed);
+        };
+        assert_eq!(uncapped.first - last, (last - before_last) * 2);
+        assert!(uncapped.first - last > SCENARIO_CAP);
+    }
 }
