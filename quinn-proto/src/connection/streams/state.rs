@@ -111,7 +111,9 @@ pub struct StreamsState {
     pub(super) connection_blocked: Vec<StreamId>,
     /// Connection-level flow control budget dictated by the peer
     pub(super) max_data: u64,
-    initial_send_credit: u64,
+    /// Largest connection window the peer has shown: its credit beyond the data we had sent
+    /// when the grant arrived. Bounds the credit reserves.
+    peer_credit_window: u64,
     send_credit_reserve: Option<crate::config::SendCreditReserve>,
     low_credit_updates: bool,
     /// Unsent bytes each stream may hold, from `TransportConfig::max_unsent_stream_delay`
@@ -200,7 +202,7 @@ impl StreamsState {
             events: VecDeque::new(),
             connection_blocked: Vec::new(),
             max_data: 0,
-            initial_send_credit: 0,
+            peer_credit_window: 0,
             send_credit_reserve: None,
             low_credit_updates: false,
             max_unsent: None,
@@ -250,7 +252,6 @@ impl StreamsState {
     }
 
     pub(crate) fn set_params(&mut self, params: &TransportParameters) {
-        self.initial_send_credit = params.initial_max_data.into();
         self.initial_max_stream_data_uni = params.initial_max_stream_data_uni;
         self.initial_max_stream_data_bidi_local = params.initial_max_stream_data_bidi_local;
         self.initial_max_stream_data_bidi_remote = params.initial_max_stream_data_bidi_remote;
@@ -883,11 +884,14 @@ impl StreamsState {
 
     /// Handle increase to connection-level flow control limit
     pub(crate) fn received_max_data(&mut self, n: VarInt) {
-        // A peer may initially advertise no credit and grant its first window later.
-        if self.initial_send_credit == 0 {
-            self.initial_send_credit = n.into();
-        }
-        self.max_data = self.max_data.max(n.into());
+        let n = u64::from(n);
+        // The peer cannot have read more than we sent, so its window is at least the
+        // credit it grants beyond that. A peer may start with no or little credit (for
+        // example before authentication) and raise its window later.
+        self.peer_credit_window = self
+            .peer_credit_window
+            .max(n.saturating_sub(self.data_sent));
+        self.max_data = self.max_data.max(n);
     }
 
     pub(crate) fn received_max_stream_data(
@@ -970,7 +974,7 @@ impl StreamsState {
         if stream.is_some_and(|stream| stream.priority >= policy.priority) {
             return available;
         }
-        let cap = self.initial_send_credit.min(self.send_window) / 8;
+        let cap = self.peer_credit_window.min(self.send_window) / 8;
         let control = policy.control.min(cap);
         let offset = stream.map_or(0, |stream| stream.offset());
         let opening_left = policy.opening_bytes.saturating_sub(offset);
@@ -2737,6 +2741,22 @@ mod tests {
         assert_eq!(state.poll(), Some(StreamEvent::Writable { id }));
         assert_eq!(reserve_write(&mut state, id, 4096), Ok(16));
         assert_eq!(reserve_write(&mut state, id, 4096), Ok(1840));
+
+        // A peer that raises its window after the handshake restores the full reserves:
+        // the 80-byte initial window must not clamp them for the connection's lifetime.
+        let mut state = credit_reserve_state(80, 8192);
+        let bulk = reserve_open(&mut state);
+        assert_eq!(reserve_write(&mut state, bulk, 4096), Ok(16));
+        assert_eq!(reserve_write(&mut state, bulk, 4096), Ok(44));
+        assert_eq!(reserve_write(&mut state, bulk, 1), Err(WriteError::Blocked));
+        state.received_max_data(VarInt::from_u32(80 + 8192));
+        assert_eq!(state.poll(), Some(StreamEvent::Writable { id: bulk }));
+        // The local send window (8192, 60 bytes outstanding) now limits; both full
+        // reserves are kept instead of the 10-byte reserves of the initial window.
+        assert_eq!(
+            reserve_write(&mut state, bulk, 9000),
+            Ok(8192 - 60 - 64 - 128)
+        );
     }
 
     #[test]

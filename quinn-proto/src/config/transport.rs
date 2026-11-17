@@ -110,7 +110,8 @@ impl TransportConfig {
     /// Streams with priority at least `priority` may use all available credit. Other streams
     /// preserve `control` bytes; after their first `opening_bytes` bytes, they also preserve
     /// `opening` bytes for the initial exchange on new streams. Each reserve is clamped to
-    /// one eighth of both the peer's initial connection credit and the local send window.
+    /// one eighth of both the largest connection window the peer has granted and the local
+    /// send window, so a peer that raises its window after the handshake restores them.
     /// These are local budgets, with no new frames or transport parameters. Disabled by default.
     ///
     /// A receiver which batches credit updates can eventually exhaust even the reserved credit.
