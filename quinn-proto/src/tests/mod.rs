@@ -31,6 +31,7 @@ use crate::{
     crypto::rustls::QuicServerConfig,
     frame::FrameStruct,
     range_set::ArrayRangeSet,
+    shared::{ConnectionEventInner, DatagramConnectionEvent},
     transport_parameters::TransportParameters,
 };
 mod util;
@@ -1152,6 +1153,75 @@ fn test_zero_rtt_happypath(bbr: bool) {
 }
 
 #[test]
+fn client_discards_0rtt_packets() {
+    let _guard = subscribe();
+    let mut pair = Pair::default();
+    let config = client_config();
+
+    // Establish normal connection
+    let client_ch = pair.begin_connect(config.clone());
+    pair.drive();
+    pair.server.assert_accept();
+    let now = pair.time;
+    pair.client_conn_mut(client_ch)
+        .close(now, VarInt(0), [][..].into());
+    pair.drive();
+
+    pair.client.addr = SocketAddr::new(
+        Ipv6Addr::LOCALHOST.into(),
+        CLIENT_PORTS.lock().unwrap().next().unwrap(),
+    );
+    info!("resuming session");
+    let client_ch = pair.begin_connect(config);
+    assert!(pair.client_conn_mut(client_ch).has_0rtt());
+    let s = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
+    const MSG: &[u8] = b"Hello, 0-RTT!";
+    pair.client_send(client_ch, s).write(MSG).unwrap();
+    pair.client.drive_outgoing(pair.time);
+
+    // Reflect the client's own 0-RTT packet, coalesced after the Initial in its first datagram,
+    // back to it. The client holds the keys to decrypt it, but RFC 9001 §5.6 requires it to
+    // discard 0-RTT packets without attempting to.
+    let decode = |data| {
+        PartialDecode::new(
+            data,
+            &FixedLengthConnectionIdParser::new(0),
+            DEFAULT_SUPPORTED_VERSIONS,
+            true,
+        )
+        .unwrap()
+    };
+    let (_, datagram) = pair.client.outbound.front().unwrap();
+    let (initial, rest) = decode(BytesMut::from(&datagram[..]));
+    assert!(initial.is_initial());
+    let (first_decode, remaining) = decode(rest.unwrap());
+    assert!(first_decode.is_0rtt());
+    assert!(remaining.is_none());
+    let event = ConnectionEvent(ConnectionEventInner::Datagram(DatagramConnectionEvent {
+        wire_framing: None,
+        now: pair.time,
+        remote: pair.server.addr,
+        ecn: None,
+        first_decode,
+        remaining,
+    }));
+    pair.client_conn_mut(client_ch).handle_event(event);
+    assert!(!pair.client_conn_mut(client_ch).is_closed());
+    assert_eq!(pair.client_conn_mut(client_ch).stats().frame_rx.stream, 0);
+
+    pair.drive();
+    assert_matches!(
+        pair.client_conn_mut(client_ch).poll(),
+        Some(Event::HandshakeDataReady)
+    );
+    assert_matches!(
+        pair.client_conn_mut(client_ch).poll(),
+        Some(Event::Connected)
+    );
+    assert!(pair.client_conn_mut(client_ch).accepted_0rtt());
+}
+
+#[test]
 fn zero_rtt_rejection() {
     test_zero_rtt_rejection(false);
 }
@@ -1364,6 +1434,141 @@ fn zero_rtt_incoming_buffer_size_total() {
     test_zero_rtt_incoming_limit(|config| {
         config.incoming_buffer_size_total(4000);
     });
+}
+
+/// Verify that datagrams arriving while a connection is in the `Accepting` state (between
+/// `start_accept` and `finish_accept`) are buffered in `incoming_buffers` and replayed into the
+/// connection after `finish_accept`. Drives through the full handshake and clean shutdown to
+/// confirm no endpoint state is leaked.
+#[test]
+fn accepting_state_buffers_retransmitted_initials() {
+    let _guard = subscribe();
+    let mut pair = Pair::default();
+    pair.server.handle_incoming = Box::new(|_| IncomingConnectionBehavior::Wait);
+
+    let client_ch = pair.begin_connect(client_config());
+    pair.drive_client();
+    pair.drive_server();
+
+    let incoming = pair.server.pop_waiting_incoming();
+
+    let accepting = pair.server.start_split_accept(incoming, pair.time);
+    assert_eq!(pair.server.incoming_buffer_bytes(), 0);
+    assert_eq!(pair.server.open_connections(), 0);
+
+    // With no server response, the client's next wakeup is its loss timer. Advancing to it and
+    // driving the client emits a retransmitted Initial for the same connection attempt.
+    pair.time = pair.client.next_wakeup().unwrap();
+    pair.drive_client();
+    assert!(!pair.server.inbound.is_empty());
+    let buffered_datagrams = pair.server.inbound.len() as u64;
+    pair.drive_server();
+
+    assert!(pair.server.waiting_incoming.is_empty());
+    assert!(pair.server.incoming_buffer_bytes() > 0);
+
+    let server_ch = pair.server.finish_split_accept(accepting);
+    assert_eq!(pair.server.incoming_buffer_bytes(), 0);
+    assert_eq!(pair.server.open_connections(), 1);
+    // Check delivery before driving either endpoint again: completing the handshake alone
+    // would also succeed if finish_accept silently discarded the retransmissions.
+    assert_eq!(
+        pair.server_conn_mut(server_ch).stats().udp_rx.datagrams,
+        buffered_datagrams
+    );
+
+    pair.drive();
+    pair.finish_connect(client_ch, server_ch);
+
+    pair.client
+        .connections
+        .get_mut(&client_ch)
+        .unwrap()
+        .close(pair.time, VarInt(42), Bytes::new());
+    pair.drive();
+    assert_eq!(pair.client.known_connections(), 0);
+    assert_eq!(pair.client.known_cids(), 0);
+    assert_eq!(pair.server.known_connections(), 0);
+    assert_eq!(pair.server.known_cids(), 0);
+}
+
+/// Verify that attempts in the `Accepting` state count toward `max_incoming`, so a second
+/// connection attempt is refused while the first attempt is still between `start_accept`
+/// and `finish_accept`.
+#[test]
+fn max_incoming_counts_accepts_in_progress() {
+    let _guard = subscribe();
+    let mut server_config = server_config();
+    server_config.max_incoming(1);
+    let mut pair = Pair::new(Arc::new(EndpointConfig::default()), server_config);
+    pair.server.handle_incoming = Box::new(|_| IncomingConnectionBehavior::Wait);
+
+    let _client_ch = pair.begin_connect(client_config());
+    pair.drive_client();
+    pair.drive_server();
+
+    let incoming = pair.server.pop_waiting_incoming();
+
+    let accepting = pair.server.start_split_accept(incoming, pair.time);
+    assert_eq!(pair.server.open_connections(), 0);
+
+    let _refused_ch = pair.begin_connect(client_config());
+    pair.drive_client();
+    pair.drive_server();
+    assert!(pair.server.waiting_incoming.is_empty());
+    assert_eq!(pair.server.open_connections(), 0);
+
+    pair.server.finish_split_accept(accepting);
+    assert_eq!(pair.server.open_connections(), 1);
+}
+
+/// Verify that when the handshake fails (here via ALPN mismatch) after `start_accept` has
+/// reserved endpoint state, `finish_accept` releases the reserved CIDs and buffer, leaving no
+/// endpoint state behind.
+#[test]
+fn accepting_state_cleaned_up_on_handshake_failure() {
+    let _guard = subscribe();
+    let mut server_config =
+        ServerConfig::with_crypto(Arc::new(server_crypto_with_alpn(vec!["foo".into()])));
+    server_config.max_incoming(1);
+    let mut pair = Pair::new(Arc::new(EndpointConfig::default()), server_config);
+    pair.server.handle_incoming = Box::new(|_| IncomingConnectionBehavior::Wait);
+
+    let _client_ch =
+        pair.begin_connect(ClientConfig::new(Arc::new(client_crypto_with_alpn(vec![
+            "bar".into(),
+        ]))));
+    pair.drive_client();
+    pair.drive_server();
+
+    let incoming = pair.server.pop_waiting_incoming();
+    let accepting = pair.server.start_split_accept(incoming, pair.time);
+
+    pair.time = pair.client.next_wakeup().unwrap();
+    pair.drive_client();
+    pair.drive_server();
+    assert!(pair.server.incoming_buffer_bytes() > 0);
+
+    // The TLS handshake runs in Accepting::accept and fails on the ALPN mismatch.
+    let cause = pair.server.finish_split_accept_error(accepting);
+    assert_matches!(
+        cause,
+        ConnectionError::TransportError(e) if e.code == TransportErrorCode::crypto(0x78)
+    );
+
+    // The failed accept must leave no reserved endpoint state behind.
+    assert_eq!(pair.server.open_connections(), 0);
+    assert_eq!(pair.server.incoming_buffer_bytes(), 0);
+    assert_eq!(pair.server.known_connections(), 0);
+    assert_eq!(pair.server.known_cids(), 0);
+
+    // Releasing the byte accounting is not sufficient: the incoming buffer slot must also
+    // be freed so the next attempt can be admitted under max_incoming(1).
+    pair.begin_connect(client_config());
+    pair.drive_client();
+    pair.drive_server();
+    let incoming = pair.server.pop_waiting_incoming();
+    pair.server.ignore(incoming);
 }
 
 #[test]
@@ -4106,6 +4311,133 @@ fn server_with_disabled_idle_timeout_accepts_connections() {
     let (client_ch, server_ch) = pair.connect();
     assert!(!pair.client_conn_mut(client_ch).is_closed());
     assert!(!pair.server_conn_mut(server_ch).is_closed());
+}
+
+#[test]
+fn migration_mtu_probes_respect_anti_amplification_limit() {
+    let _guard = subscribe();
+    let mut pair = Pair::default();
+    let (client_ch, server_ch) = pair.connect();
+    pair.drive();
+    assert_eq!(
+        usize::from(pair.server_conn_mut(server_ch).path_mtu()),
+        DEFAULT_MTU
+    );
+
+    // The server's own counters. From here on everything it receives comes from the client's new
+    // address, and everything it sends goes there too, bar the single padded PATH_CHALLENGE it
+    // sends to the old address when it migrates.
+    let server_stats = |pair: &mut Pair| pair.server_conn_mut(server_ch).stats();
+    let before = server_stats(&mut pair);
+
+    let path_responses = |pair: &mut Pair| {
+        pair.client_conn_mut(client_ch)
+            .stats()
+            .frame_tx
+            .path_response
+    };
+    let path_responses_before = path_responses(&mut pair);
+
+    // The client shows up at a new IP address, as after a NAT rebinding that changed its public
+    // address. The server starts MTU discovery from scratch for the new path.
+    pair.client.addr = SocketAddr::new(
+        Ipv4Addr::new(127, 0, 0, 1).into(),
+        CLIENT_PORTS.lock().unwrap().next().unwrap(),
+    );
+    let s = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
+    pair.client_send(client_ch, s).write(&[0xab; 700]).unwrap();
+
+    // Until the new path is validated, the server includes a PATH_CHALLENGE in every packet it
+    // sends there, padded to `INITIAL_MTU`; only MTU probes are larger. Lose the datagrams of up to
+    // `INITIAL_MTU` so the path stays unvalidated, and deliver the probes.
+    let lose = |datagram: &[u8]| datagram.len() <= usize::from(INITIAL_MTU);
+
+    // Delivering the client's data from its new address migrates the server onto the new path,
+    // where MTU discovery starts over from `INITIAL_MTU`
+    assert!(step_losing_server_datagrams(&mut pair, lose));
+    assert_eq!(
+        pair.server_conn_mut(server_ch).remote_address(),
+        pair.client.addr
+    );
+    assert_eq!(pair.server_conn_mut(server_ch).path_mtu(), INITIAL_MTU);
+
+    // Hold the path unvalidated for as long as the server keeps trying to validate it, which ends
+    // when its path validation timer expires, because every PATH_CHALLENGE is lost
+    while pair.server_conn_mut(server_ch).remote_address() == pair.client.addr {
+        let now = server_stats(&mut pair);
+        let sent = now.udp_tx.bytes - before.udp_tx.bytes;
+        let received = now.udp_rx.bytes - before.udp_rx.bytes;
+        info!(
+            sent,
+            received, "bytes exchanged with the unvalidated address"
+        );
+        // The anti-amplification limit is three times the bytes received on the path.
+        // `poll_transmit` still starts a full-size datagram while any of that budget is left, and
+        // the PATH_CHALLENGE to the old address is counted here too, so allow two more datagrams
+        // of the unvalidated path's `INITIAL_MTU` on top.
+        assert!(
+            sent < 3 * received + 2 * u64::from(INITIAL_MTU),
+            "server sent {sent} bytes to an unvalidated address it received {received} bytes from"
+        );
+        // MTU probes are not subject to the limit above, so they must wait for validation
+        assert_eq!(
+            now.path.sent_plpmtud_probes, before.path.sent_plpmtud_probes,
+            "server sent an MTU probe to an unvalidated address"
+        );
+        assert_eq!(pair.server_conn_mut(server_ch).path_mtu(), INITIAL_MTU);
+        if !step_losing_server_datagrams(&mut pair, lose) {
+            break;
+        }
+    }
+    assert_eq!(
+        path_responses(&mut pair),
+        path_responses_before,
+        "no PATH_CHALLENGE should have reached the client yet"
+    );
+
+    // More data from the client lifts the limit, a PATH_CHALLENGE gets through, the path is
+    // validated, and MTU discovery runs on it, back up from `INITIAL_MTU`
+    pair.client_send(client_ch, s).write(&[0xab; 700]).unwrap();
+    pair.drive();
+    assert_eq!(
+        pair.server_conn_mut(server_ch).remote_address(),
+        pair.client.addr
+    );
+    assert!(path_responses(&mut pair) > path_responses_before);
+    assert!(server_stats(&mut pair).path.sent_plpmtud_probes > before.path.sent_plpmtud_probes);
+    assert_eq!(
+        usize::from(pair.server_conn_mut(server_ch).path_mtu()),
+        DEFAULT_MTU
+    );
+}
+
+/// Like [`Pair::step`], but drops the server's datagrams to the client's current address for which
+/// `lose` returns true, and all of its datagrams to any other address
+///
+/// Returns false once neither endpoint has anything scheduled.
+fn step_losing_server_datagrams(pair: &mut Pair, lose: impl Fn(&[u8]) -> bool) -> bool {
+    pair.drive_client();
+
+    pair.server.drive(pair.time, pair.client.addr);
+    for (transmit, datagram) in pair.server.outbound.drain(..) {
+        if transmit.destination != pair.client.addr || lose(&datagram) || datagram.len() > pair.mtu
+        {
+            continue;
+        }
+        let arrival = pair.time + pair.latency;
+        let datagram = datagram.as_ref().into();
+        pair.client
+            .inbound
+            .push_back((arrival, transmit.ecn, datagram));
+    }
+
+    match min_opt(pair.client.next_wakeup(), pair.server.next_wakeup()) {
+        Some(t) => {
+            pair.time = pair.time.max(t);
+            true
+        }
+        None => false,
+    }
 }
 
 #[test]

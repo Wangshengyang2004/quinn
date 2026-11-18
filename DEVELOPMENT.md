@@ -31,12 +31,10 @@ evidence belong in private ops.
 
 ## Upstream maintenance and packet handling
 
-The maintained 0.11.x fixes cover receive-state preservation after illegal ordered
-reads, duplicate removal when switching to unordered reads, nonminimal integer
-transport parameters, zero idle timeout, APPLICATION_CLOSE reason budgeting,
-and server handshake-data availability after HelloRetryRequest/ALPN. The new
-connection-acceptance API is omitted because the Quinn 0.11.12 wrapper has no
-consumer. UDP envelope metadata now crosses quinn-udp, the wrapper and proto;
+The fork merges upstream `0.11.x` through `a9ae122f`, including the three-phase
+`Endpoint::start_accept`/`Accepting::accept`/`Endpoint::finish_accept` path that the
+wrapper uses to run TLS setup outside the endpoint lock; `Accepting` and `Accepted`
+carry the first datagram's UDP framing. UDP envelope metadata crosses quinn-udp, the wrapper and proto;
 consumers using it must select all three fork crates at the same revision.
 `Endpoint::handle` remains the ordinary metadata-free entry point; the wrapper
 uses `handle_with_framing`. Fresh authenticated 1-RTT packets confirm framing

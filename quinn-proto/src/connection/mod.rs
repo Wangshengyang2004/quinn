@@ -18,7 +18,6 @@ use crate::{
     Dir, Duration, EndpointConfig, Frame, Instant, MAX_CID_SIZE, MAX_STREAM_COUNT,
     MIN_INITIAL_SIZE, Side, StreamId, TIMER_GRANULARITY, TokenStore, Transmit, TransportError,
     TransportErrorCode, VarInt,
-    cid_generator::ConnectionIdGenerator,
     cid_queue::CidQueue,
     coding::BufMutExt,
     config::{ServerConfig, TransportConfig},
@@ -253,22 +252,23 @@ pub struct Connection {
 }
 
 impl Connection {
-    pub(crate) fn new(
-        endpoint_config: Arc<EndpointConfig>,
-        config: Arc<TransportConfig>,
-        init_cid: ConnectionId,
-        loc_cid: ConnectionId,
-        rem_cid: ConnectionId,
-        remote: SocketAddr,
-        local_ip: Option<IpAddr>,
-        crypto: Box<dyn crypto::Session>,
-        cid_gen: &dyn ConnectionIdGenerator,
-        now: Instant,
-        version: u32,
-        allow_mtud: bool,
-        rng_seed: [u8; 32],
-        side_args: SideArgs,
-    ) -> Self {
+    pub(crate) fn new(crypto: Box<dyn crypto::Session>, args: ConnectionArgs) -> Self {
+        let ConnectionArgs {
+            endpoint_config,
+            transport_config: config,
+            init_cid,
+            loc_cid,
+            rem_cid,
+            remote,
+            local_ip,
+            local_cid_len,
+            local_cid_lifetime,
+            now,
+            version,
+            allow_mtud,
+            rng_seed,
+            side_args,
+        } = args;
         let pref_addr_cid = side_args.pref_addr_cid();
         let path_validated = side_args.path_validated();
         let connection_side = ConnectionSide::from(side_args);
@@ -292,8 +292,8 @@ impl Connection {
             handshake_cid: loc_cid,
             rem_handshake_cid: rem_cid,
             local_cid_state: CidState::new(
-                cid_gen.cid_len(),
-                cid_gen.cid_lifetime(),
+                local_cid_len,
+                local_cid_lifetime,
                 now,
                 if pref_addr_cid.is_some() { 2 } else { 1 },
             ),
@@ -2624,6 +2624,7 @@ impl Connection {
             partial_decode,
             &self.spaces,
             self.zero_rtt_crypto.as_ref(),
+            self.side.side(),
             self.peer_params.stateless_reset_token,
         ) {
             self.handle_packet(
@@ -4164,6 +4165,7 @@ impl Connection {
             first_decode.clone(),
             &self.spaces,
             self.zero_rtt_crypto.as_ref(),
+            self.side.side(),
             self.peer_params.stateless_reset_token,
         )?;
 
@@ -4702,6 +4704,27 @@ impl From<SideArgs> for ConnectionSide {
             } => Self::Server { server_config },
         }
     }
+}
+
+/// Parameters to `Connection::new` other than the TLS session
+pub(crate) struct ConnectionArgs {
+    pub(crate) endpoint_config: Arc<EndpointConfig>,
+    pub(crate) transport_config: Arc<TransportConfig>,
+    /// Destination CID of the first Initial packet sent by the client
+    pub(crate) init_cid: ConnectionId,
+    /// CID initially issued to the peer for addressing this connection
+    pub(crate) loc_cid: ConnectionId,
+    /// CID initially issued by the peer for addressing it
+    pub(crate) rem_cid: ConnectionId,
+    pub(crate) remote: SocketAddr,
+    pub(crate) local_ip: Option<IpAddr>,
+    pub(crate) local_cid_len: usize,
+    pub(crate) local_cid_lifetime: Option<Duration>,
+    pub(crate) now: Instant,
+    pub(crate) version: u32,
+    pub(crate) allow_mtud: bool,
+    pub(crate) rng_seed: [u8; 32],
+    pub(crate) side_args: SideArgs,
 }
 
 /// Parameters to `Connection::new` specific to it being client-side or server-side
