@@ -398,13 +398,24 @@ impl Bbr {
             return;
         }
         let mut target_window = self.get_target_cwnd(self.cwnd_gain);
+        // Like Linux BBR (bbr_extra_acked_max_us), allow at most 100 ms of the
+        // bandwidth estimate for ACK aggregation. Otherwise one long ACK stall
+        // keeps the window that many seconds of data above the BDP while the
+        // filter retains it.
+        let max_aggregation = self.max_bandwidth.get_estimate()
+            * K_MAX_ACK_AGGREGATION.as_micros() as u64
+            / 1_000_000;
         if self.is_at_full_bandwidth {
             // Add the max recently measured ack aggregation to CWND.
-            target_window += self.ack_aggregation.max_ack_height.get();
+            target_window += self
+                .ack_aggregation
+                .max_ack_height
+                .get()
+                .min(max_aggregation);
         } else if self.config.enable_ack_aggregation_during_startup {
             // Add the most recent excess acked.  Because CWND never decreases in
             // STARTUP, this will automatically create a very localized max filter.
-            target_window += excess_acked;
+            target_window += excess_acked.min(max_aggregation);
         }
         // Instead of immediately setting the target CWND as the new one, BBR grows
         // the CWND towards |target_window| by only increasing it |bytes_acked| at a
@@ -1065,6 +1076,7 @@ const K_DERIVED_HIGH_CWNDGAIN: f32 = 2.0;
 const K_PACING_GAIN: [f32; 8] = [1.25, 0.75, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0];
 
 const K_STARTUP_GROWTH_TARGET: f32 = 1.25;
+const K_MAX_ACK_AGGREGATION: Duration = Duration::from_millis(100);
 const K_ROUND_TRIPS_WITHOUT_GROWTH_BEFORE_EXITING_STARTUP: u8 = 3;
 
 // Do not allow initial congestion window to be greater than 200 packets.
@@ -2359,6 +2371,11 @@ mod policed_path_tests {
         /// Drops every n-th packet before the policer
         drop_every: Option<u64>,
         source: Source,
+        /// (period, hold): ACKs due in the first `hold` of each `period` leave
+        /// together when it ends, as from a stalled receiver or Wi-Fi uplink
+        ack_hold: Option<(Duration, Duration)>,
+        /// The simplified PTO declares the tail lost; off for paths that only delay ACKs
+        pto_declares_loss: bool,
         produced: f64,
         next_pn: u64,
         /// Packet number -> (sent at, bytes in flight after send)
@@ -2372,6 +2389,8 @@ mod policed_path_tests {
         totals: Totals,
         startup_exit: Option<Duration>,
         entered_recovery: bool,
+        /// Largest window after STARTUP
+        max_window: u64,
     }
 
     impl Sim {
@@ -2400,6 +2419,8 @@ mod policed_path_tests {
                 policer: None,
                 drop_every: None,
                 source,
+                ack_hold: None,
+                pto_declares_loss: true,
                 produced: 0.0,
                 next_pn: 0,
                 outstanding: BTreeMap::new(),
@@ -2411,6 +2432,7 @@ mod policed_path_tests {
                 totals: Totals::default(),
                 startup_exit: None,
                 entered_recovery: false,
+                max_window: 0,
             }
         }
 
@@ -2469,8 +2491,15 @@ mod policed_path_tests {
                 {
                     continue;
                 }
-                self.acks
-                    .push_back((self.start + arrival + self.one_way, pn));
+                let mut ack_at = arrival + self.one_way;
+                if let Some((period, hold)) = self.ack_hold {
+                    let phase =
+                        Duration::from_nanos((ack_at.as_nanos() % period.as_nanos()) as u64);
+                    if phase < hold {
+                        ack_at += hold - phase;
+                    }
+                }
+                self.acks.push_back((self.start + ack_at, pn));
             }
         }
 
@@ -2531,7 +2560,8 @@ mod policed_path_tests {
         fn probe_timeout(&mut self, now: Instant) {
             // Armed from the newest send, including the peer's default 25 ms maximum ACK delay
             let pto = self.rtt.pto_base() + Duration::from_millis(25);
-            if self.outstanding.is_empty() || now < self.last_sent + pto {
+            if !self.pto_declares_loss || self.outstanding.is_empty() || now < self.last_sent + pto
+            {
                 return;
             }
             let lost = self
@@ -2557,6 +2587,9 @@ mod policed_path_tests {
                     self.startup_exit = Some(now - self.start);
                 }
                 self.entered_recovery |= self.bbr.recovery_state.in_recovery();
+                if self.bbr.is_at_full_bandwidth {
+                    self.max_window = self.max_window.max(self.bbr.window());
+                }
                 self.clock += TICK;
             }
             let t = Totals {
@@ -2738,5 +2771,41 @@ mod policed_path_tests {
         );
         assert!(first.delivered as f64 >= 2.0 * 0.8 * LINE);
         assert!(late.delivered as f64 >= 2.0 * 0.8 * LINE);
+    }
+
+    /// 70 Mbit/s behind a Wi-Fi receiver
+    const WIFI: f64 = 8_750_000.0;
+
+    /// ACK aggregation adds at most 100 ms of the estimate to the window. Routine
+    /// millisecond bunching stays below that; a stalled receiver that releases
+    /// 300 ms of ACKs at once would otherwise add the whole stall.
+    #[test]
+    fn ack_aggregation_allowance_is_capped_at_100ms_of_bandwidth() {
+        for (period_ms, hold_ms, min_utilization) in [(8, 4, 0.9), (600, 300, 0.5)] {
+            let mut sim = Sim::new(60, WIFI, Source::Backlogged);
+            sim.ack_hold = Some((
+                Duration::from_millis(period_ms),
+                Duration::from_millis(hold_ms),
+            ));
+            sim.pto_declares_loss = false;
+            sim.run_until(Duration::from_secs(3));
+            assert!(sim.bbr.is_at_full_bandwidth);
+            let late = sim.run_until(Duration::from_secs(10));
+            let bdp = 0.060 * WIFI;
+            println!(
+                "hold {hold_ms}/{period_ms} ms: max_window={} ({:.2} BDP) utilization={:.2} min_rtt={:?}",
+                sim.max_window,
+                sim.max_window as f64 / bdp,
+                late.delivered as f64 / (7.0 * WIFI),
+                sim.bbr.min_rtt,
+            );
+            assert_eq!(late.lost, 0);
+            assert!(
+                sim.max_window as f64 <= 1.05 * (2.0 * bdp + 0.1 * WIFI),
+                "window {} exceeds 2 BDP + 100 ms of bandwidth",
+                sim.max_window
+            );
+            assert!(late.delivered as f64 >= min_utilization * 7.0 * WIFI);
+        }
     }
 }
