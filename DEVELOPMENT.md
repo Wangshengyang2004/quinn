@@ -51,6 +51,11 @@ that exceeds the receive buffer is dropped; a frame larger than the advertised
 the same limit, including overrides. `omit_max_datagram_frame_size` advertises no
 limit and bounds received frames only by the receive buffer.
 
+Zero-length local CIDs route by remote address (client) or four-tuple (server).
+A connection that finishes draining removes that route only while it still
+points at it, so a newer connection to the same remote, such as a reused client
+endpoint re-establishing, keeps receiving. Upstream removes the route by key.
+
 Due ACK-only feedback bypasses the congestion window and pacer in its own packet,
 leaving application and path-validation frames queued. It receives no optional MTU
 or GSO padding; mandatory client Initial padding and anti-amplification still apply.
