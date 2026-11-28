@@ -132,7 +132,7 @@ impl Endpoint {
             }
             Drained => {
                 if let Some(conn) = self.connections.try_remove(ch.0) {
-                    self.index.remove(&conn);
+                    self.index.remove(ch, &conn);
                 } else {
                     // This indicates a bug in downstream code, which could cause spurious
                     // connection loss instead of this error if the CID was (re)allocated prior to
@@ -1248,16 +1248,22 @@ impl ConnectionIndex {
     }
 
     /// Remove all references to a connection
-    fn remove(&mut self, conn: &ConnectionMeta) {
+    fn remove(&mut self, ch: ConnectionHandle, conn: &ConnectionMeta) {
         if conn.side.is_server() {
             self.remove_initial(conn.init_cid);
         }
         for cid in conn.loc_cids.values() {
             self.connection_ids.remove(cid);
         }
-        self.incoming_connection_remotes.remove(&conn.addresses);
-        self.outgoing_connection_remotes
-            .remove(&conn.addresses.remote);
+        // A newer connection to the same remote may have taken over the
+        // zero-length-CID route while this one was draining.
+        if self.incoming_connection_remotes.get(&conn.addresses) == Some(&ch) {
+            self.incoming_connection_remotes.remove(&conn.addresses);
+        }
+        if self.outgoing_connection_remotes.get(&conn.addresses.remote) == Some(&ch) {
+            self.outgoing_connection_remotes
+                .remove(&conn.addresses.remote);
+        }
         if let Some((remote, token)) = conn.reset_token {
             self.connection_reset_tokens.remove(remote, token);
         }

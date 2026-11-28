@@ -3133,6 +3133,42 @@ fn zero_length_cid() {
     pair.connect();
 }
 
+/// A zero-length-CID connection that drains after a newer connection took over
+/// its address route must leave that route in place.
+#[test]
+fn zero_length_cid_reconnect_before_drain() {
+    let _guard = subscribe();
+    let cid_generator_factory: fn() -> Box<dyn ConnectionIdGenerator> =
+        || Box::new(RandomConnectionIdGenerator::new(0));
+    let mut pair = Pair::new(
+        Arc::new(EndpointConfig {
+            connection_id_generator_factory: Arc::new(cid_generator_factory),
+            ..EndpointConfig::default()
+        }),
+        server_config(),
+    );
+    let (old, _) = pair.connect();
+    pair.client
+        .connections
+        .get_mut(&old)
+        .unwrap()
+        .close(pair.time, VarInt(42), Bytes::new());
+    // Reconnect from the same address while the old connection still drains.
+    let (client_ch, server_ch) = pair.connect();
+    pair.drive();
+
+    // Finishing needs the server's ACK to reach the new connection.
+    let s = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
+    pair.client_send(client_ch, s).write(b"after drain").unwrap();
+    pair.client_send(client_ch, s).finish().unwrap();
+    pair.drive();
+    assert_matches!(pair.server_streams(server_ch).accept(Dir::Uni), Some(stream) if stream == s);
+    assert_matches!(
+        pair.client_conn_mut(client_ch).poll(),
+        Some(Event::Stream(StreamEvent::Finished { id })) if id == s
+    );
+}
+
 #[test]
 fn keep_alive() {
     let _guard = subscribe();
